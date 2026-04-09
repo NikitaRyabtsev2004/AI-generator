@@ -1,0 +1,20 @@
+{
+  "watch": [
+    "server"
+  ],
+  "ext": "js,cjs,mjs",
+  "execMap": {
+    "js": "node --disable-warning=ExperimentalWarning",
+    "cjs": "node --disable-warning=ExperimentalWarning",
+    "mjs": "node --disable-warning=ExperimentalWarning"
+  },
+  "ignore": [
+    "server/data/**",
+    "server/artifacts/**",
+    "build/**",
+    "node_modules/**",
+    "public/**",
+    "src/**"
+  ],
+  "delay": "200"
+}

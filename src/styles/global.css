@@ -1,0 +1,108 @@
+:root {
+  --page-bg: #050d16;
+  --page-bg-alt: #081522;
+  --panel-border: rgba(255, 255, 255, 0.1);
+  --panel-soft: rgba(255, 255, 255, 0.05);
+  --text-muted: rgba(231, 241, 255, 0.72);
+  --accent: #8ce1c7;
+  --accent-warm: #ff9d6b;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: linear-gradient(180deg, var(--page-bg) 0%, var(--page-bg-alt) 100%);
+  color: #f6fbff;
+  font-family: 'Manrope', 'Segoe UI', sans-serif;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+.muted-text {
+  color: var(--text-muted);
+}
+
+.action-button {
+  min-height: 42px;
+}
+
+.text-input {
+  width: 100%;
+}
+
+.status-pill {
+  backdrop-filter: blur(12px);
+}
+
+.status-pill--active {
+  box-shadow: 0 0 0 1px rgba(140, 225, 199, 0.36);
+}
+
+.status-pill--accent {
+  background: rgba(140, 225, 199, 0.16) !important;
+}
+
+.status-pill--neutral {
+  background: rgba(255, 255, 255, 0.08) !important;
+}
+
+.metric-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 16px;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--panel-border);
+}
+
+.metric-card__label {
+  color: var(--text-muted);
+  letter-spacing: 0.05em;
+}
+
+.metric-card__value {
+  font-size: 1.28rem !important;
+}
+
+.metric-card__hint {
+  color: var(--text-muted);
+}
+
+.panel-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.panel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+@media (max-width: 960px) {
+  .panel-heading {
+    flex-direction: column;
+  }
+
+  .panel-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+}
