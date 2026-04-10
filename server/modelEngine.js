@@ -40,6 +40,7 @@ const RETRAINING_KEYS = [
 ];
 
 const TRAINING_LOCKED_STATUSES = new Set(['training', 'syncing_knowledge']);
+const ARCHIVED_REPLY_REPLAY_LIMIT = 240;
 
 function nowIso() {
   return new Date().toISOString();
@@ -321,32 +322,102 @@ function buildSourceDocuments(source) {
   ];
 }
 
-function createCorpusSignature(state, artifacts) {
-  const signaturePayload = JSON.stringify({
-    sourceIds: state.sources.map((source) => source.id),
-    sourceSizes: state.sources.map((source) => source.stats?.tokenCount || 0),
-    replyPairCount: artifacts.replyMemories.length,
-    chunkCount: artifacts.chunks.length,
-    tokenCount: artifacts.tokenCount,
-    positiveFeedbackCount: artifacts.positiveFeedbackCount,
-    negativeFeedbackCount: artifacts.negativeFeedbackCount,
-    settings: {
-      sequenceLength: state.settings.training.sequenceLength,
-      embeddingSize: state.settings.training.embeddingSize,
-      hiddenSize: state.settings.training.hiddenSize,
-      recurrentLayers: state.settings.training.recurrentLayers,
-      dropout: state.settings.training.dropout,
-      learningRate: state.settings.training.learningRate,
-      chunkSize: state.settings.training.chunkSize,
-      chunkOverlap: state.settings.training.chunkOverlap,
-      vocabularyLimit: state.settings.training.vocabularyLimit,
-      topKChunks: state.settings.training.topKChunks,
-      minSimilarity: state.settings.training.minSimilarity,
-    },
-    runtime: getRuntimeConfig(),
+function normalizeStoredChunks(chunks = []) {
+  return chunks
+    .map((chunk, index) => ({
+      id: chunk.id || `knowledge_chunk_${index}`,
+      sourceId: chunk.sourceId || `knowledge_chunk_${index}`,
+      sourceType: chunk.sourceType || 'knowledge',
+      sourceKind: chunk.sourceKind || 'knowledge',
+      label: cleanText(chunk.label || '') || 'Архив знаний',
+      text: cleanText(chunk.text || ''),
+    }))
+    .filter((entry) => Boolean(entry.text));
+}
+
+function dedupeEntries(entries, getKey) {
+  const seen = new Set();
+  const result = [];
+
+  entries.forEach((entry) => {
+    const key = getKey(entry);
+    if (!key || seen.has(key)) {
+      return;
+    }
+
+    seen.add(key);
+    result.push(entry);
   });
 
-  return crypto.createHash('sha1').update(signaturePayload).digest('hex');
+  return result;
+}
+
+function normalizeStoredReplyMemories(entries = []) {
+  return entries
+    .map((entry, index) => {
+      const promptText = cleanText(entry.promptText || '');
+      const responseText = sanitizeReplyText(entry.responseText || '');
+      if (!promptText || !responseText) {
+        return null;
+      }
+
+      return {
+        id: entry.id || createId(`archive_pair_${index}`),
+        ownerId: entry.ownerId || 'knowledge',
+        title: cleanText(entry.title || '') || 'Архив знаний',
+        origin: entry.origin || 'knowledge',
+        score: Number(entry.score || 0.78),
+        promptText,
+        responseText,
+        combinedText: cleanText(
+          entry.combinedText || `Пользователь: ${promptText}\nАссистент: ${responseText}`
+        ),
+      };
+    })
+    .filter(Boolean);
+}
+
+function appendHash(hash, value) {
+  hash.update(String(value || ''));
+  hash.update('\u001f');
+}
+
+function createCorpusSignature(state, artifacts) {
+  const hash = crypto.createHash('sha1');
+  appendHash(hash, artifacts.chunkCount || artifacts.chunks?.length || 0);
+  appendHash(hash, artifacts.replyPairCount || artifacts.replyMemories?.length || 0);
+  appendHash(hash, artifacts.tokenCount || 0);
+  appendHash(hash, artifacts.positiveFeedbackCount || 0);
+  appendHash(hash, artifacts.negativeFeedbackCount || 0);
+
+  (artifacts.chunks || []).forEach((chunk) => {
+    appendHash(hash, chunk.label);
+    appendHash(hash, chunk.text);
+  });
+
+  (artifacts.replyMemories || []).forEach((pair) => {
+    appendHash(hash, pair.promptText);
+    appendHash(hash, pair.responseText);
+    appendHash(hash, pair.score);
+  });
+
+  const settingsSnapshot = {
+    sequenceLength: state.settings.training.sequenceLength,
+    embeddingSize: state.settings.training.embeddingSize,
+    hiddenSize: state.settings.training.hiddenSize,
+    recurrentLayers: state.settings.training.recurrentLayers,
+    dropout: state.settings.training.dropout,
+    learningRate: state.settings.training.learningRate,
+    chunkSize: state.settings.training.chunkSize,
+    chunkOverlap: state.settings.training.chunkOverlap,
+    vocabularyLimit: state.settings.training.vocabularyLimit,
+    topKChunks: state.settings.training.topKChunks,
+    minSimilarity: state.settings.training.minSimilarity,
+  };
+
+  appendHash(hash, JSON.stringify(settingsSnapshot));
+  appendHash(hash, JSON.stringify(getRuntimeConfig()));
+  return hash.digest('hex');
 }
 
 function buildBm25Index(entries) {
@@ -591,33 +662,36 @@ function collectBlockedReplies(state) {
   return blocked;
 }
 
-function buildTrainingTexts(state, replyMemories, runtimeConfig) {
+function buildTrainingTexts({
+  sourceDocuments,
+  sourceReplyMemories,
+  replayReplyMemories,
+  runtimeConfig,
+}) {
   const texts = [];
 
-  state.sources.forEach((source) => {
-    const cleanSourceText = cleanText(source.content);
+  sourceDocuments.forEach((documentEntry) => {
+    const cleanSourceText = cleanText(documentEntry.text);
     if (cleanSourceText) {
       texts.push(structuredTrainingText(['__bos__', cleanSourceText, '__eos__']));
     }
   });
 
-  state.sources.forEach((source) => {
-    extractDialoguePairsFromSource(source).forEach((pair) => {
-      texts.push(
-        structuredTrainingText([
-          '__bos__',
-          '__usr__',
-          pair.promptText,
-          '__sep__',
-          '__asst__',
-          pair.responseText,
-          '__eos__',
-        ])
-      );
-    });
+  sourceReplyMemories.forEach((pair) => {
+    texts.push(
+      structuredTrainingText([
+        '__bos__',
+        '__usr__',
+        pair.promptText,
+        '__sep__',
+        '__asst__',
+        pair.responseText,
+        '__eos__',
+      ])
+    );
   });
 
-  replyMemories.forEach((pair) => {
+  replayReplyMemories.forEach((pair) => {
     const weight = pair.origin === 'chat_feedback'
       ? Math.max(1, runtimeConfig.feedback.positiveReplayWeight)
       : 1;
@@ -639,13 +713,28 @@ function buildTrainingTexts(state, replyMemories, runtimeConfig) {
   return texts.filter(Boolean);
 }
 
-function buildKnowledgeArtifacts(state) {
+function buildKnowledgeArtifacts(state, options = {}) {
+  const {
+    includeQueuedSources = false,
+  } = options;
   const runtimeConfig = getRuntimeConfig();
-  const sourceReplyMemories = state.sources.flatMap((source) => extractDialoguePairsFromSource(source));
+  const queuedSources = includeQueuedSources ? state.sources : [];
+  const persistedKnowledgeChunks = dedupeEntries(
+    normalizeStoredChunks(state.knowledge.chunks || []),
+    (entry) => `${entry.label}\u241f${entry.text}`
+  );
+  const sourceDocuments = queuedSources.flatMap((source) => buildSourceDocuments(source));
+  const uniqueSourceDocuments = dedupeEntries(sourceDocuments, (entry) => `${entry.label}\u241f${entry.text}`);
+
+  const sourceReplyMemories = queuedSources.flatMap((source) => extractDialoguePairsFromSource(source));
   const chatReplyMemories = state.chats.flatMap((chat) => extractDialoguePairsFromChat(chat));
+  const storedReplyMemories = normalizeStoredReplyMemories(state.knowledge.replyMemories || []);
   const blockedReplies = collectBlockedReplies(state);
 
-  const replyMemories = [...sourceReplyMemories, ...chatReplyMemories]
+  const replyMemories = dedupeEntries(
+    [...storedReplyMemories, ...sourceReplyMemories, ...chatReplyMemories],
+    (pair) => `${pair.promptText}\u241f${pair.responseText}`
+  )
     .map((pair) => ({
       ...pair,
       responseText: sanitizeReplyText(pair.responseText),
@@ -654,12 +743,21 @@ function buildKnowledgeArtifacts(state) {
     .filter((pair) => !blockedReplies.has(pair.responseText.toLowerCase()))
     .filter((pair) => !isEchoReply(pair.promptText, pair.responseText));
 
-  const documents = state.sources.flatMap((source) => buildSourceDocuments(source));
   const rawVocabulary = {};
   let tokenCount = 0;
   let sentenceCount = 0;
 
-  documents.forEach((documentEntry) => {
+  persistedKnowledgeChunks.forEach((chunk) => {
+    const tokens = tokenizeWords(chunk.text);
+    const sentences = splitIntoSentences(chunk.text);
+    tokenCount += tokens.length;
+    sentenceCount += sentences.length;
+    tokens.forEach((token) => {
+      rawVocabulary[token] = (rawVocabulary[token] || 0) + 1;
+    });
+  });
+
+  uniqueSourceDocuments.forEach((documentEntry) => {
     const tokens = tokenizeWords(documentEntry.text);
     const sentences = splitIntoSentences(documentEntry.text);
     tokenCount += tokens.length;
@@ -684,13 +782,27 @@ function buildKnowledgeArtifacts(state) {
   const allowedTerms = new Set(vocabularyEntries.map(([term]) => term));
   const vocabulary = Object.fromEntries(vocabularyEntries);
 
-  const chunks = documents.flatMap((documentEntry) =>
+  const persistedIndexedChunks = persistedKnowledgeChunks.map((chunk) => {
+    const chunkTokens = tokenizeWords(chunk.text);
+    return {
+      ...chunk,
+      sentences: splitIntoSentences(chunk.text),
+      tokenCount: chunkTokens.length,
+      documentLength: chunkTokens.length,
+      termMap: createTermMap(chunkTokens, allowedTerms),
+    };
+  });
+  const queuedSourceChunks = uniqueSourceDocuments.flatMap((documentEntry) =>
     createChunksForDocument(
       documentEntry,
       state.settings.training.chunkSize,
       state.settings.training.chunkOverlap,
       allowedTerms
     )
+  );
+  const chunks = dedupeEntries(
+    [...persistedIndexedChunks, ...queuedSourceChunks],
+    (entry) => `${entry.label}\u241f${entry.text}`
   );
 
   const knowledgeBm25 = buildBm25Index(chunks);
@@ -713,7 +825,23 @@ function buildKnowledgeArtifacts(state) {
     .flatMap((chat) => chat.messages)
     .filter((message) => message.metadata?.userRating === -1)
     .length;
-  const trainingTexts = buildTrainingTexts(state, indexedReplyMemories, runtimeConfig);
+  const archivedReplayMemories = storedReplyMemories
+    .sort((left, right) => (right.score || 0) - (left.score || 0))
+    .slice(0, ARCHIVED_REPLY_REPLAY_LIMIT);
+  const trainingReplayMemories = [...chatReplyMemories, ...archivedReplayMemories]
+    .map((pair) => ({
+      ...pair,
+      responseText: sanitizeReplyText(pair.responseText),
+    }))
+    .filter((pair) => pair.promptText && pair.responseText)
+    .filter((pair) => !blockedReplies.has(pair.responseText.toLowerCase()))
+    .filter((pair) => !isEchoReply(pair.promptText, pair.responseText));
+  const trainingTexts = buildTrainingTexts({
+    sourceDocuments: uniqueSourceDocuments,
+    sourceReplyMemories,
+    replayReplyMemories: trainingReplayMemories,
+    runtimeConfig,
+  });
   const tokenizerTokenCount = trainingTexts.reduce(
     (sum, text) => sum + tokenizeForModel(text).length,
     0
@@ -1268,10 +1396,14 @@ function createModelEngine({ getState, updateState }) {
     return neuralRuntime;
   }
 
-  async function rebuildKnowledge(state) {
-    const artifacts = buildKnowledgeArtifacts(state);
+  async function rebuildKnowledge(state, options = {}) {
+    const artifacts = buildKnowledgeArtifacts(state, options);
     updateModelMetricsFromArtifacts(state, artifacts);
     return artifacts;
+  }
+
+  function shouldAutoClearSources(state) {
+    return state.settings.training.autoClearSourcesAfterTraining !== false;
   }
 
   async function ensureModelExists() {
@@ -1322,21 +1454,22 @@ function createModelEngine({ getState, updateState }) {
     createTrainingStartSignal();
     activeTrainingPromise = (async () => {
       const initialState = getState();
-      const initialArtifacts = buildKnowledgeArtifacts(initialState);
+      const initialArtifacts = buildKnowledgeArtifacts(initialState, {
+        includeQueuedSources: true,
+      });
       const trainingTexts = initialArtifacts.trainingTexts;
 
       if (!trainingTexts.length) {
         throw new Error('Для обучения не хватает данных. Добавьте источники или диалоговые пары.');
       }
 
-      const sameArchitecture =
+      const canResumeFromCheckpoint =
         initialState.knowledge.languageModel?.checkpointReady &&
-        initialState.model.corpusSignature === initialArtifacts.corpusSignature &&
         initialState.model.configSnapshot?.training?.sequenceLength === initialState.settings.training.sequenceLength &&
         initialState.model.configSnapshot?.training?.embeddingSize === initialState.settings.training.embeddingSize &&
         initialState.model.configSnapshot?.training?.hiddenSize === initialState.settings.training.hiddenSize &&
         initialState.model.configSnapshot?.training?.recurrentLayers === initialState.settings.training.recurrentLayers;
-      const resumeEpochOffset = sameArchitecture
+      const resumeEpochOffset = canResumeFromCheckpoint
         ? Math.max(Number(initialState.model.trainedEpochs) || 0, 0)
         : 0;
 
@@ -1371,7 +1504,7 @@ function createModelEngine({ getState, updateState }) {
             settings: initialState.settings,
             trainingTexts,
             storage: initialState.model.storage,
-            resumeFromCheckpoint: Boolean(sameArchitecture),
+            resumeFromCheckpoint: Boolean(canResumeFromCheckpoint),
             resumeEpochOffset,
             manifest,
             tokenizerTokenCount: initialArtifacts.tokenizerTokenCount,
@@ -1504,7 +1637,9 @@ function createModelEngine({ getState, updateState }) {
             enqueueWorkerUpdate(async () => {
               await disposeNeuralRuntime();
               await updateState(async (state) => {
-                const currentArtifacts = await rebuildKnowledge(state);
+                const currentArtifacts = await rebuildKnowledge(state, {
+                  includeQueuedSources: true,
+                });
                 const corpusChanged = currentArtifacts.corpusSignature !== initialArtifacts.corpusSignature;
 
                 state.model.exists = true;
@@ -1535,11 +1670,17 @@ function createModelEngine({ getState, updateState }) {
                 state.knowledge.languageModel = message.languageModel;
                 state.model.lifecycle = message.trainingResult.stopRequested ? 'paused' : 'trained';
                 state.model.status = 'ready';
+                if (!message.trainingResult.stopRequested && shouldAutoClearSources(state)) {
+                  state.sources = [];
+                  state.model.sourceCount = 0;
+                }
                 state.training.status = message.trainingResult.stopRequested ? 'paused' : 'completed';
                 state.training.phase = message.trainingResult.stopRequested ? 'paused_by_user' : 'ready_for_chat';
                 state.training.message = message.trainingResult.stopRequested
                   ? 'Обучение остановлено пользователем. Последний чекпоинт сохранен.'
-                  : 'Обучение завершено. Нейросеть, токенизатор и индекс знаний сохранены на сервере.';
+                  : shouldAutoClearSources(state)
+                    ? 'Обучение завершено. Чекпоинт и индекс знаний сохранены, очередь источников очищена.'
+                    : 'Обучение завершено. Нейросеть, токенизатор и индекс знаний сохранены на сервере.';
                 state.training.progress = {
                   currentEpoch: message.trainingResult.completedEpochs,
                   totalEpochs: message.trainingResult.effectiveEpochs,
@@ -1810,15 +1951,18 @@ function createModelEngine({ getState, updateState }) {
           addedAt: nowIso(),
         });
 
+        state.model.sourceCount = state.sources.length;
         if (state.model.exists) {
-          await disposeNeuralRuntime();
-          resetTrainedModelState(state);
-          state.model.lifecycle = 'ready_for_training';
+          state.model.lifecycle = state.model.trainedEpochs ? 'trained' : 'ready_for_training';
           state.model.status = 'ready';
         }
 
-        pushStatus(state, 'idle', 'source_added', `Источник ${label} добавлен в корпус.`);
-        await rebuildKnowledge(state);
+        pushStatus(
+          state,
+          'idle',
+          'source_added',
+          `Источник ${label} добавлен в очередь обучения. Текущая обученная модель сохранена, новые данные войдут после следующего запуска обучения.`
+        );
       }).then((state) => buildDashboard(state));
     },
 
@@ -1826,16 +1970,13 @@ function createModelEngine({ getState, updateState }) {
       return updateState(async (state) => {
         assertTrainingUnlocked(state, 'Изменение источников');
         state.sources = state.sources.filter((source) => source.id !== sourceId);
-
+        state.model.sourceCount = state.sources.length;
         if (state.model.exists) {
-          await disposeNeuralRuntime();
-          resetTrainedModelState(state);
-          state.model.lifecycle = 'ready_for_training';
+          state.model.lifecycle = state.model.trainedEpochs ? 'trained' : 'ready_for_training';
           state.model.status = 'ready';
         }
 
-        pushStatus(state, 'idle', 'source_removed', 'Источник удален из корпуса.');
-        await rebuildKnowledge(state);
+        pushStatus(state, 'idle', 'source_removed', 'Источник удален из очереди обучения.');
       }).then((state) => buildDashboard(state));
     },
 

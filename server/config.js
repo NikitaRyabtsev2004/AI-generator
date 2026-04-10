@@ -17,6 +17,7 @@ const DEFAULT_SETTINGS = {
     topKChunks: 6,
     minSimilarity: 0.12,
     maxHistoryPoints: 360,
+    autoClearSourcesAfterTraining: true,
   },
   generation: {
     responseTemperature: 0.4,
