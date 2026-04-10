@@ -1,15 +1,16 @@
-const MODEL_ENGINE = 'hybrid-rag-neural-v3';
+const MODEL_ENGINE = 'hybrid-rag-neural-v4';
 
 const DEFAULT_SETTINGS = {
   training: {
-    epochs: 8,
-    batchSize: 16,
-    sequenceLength: 80,
-    embeddingSize: 96,
-    hiddenSize: 192,
+    epochs: 24,
+    batchSize: 8,
+    executionMode: 'compatibility',
+    sequenceLength: 96,
+    embeddingSize: 128,
+    hiddenSize: 256,
     recurrentLayers: 2,
-    dropout: 0.12,
-    learningRate: 0.0015,
+    dropout: 0.15,
+    learningRate: 0.0012,
     chunkSize: 180,
     chunkOverlap: 36,
     vocabularyLimit: 12000,
@@ -18,12 +19,12 @@ const DEFAULT_SETTINGS = {
     maxHistoryPoints: 360,
   },
   generation: {
-    responseTemperature: 0.45,
+    responseTemperature: 0.4,
     maxReplySentences: 4,
     maxReplyCharacters: 1400,
-    maxGeneratedTokens: 72,
-    topKSampling: 18,
-    repetitionPenalty: 1.18,
+    maxGeneratedTokens: 96,
+    topKSampling: 16,
+    repetitionPenalty: 1.22,
   },
 };
 
@@ -55,11 +56,16 @@ function createDefaultModelState() {
     sentenceCount: 0,
     vocabularySize: 0,
     parameterCount: 0,
+    computeBackend: 'cpu',
+    computeBackendLabel: 'CPU (совместимый режим)',
+    computeBackendWarning: '',
     trainedEpochs: 0,
     targetEpochs: 0,
     batchesProcessed: 0,
     lastLoss: null,
     averageLoss: null,
+    validationLoss: null,
+    bestValidationLoss: null,
     perplexity: null,
     lastTrainingAt: null,
     lastGenerationAt: null,
@@ -83,9 +89,9 @@ function createDefaultModelState() {
     configSnapshot: JSON.parse(JSON.stringify(DEFAULT_SETTINGS)),
     topTerms: [],
     notes: [
-      'Model data is stored separately from user data: SQLite keeps chats and sources, artifact files keep the trained index and language model.',
-      'Training now fits a real recurrent neural language model over token sequences and keeps a separate tokenizer, weight checkpoint and retrieval index.',
-      'Replies use neural generation plus retrieval grounding, current chat context and user feedback so the model can improve over time.',
+      'Чаты и источники хранятся в SQLite, а чекпоинты модели, токенизатор и индекс знаний лежат отдельными артефактами на диске.',
+      'Обучение использует реальную языковую модель по токенам, отдельный токенизатор, валидацию и сохранение весов.',
+      'Ответы строятся из памяти чата, retrieval по корпусу, нейросетевой генерации и пользовательской обратной связи.',
     ],
   };
 }
@@ -94,7 +100,7 @@ function createDefaultTrainingState() {
   return {
     status: 'idle',
     phase: 'waiting',
-    message: 'Model has not been created yet.',
+    message: 'Модель еще не создана.',
     startedAt: null,
     updatedAt: null,
     requestedStop: false,
@@ -125,6 +131,10 @@ function createDefaultKnowledgeState() {
       trainingSequenceCount: 0,
       corpusTokenCount: 0,
       feedbackExampleCount: 0,
+      validationLoss: null,
+      bestValidationLoss: null,
+      trainingSampleCount: 0,
+      validationSampleCount: 0,
     },
     bm25: {
       knowledge: {

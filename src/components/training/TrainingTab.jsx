@@ -2,7 +2,11 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   Button,
+  FormControlLabel,
   IconButton,
+  LinearProgress,
+  Radio,
+  RadioGroup,
   Slider,
   TextField,
   Tooltip,
@@ -20,7 +24,7 @@ import GlassPanel from '../shared/GlassPanel';
 import MetricCard from '../shared/MetricCard';
 import StatusPill from '../shared/StatusPill';
 import TrainingChart from './TrainingChart';
-import { SETTING_GROUPS, STATUS_FLOW } from '../../constants/modelConfig';
+import { SETTING_GROUPS, STATUS_FLOW, TOGGLE_CONTROLS } from '../../constants/modelConfig';
 import {
   formatDateTime,
   formatDecimal,
@@ -39,7 +43,7 @@ function formatSettingValue(control, value) {
 }
 
 function modelFactRows(snapshot) {
-  const { model, runtime } = snapshot;
+  const { model, runtime, knowledge } = snapshot;
 
   return [
     ['Движок', model.engine],
@@ -48,23 +52,30 @@ function modelFactRows(snapshot) {
     ['Источников', formatNumber(model.sourceCount)],
     ['Чатов', formatNumber(model.chatCount)],
     ['Диалоговых пар', formatNumber(model.replyPairCount)],
-    ['Knowledge-чанков', formatNumber(model.chunkCount)],
-    ['Sequence-примеров', formatNumber(model.trainingItemCount)],
+    ['Фрагментов знаний', formatNumber(model.chunkCount)],
+    ['Обучающих окон', formatNumber(model.trainingItemCount)],
     ['Батчей на эпоху', formatNumber(model.batchesPerEpoch)],
     ['Токенов корпуса', formatNumber(model.tokenCount)],
     ['Размер словаря', formatNumber(model.vocabularySize)],
     ['Параметров модели', formatNumber(model.parameterCount)],
     ['Обучено эпох', formatNumber(model.trainedEpochs)],
+    ['План эпох', formatNumber(model.targetEpochs)],
     ['Последний loss', formatDecimal(model.lastLoss, 4)],
     ['Средний loss', formatDecimal(model.averageLoss, 4)],
+    ['Validation loss', formatDecimal(model.validationLoss, 4)],
+    ['Лучший validation loss', formatDecimal(model.bestValidationLoss, 4)],
     ['Perplexity', formatDecimal(model.perplexity, 4)],
-    ['Средний self-score', formatDecimal(model.averageSelfScore, 3)],
+    ['Средняя самооценка', formatDecimal(model.averageSelfScore, 3)],
     ['Положительных оценок', formatNumber(model.positiveFeedbackCount)],
     ['Отрицательных оценок', formatNumber(model.negativeFeedbackCount)],
     ['Последнее обучение', formatDateTime(model.lastTrainingAt)],
     ['Последняя генерация', formatDateTime(model.lastGenerationAt)],
     ['Стратегия контекста', runtime?.contextStrategy || 'n/a'],
     ['Генератор', runtime?.generatorBackend || 'neural'],
+    ['Режим выполнения', snapshot.settings?.training?.executionMode || 'compatibility'],
+    ['Backend обучения', model.computeBackendLabel || model.computeBackend || 'cpu'],
+    ['Train-примеров в LM', formatNumber(knowledge?.languageModel?.trainingSampleCount || 0)],
+    ['Validation-примеров', formatNumber(knowledge?.languageModel?.validationSampleCount || 0)],
   ];
 }
 
@@ -72,6 +83,9 @@ export default function TrainingTab({
   snapshot,
   busy,
   error,
+  pendingAction,
+  uploadProgress,
+  processingProgress,
   onSaveSettings,
   onUploadFiles,
   onAddUrlSource,
@@ -109,7 +123,39 @@ export default function TrainingTab({
     [settingsDraft, snapshotSettingsKey]
   );
   const canTrain = snapshot.sources.length > 0;
-  const trainingLocked = snapshot.training.status === 'training' || snapshot.model.status === 'saving_checkpoint';
+  const isTraining = snapshot.training.status === 'training';
+  const isSavingCheckpoint = snapshot.model.status === 'saving_checkpoint';
+  const trainingLocked = isTraining || isSavingCheckpoint;
+  const isPaused = snapshot.training.status === 'paused';
+  const isUploadingFiles = pendingAction === 'uploadFiles';
+  const normalizedUploadProgress = typeof uploadProgress === 'number'
+    ? Math.min(100, Math.max(0, uploadProgress))
+    : 0;
+  const normalizedProcessingProgress = typeof processingProgress === 'number'
+    ? Math.min(100, Math.max(0, processingProgress))
+    : null;
+  const isServerProcessing = normalizedProcessingProgress !== null && normalizedUploadProgress >= 100;
+  const uploadIndicatorPercent = isServerProcessing
+    ? normalizedProcessingProgress
+    : normalizedUploadProgress;
+  const hasModel = Boolean(
+    snapshot.model.exists ||
+    snapshot.model.trainedEpochs ||
+    snapshot.knowledge?.languageModel?.checkpointReady
+  );
+  const trainActionLabel = isPaused ? 'Продолжить обучение' : 'Начать обучение';
+  const deleteActionLabel = trainingLocked ? 'Остановить и удалить модель' : 'Удалить модель';
+
+  const handleTrainClick = async () => {
+    if (hasUnsavedSettings) {
+      const savedSnapshot = await onSaveSettings(settingsDraft);
+      if (!savedSnapshot) {
+        return;
+      }
+    }
+
+    await onTrainModel();
+  };
 
   return (
     <div className="training-tab">
@@ -119,8 +165,7 @@ export default function TrainingTab({
             <div>
               <Typography variant="h3">Настройки модели и обучения</Typography>
               <Typography variant="body2" className="muted-text">
-                Здесь настраивается уже не псевдо-обучение, а реальная серверная sequence-модель:
-                архитектура, training loop, retrieval-контекст и генерация ответа.
+                Здесь настраивается полноценный серверный контур: токенизация, языковая модель, retrieval, валидация, пауза с чекпоинтом и генерация ответа.
               </Typography>
             </div>
             <div className="panel-actions">
@@ -137,17 +182,17 @@ export default function TrainingTab({
                 className="action-button"
                 variant="contained"
                 startIcon={<PlayArrowRoundedIcon />}
-                onClick={() => onTrainModel()}
+                onClick={handleTrainClick}
                 disabled={busy || trainingLocked || !canTrain}
               >
-                Запустить обучение
+                {trainActionLabel}
               </Button>
               <Button
                 className="action-button"
                 variant="outlined"
                 startIcon={<PauseRoundedIcon />}
                 onClick={() => onPauseModel()}
-                disabled={snapshot.training.status !== 'training'}
+                disabled={busy || !isTraining}
               >
                 Пауза
               </Button>
@@ -157,14 +202,19 @@ export default function TrainingTab({
                 variant="outlined"
                 startIcon={<DeleteForeverRoundedIcon />}
                 onClick={() => onResetModel()}
-                disabled={busy || trainingLocked}
+                disabled={busy || !hasModel}
               >
-                Сбросить модель
+                {deleteActionLabel}
               </Button>
             </div>
           </div>
 
           {error ? <Alert severity="error">{error}</Alert> : null}
+          {isPaused ? (
+            <Alert severity="success">
+              Обучение поставлено на паузу. Можно продолжить с последнего чекпоинта или полностью удалить модель.
+            </Alert>
+          ) : null}
           {trainingLocked ? (
             <Alert severity="info">
               Во время обучения редактирование корпуса и параметров заблокировано, чтобы чекпоинт не устарел прямо в процессе.
@@ -172,13 +222,64 @@ export default function TrainingTab({
           ) : null}
           {hasUnsavedSettings ? (
             <Alert severity="warning">
-              Есть несохраненные изменения. Они не применятся к серверу, пока вы явно не нажмете сохранение.
+              Есть несохраненные изменения. Они не применятся к серверу, пока вы явно не сохраните настройки.
             </Alert>
           ) : null}
           {!canTrain ? (
             <Alert severity="info">
-              Добавьте хотя бы один `txt`-файл или URL, чтобы у модели был корпус для обучения.
+              Добавьте хотя бы один `txt`-файл или URL, чтобы у модели появился корпус для обучения.
             </Alert>
+          ) : null}
+          {snapshot.model.computeBackendWarning ? (
+            <Alert severity="warning">
+              {snapshot.model.computeBackendWarning}
+            </Alert>
+          ) : null}
+
+          {TOGGLE_CONTROLS.length ? (
+            <div className="toggle-row">
+              {TOGGLE_CONTROLS.map((control) => {
+                const value = settingsDraft?.[control.section]?.[control.key];
+                return (
+                  <div className="toggle-control" key={control.key}>
+                    <Typography variant="subtitle1">{control.label}</Typography>
+                    <Typography variant="body2" className="muted-text">
+                      {control.description}
+                    </Typography>
+                    <RadioGroup
+                      value={value}
+                      onChange={(event) => {
+                        const nextValue = event.target.value;
+                        setSettingsDraft((current) => ({
+                          ...current,
+                          [control.section]: {
+                            ...current[control.section],
+                            [control.key]: nextValue,
+                          },
+                        }));
+                      }}
+                    >
+                      {control.options.map((option) => (
+                        <FormControlLabel
+                          key={option.value}
+                          value={option.value}
+                          control={<Radio />}
+                          disabled={trainingLocked}
+                          label={(
+                            <div>
+                              <Typography variant="subtitle2">{option.label}</Typography>
+                              <Typography variant="caption" className="muted-text">
+                                {option.hint}
+                              </Typography>
+                            </div>
+                          )}
+                        />
+                      ))}
+                    </RadioGroup>
+                  </div>
+                );
+              })}
+            </div>
           ) : null}
 
           <div className="settings-groups">
@@ -225,6 +326,19 @@ export default function TrainingTab({
                             }))
                           }
                         />
+                        {control.key === 'batchSize' && snapshot.model.trainingItemCount > 0 ? (
+                          <Typography variant="caption" className="muted-text">
+                            {`При ${formatNumber(snapshot.model.trainingItemCount)} обучающих окнах это примерно ${formatNumber(
+                              Math.max(
+                                Math.ceil(
+                                  snapshot.model.trainingItemCount /
+                                    Math.max(1, Number(value) || 1)
+                                ),
+                                1
+                              )
+                            )} батч(ей) на эпоху.`}
+                          </Typography>
+                        ) : null}
                       </div>
                     );
                   })}
@@ -250,8 +364,7 @@ export default function TrainingTab({
             <div>
               <Typography variant="h3">Источники для обучения</Typography>
               <Typography variant="body2" className="muted-text">
-                Тексты лежат в SQLite, а чекпоинт модели, токенизатор и retrieval-артефакты
-                сохраняются на диск отдельными файлами.
+                Тексты хранятся в SQLite, а чекпоинт модели, токенизатор и индекс знаний сохраняются отдельными файлами на диске.
               </Typography>
             </div>
           </div>
@@ -280,6 +393,23 @@ export default function TrainingTab({
               />
             </Button>
 
+            {isUploadingFiles ? (
+              <div style={{ width: '100%', marginTop: 8 }}>
+                <Typography variant="caption" className="muted-text">
+                  {isServerProcessing
+                    ? `Обработка данных на сервере: ${uploadIndicatorPercent.toFixed(1)}%`
+                    : normalizedUploadProgress < 100
+                      ? `Загрузка файла: ${normalizedUploadProgress.toFixed(1)}%`
+                      : 'Файл загружен, запуск обработки данных...'}
+                </Typography>
+                <LinearProgress
+                  variant="determinate"
+                  value={uploadIndicatorPercent}
+                  sx={{ mt: 0.5, borderRadius: 99 }}
+                />
+              </div>
+            ) : null}
+
             <div className="url-add-form">
               <TextField
                 className="text-input"
@@ -297,6 +427,7 @@ export default function TrainingTab({
                   if (!urlInput.trim()) {
                     return;
                   }
+
                   await onAddUrlSource(urlInput.trim());
                   setUrlInput('');
                 }}
@@ -314,8 +445,7 @@ export default function TrainingTab({
                   <div>
                     <Typography variant="subtitle2">{source.label}</Typography>
                     <Typography variant="caption" className="muted-text">
-                      {source.type.toUpperCase()} | {formatNumber(source.stats.tokenCount)} токенов |{' '}
-                      {formatNumber(source.stats.charCount)} символов
+                      {source.type.toUpperCase()} | {formatNumber(source.stats.tokenCount)} токенов | {formatNumber(source.stats.charCount)} символов
                     </Typography>
                   </div>
                   <IconButton onClick={() => onRemoveSource(source.id)} disabled={busy || trainingLocked}>
@@ -335,8 +465,7 @@ export default function TrainingTab({
             <div>
               <Typography variant="h3">Состояние модели</Typography>
               <Typography variant="body2" className="muted-text">
-                Метрики ниже показывают реальный размер sequence-модели, обратную связь от пользователей
-                и текущий статус обучения на сервере.
+                Метрики ниже показывают реальный размер модели, прогресс обучения, качество по валидации и накопленную обратную связь.
               </Typography>
             </div>
           </div>
@@ -346,7 +475,7 @@ export default function TrainingTab({
             <MetricCard label="Словарь" value={formatNumber(snapshot.model.vocabularySize)} hint="токенов" />
             <MetricCard label="Эпохи" value={formatNumber(snapshot.model.trainedEpochs)} hint="завершено" />
             <MetricCard label="Loss" value={formatDecimal(snapshot.model.lastLoss, 4)} hint="последний батч" />
-            <MetricCard label="Perplexity" value={formatDecimal(snapshot.model.perplexity, 4)} hint="по модели" />
+            <MetricCard label="Val loss" value={formatDecimal(snapshot.model.validationLoss, 4)} hint="последняя проверка" />
             <MetricCard label="Оценки" value={formatNumber(snapshot.runtime?.ratedMessages || 0)} hint="ответов" />
           </div>
 
@@ -400,8 +529,7 @@ export default function TrainingTab({
             <div>
               <Typography variant="h3">График обучения</Typography>
               <Typography variant="body2" className="muted-text">
-                Лента batch-loss обновляется во время реального server-side training loop и помогает
-                понять, идет ли модель к стабильному обучению.
+                Лента batch-loss обновляется во время реального server-side цикла обучения и помогает понять, стабилизируется ли модель.
               </Typography>
             </div>
           </div>
@@ -413,8 +541,7 @@ export default function TrainingTab({
             <div>
               <Typography variant="h3">Лента статусов</Typography>
               <Typography variant="body2" className="muted-text">
-                Здесь видно, на какой стадии находится модель: подготовка корпуса, fit, сохранение
-                чекпоинта или обучение от обратной связи.
+                Здесь видно, на какой стадии находится модель: подготовка корпуса, обучение, сохранение чекпоинта, пауза или удаление модели.
               </Typography>
             </div>
           </div>

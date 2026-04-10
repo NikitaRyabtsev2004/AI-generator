@@ -1,6 +1,6 @@
 const fs = require('fs/promises');
 const path = require('path');
-const { DatabaseSync } = require('node:sqlite');
+const Database = require('better-sqlite3');
 const {
   createDefaultKnowledgeState,
   createDefaultModelState,
@@ -197,7 +197,7 @@ async function ensureStorageLayout() {
   await fs.mkdir(NEURAL_MODEL_DIR, { recursive: true });
 
   if (!db) {
-    db = new DatabaseSync(DB_FILE);
+    db = new Database(DB_FILE);
     db.exec(`
       CREATE TABLE IF NOT EXISTS app_snapshot (
         name TEXT PRIMARY KEY,

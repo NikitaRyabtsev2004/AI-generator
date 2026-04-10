@@ -48,12 +48,37 @@ function repairMojibakeText(input = '') {
     return '';
   }
 
+  const decodeUtf8FromWin1251Mojibake = (value) => {
+    const bytes = [];
+    for (const character of value) {
+      const codePoint = character.charCodeAt(0);
+      if (codePoint <= 0xFF) {
+        bytes.push(codePoint);
+        continue;
+      }
+
+      const encoded = iconv.encode(character, 'win1251');
+      if (!encoded.length) {
+        return value;
+      }
+      bytes.push(...encoded);
+    }
+
+    return normalizeTextShape(Buffer.from(bytes).toString('utf8'));
+  };
+
   const candidates = [normalized];
 
   try {
     candidates.push(
       normalizeTextShape(iconv.decode(iconv.encode(normalized, 'win1251'), 'utf8'))
     );
+  } catch (error) {
+    // Ignore conversion failures and keep the original text.
+  }
+
+  try {
+    candidates.push(decodeUtf8FromWin1251Mojibake(normalized));
   } catch (error) {
     // Ignore conversion failures and keep the original text.
   }

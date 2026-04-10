@@ -1,7 +1,8 @@
 const fs = require('fs/promises');
+const fsSync = require('fs');
 const path = require('path');
 const tf = require('@tensorflow/tfjs');
-const { cleanText } = require('./text');
+const { cleanText, tokenizeWords } = require('./text');
 
 const SPECIAL_TOKENS = Object.freeze([
   '__pad__',
@@ -18,23 +19,44 @@ const SPECIAL_TOKEN_SET = new Set(SPECIAL_TOKENS);
 const NO_SPACE_BEFORE = new Set(['.', ',', '!', '?', ';', ':', ')', ']', '}', '%']);
 const NO_SPACE_AFTER = new Set(['(', '[', '{']);
 
-let backendReadyPromise = null;
+const SUPPORTED_EXECUTION_MODES = new Set([
+  'compatibility',
+  'native_preferred',
+  'gpu_preferred',
+]);
+
+let backendReadyState = {
+  key: null,
+  promise: null,
+  info: null,
+};
 let bannerSuppressed = false;
 let originalWarn = null;
 let originalLog = null;
 let originalInfo = null;
+let nodeBackendPackages = null;
 
 function suppressNodeBanner() {
   if (bannerSuppressed) {
     return;
   }
 
+  if (!process.env.TF_CPP_MIN_LOG_LEVEL) {
+    process.env.TF_CPP_MIN_LOG_LEVEL = '3';
+  }
+
   originalWarn = console.warn;
   originalLog = console.log;
   originalInfo = console.info;
+  const suppressedPatterns = [
+    'To speed things up dramatically, install our node backend',
+    "The kernel '",
+    "for backend 'tensorflow' is already registered",
+    'tensorflow backend was already registered',
+  ];
   const shouldSuppress = (args) => args.some((value) => (
     typeof value === 'string' &&
-    value.includes('To speed things up dramatically, install our node backend')
+    suppressedPatterns.some((pattern) => value.includes(pattern))
   ));
 
   console.warn = (...args) => {
@@ -63,18 +85,277 @@ function suppressNodeBanner() {
   bannerSuppressed = true;
 }
 
-async function ensureBackend() {
-  if (!backendReadyPromise) {
-    backendReadyPromise = (async () => {
-      suppressNodeBanner();
-      await tf.setBackend('cpu');
+function normalizeExecutionMode(input) {
+  const candidate = typeof input === 'string'
+    ? input
+    : input?.training?.executionMode;
+
+  return SUPPORTED_EXECUTION_MODES.has(candidate)
+    ? candidate
+    : 'compatibility';
+}
+
+function extractBackendErrorMessage(error) {
+  const rawMessage = String(error?.message || '').trim();
+  if (!rawMessage) {
+    return 'Не удалось загрузить native backend.';
+  }
+
+  return cleanText(rawMessage.split(/\r?\n/u)[0]);
+}
+
+function readNapiDirectories(libDir) {
+  if (!fsSync.existsSync(libDir)) {
+    return [];
+  }
+
+  return fsSync.readdirSync(libDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith('napi-v'))
+    .map((entry) => path.join(libDir, entry.name))
+    .sort();
+}
+
+function repairTensorflowDllPlacement(packageName, packageDir) {
+  if (process.platform !== 'win32' || !packageDir) {
+    return {
+      repaired: false,
+      note: '',
+    };
+  }
+
+  const libDir = path.join(packageDir, 'lib');
+  const napiDirs = readNapiDirectories(libDir);
+  if (!napiDirs.length) {
+    return {
+      repaired: false,
+      note: '',
+    };
+  }
+
+  const donorDllPath = napiDirs
+    .map((directory) => path.join(directory, 'tensorflow.dll'))
+    .find((candidate) => fsSync.existsSync(candidate));
+
+  if (!donorDllPath) {
+    return {
+      repaired: false,
+      note: '',
+    };
+  }
+
+  const repairedTargets = [];
+  napiDirs.forEach((directory) => {
+    const bindingPath = path.join(directory, 'tfjs_binding.node');
+    const dllPath = path.join(directory, 'tensorflow.dll');
+
+    if (!fsSync.existsSync(bindingPath) || fsSync.existsSync(dllPath)) {
+      return;
+    }
+
+    fsSync.copyFileSync(donorDllPath, dllPath);
+    repairedTargets.push(path.basename(directory));
+  });
+
+  return repairedTargets.length
+    ? {
+      repaired: true,
+      note: `Сервер выровнял размещение tensorflow.dll для ${packageName} (${repairedTargets.join(', ')}).`,
+    }
+    : {
+      repaired: false,
+      note: '',
+    };
+}
+
+function inspectNodeBackendPackage(packageName) {
+  const result = {
+    packageName,
+    installed: false,
+    loadable: false,
+    errorCode: '',
+    errorMessage: '',
+    repairNote: '',
+  };
+
+  try {
+    const packageJsonPath = require.resolve(`${packageName}/package.json`);
+    result.installed = true;
+    const packageDir = path.dirname(packageJsonPath);
+    const repairInfo = repairTensorflowDllPlacement(packageName, packageDir);
+    result.repairNote = repairInfo.note;
+    require(packageName);
+    result.loadable = true;
+  } catch (error) {
+    if (error?.code === 'MODULE_NOT_FOUND' && !String(error?.message || '').includes(packageName)) {
+      result.installed = true;
+    }
+
+    if (!result.installed && error?.code !== 'MODULE_NOT_FOUND') {
+      result.installed = true;
+    }
+
+    result.errorCode = error?.code || '';
+    result.errorMessage = extractBackendErrorMessage(error);
+  }
+
+  return result;
+}
+
+function getNodeBackendPackageName(kind) {
+  return kind === 'gpu'
+    ? '@tensorflow/tfjs-node-gpu'
+    : '@tensorflow/tfjs-node';
+}
+
+async function getNodeBackendPackageProbe(kind) {
+  if (!nodeBackendPackages) {
+    nodeBackendPackages = {};
+  }
+
+  if (!nodeBackendPackages[kind]) {
+    nodeBackendPackages[kind] = inspectNodeBackendPackage(getNodeBackendPackageName(kind));
+  }
+
+  return nodeBackendPackages[kind];
+}
+
+function detectTensorflowDeviceMode() {
+  const backend = tf.engine().backendInstance;
+  const gpuFlag = typeof backend?.isUsingGpuDevice === 'function'
+    ? backend.isUsingGpuDevice()
+    : backend?.binding && typeof backend.binding.isUsingGpuDevice === 'function'
+      ? backend.binding.isUsingGpuDevice()
+      : backend?.isUsingGpuDevice;
+
+  return {
+    usingGpu: Boolean(gpuFlag),
+    isGpuPackage: Boolean(backend?.isGPUPackage),
+  };
+}
+
+function formatBackendLabel({ usingGpu, isGpuPackage }) {
+  if (usingGpu) {
+    return 'TensorFlow backend (GPU)';
+  }
+
+  return isGpuPackage
+    ? 'TensorFlow backend (native CPU)'
+    : 'TensorFlow native backend';
+}
+
+function buildMissingPackageWarning(packageName, fallbackLabel) {
+  return `Выбран ускоренный режим, но пакет \`${packageName}\` не установлен. Используется ${fallbackLabel}.`;
+}
+
+function buildLoadFailureWarning(probe, fallbackLabel) {
+  const repairSuffix = probe.repairNote ? ` ${probe.repairNote}` : '';
+  return `Пакет \`${probe.packageName}\` найден, но native binding не загрузился: ${probe.errorMessage}.${repairSuffix} Используется ${fallbackLabel}.`;
+}
+
+function buildGpuUnavailableWarning(probe) {
+  const repairSuffix = probe.repairNote ? ` ${probe.repairNote}` : '';
+  return `GPU-режим выбран, но TensorFlow не активировал видеокарту.${repairSuffix} Для \`@tensorflow/tfjs-node-gpu\` на Windows обычно нужны CUDA 11.x и cuDNN 8.x, а DLL вроде \`cudart64_110.dll\`, \`cudnn64_8.dll\`, \`cusolver64_11.dll\` и \`cublas64_11.dll\` должны быть доступны в PATH.`;
+}
+
+function buildBackendRuntimeFailureWarning(probe, fallbackLabel, errorMessage) {
+  const repairSuffix = probe.repairNote ? ` ${probe.repairNote}` : '';
+  const compatibilityHint = errorMessage.includes('isNullOrUndefined')
+    ? ' Похоже на несовместимость `tfjs-node(-gpu)` с текущей версией Node.js.'
+    : '';
+  return `TensorFlow backend загрузился, но базовая операция завершилась ошибкой: ${errorMessage}.${compatibilityHint}${repairSuffix} Используется ${fallbackLabel}.`;
+}
+
+async function verifyTensorflowBackendExecution() {
+  const input = tf.tensor1d([1, 2, 3], 'float32');
+  let slice = null;
+
+  try {
+    slice = tf.slice(input, [0], [1]);
+    await slice.data();
+    return {
+      ok: true,
+      errorMessage: '',
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      errorMessage: extractBackendErrorMessage(error),
+    };
+  } finally {
+    slice?.dispose();
+    input.dispose();
+  }
+}
+
+async function selectBackend(executionMode) {
+  const normalizedMode = normalizeExecutionMode(executionMode);
+  suppressNodeBanner();
+
+  if (normalizedMode === 'compatibility') {
+    await tf.setBackend('cpu');
+    return {
+      backendName: 'cpu',
+      executionMode: normalizedMode,
+      label: 'CPU (совместимый режим)',
+      warning: '',
+    };
+  }
+
+  const prefersGpu = normalizedMode === 'gpu_preferred';
+  const probeKind = prefersGpu ? 'gpu' : 'native';
+  const packageProbe = await getNodeBackendPackageProbe(probeKind);
+  let runtimeFailure = '';
+
+  if (packageProbe.loadable) {
+    try {
+      await tf.setBackend('tensorflow');
+      await tf.ready();
+      const tensorflowMode = detectTensorflowDeviceMode();
+      // const executionProbe = await verifyTensorflowBackendExecution();
+      // if (!executionProbe.ok) {
+      //   runtimeFailure = executionProbe.errorMessage;
+      //   throw new Error(executionProbe.errorMessage);
+      // }
+      return {
+        backendName: 'tensorflow',
+        executionMode: normalizedMode,
+        label: formatBackendLabel(tensorflowMode),
+        warning: prefersGpu && !tensorflowMode.usingGpu
+          ? buildGpuUnavailableWarning(packageProbe)
+          : '',
+      };
+    } catch (error) {
+      runtimeFailure ||= extractBackendErrorMessage(error);
+    }
+  }
+
+  await tf.setBackend('cpu');
+  return {
+    backendName: 'cpu',
+    executionMode: normalizedMode,
+    label: 'CPU (fallback)',
+    warning: runtimeFailure
+      ? buildBackendRuntimeFailureWarning(packageProbe, 'CPU', runtimeFailure)
+      : packageProbe.installed
+        ? buildLoadFailureWarning(packageProbe, 'CPU')
+        : buildMissingPackageWarning(getNodeBackendPackageName(probeKind), 'CPU'),
+  };
+}
+
+async function ensureBackend(executionMode = 'compatibility') {
+  const normalizedMode = normalizeExecutionMode(executionMode);
+  if (!backendReadyState.promise || backendReadyState.key !== normalizedMode) {
+    backendReadyState.key = normalizedMode;
+    backendReadyState.promise = (async () => {
+      const info = await selectBackend(normalizedMode);
       await tf.ready();
       tf.enableProdMode();
-      return tf.getBackend();
+      backendReadyState.info = info;
+      return info;
     })();
   }
 
-  return backendReadyPromise;
+  return backendReadyState.promise;
 }
 
 function normalizeModelText(input = '') {
@@ -251,22 +532,14 @@ function createModel({ vocabularySize, settings }) {
 
   const output = tf.layers.dense({
     units: vocabularySize,
-    activation: 'softmax',
     name: 'token_logits',
   }).apply(current);
 
-  const model = tf.model({
+  return tf.model({
     inputs: input,
     outputs: output,
     name: 'liquid_glass_neural_lm',
   });
-
-  model.compile({
-    optimizer: tf.train.adam(modelSettings.learningRate),
-    loss: 'sparseCategoricalCrossentropy',
-  });
-
-  return model;
 }
 
 function normalizeLossValue(lossValue) {
@@ -325,8 +598,10 @@ async function saveRuntime({
 
 async function loadRuntime({ storage, settings }) {
   const layout = createArtifactLayout(storage);
+  let model = null;
 
   try {
+    await ensureBackend(settings);
     const [tokenizerRaw, specsRaw, weightsRaw] = await Promise.all([
       fs.readFile(layout.tokenizerPath, 'utf8'),
       fs.readFile(layout.neuralSpecPath, 'utf8'),
@@ -337,7 +612,7 @@ async function loadRuntime({ storage, settings }) {
     const specBundle = JSON.parse(specsRaw);
     const manifest = specBundle.manifest || {};
     const modelSettings = manifest.modelSettings || settings.training;
-    const model = createModel({
+    model = createModel({
       vocabularySize: tokenizer.idToToken.length,
       settings: {
         ...settings,
@@ -353,7 +628,13 @@ async function loadRuntime({ storage, settings }) {
       weightsRaw.byteOffset + weightsRaw.byteLength
     );
     const namedWeights = tf.io.decodeWeights(arrayBuffer, specBundle.specs);
-    const orderedWeights = model.weights.map((weight) => namedWeights[weight.name]);
+    const normalizeWeightName = (name) => name.replace(/\/([^/]+?)_\d+$/u, '/$1');
+    const orderedWeights = model.weights.map((weight) => (
+      namedWeights[weight.name] || namedWeights[normalizeWeightName(weight.name)]
+    ));
+    if (orderedWeights.some((tensor) => !tensor)) {
+      throw new Error('Не удалось сопоставить веса модели с сохраненным чекпоинтом.');
+    }
     model.setWeights(orderedWeights);
 
     return {
@@ -363,6 +644,7 @@ async function loadRuntime({ storage, settings }) {
       parameterCount: countParameters(model),
     };
   } catch (error) {
+    model?.dispose?.();
     return null;
   }
 }
@@ -402,6 +684,130 @@ function shuffleInPlace(items) {
   return items;
 }
 
+function splitDatasetSamples(samples) {
+  const shuffled = shuffleInPlace([...samples]);
+  if (shuffled.length < 12) {
+    return {
+      trainingSamples: shuffled,
+      validationSamples: [],
+    };
+  }
+
+  const validationCount = Math.min(
+    Math.max(Math.floor(shuffled.length * 0.12), 1),
+    Math.max(shuffled.length - 4, 0)
+  );
+
+  return {
+    trainingSamples: shuffled.slice(0, shuffled.length - validationCount),
+    validationSamples: shuffled.slice(shuffled.length - validationCount),
+  };
+}
+
+function deriveMinimumOptimizationSteps({ dataset, settings, batchSize }) {
+  const requestedSteps = Math.max(
+    Math.ceil(dataset.sampleCount / Math.max(batchSize, 1)),
+    1
+  ) * Math.max(Number(settings.training.epochs) || 1, 1);
+
+  return {
+    minimumSteps: requestedSteps,
+    requestedSteps,
+    enforced: false,
+  };
+}
+
+function createBatchTensors(batchSamples, sequenceLength) {
+  const xValues = [];
+  const yValues = [];
+
+  batchSamples.forEach((sample) => {
+    xValues.push(...sample.x);
+    yValues.push(...sample.y);
+  });
+
+  return {
+    xBatch: tf.tensor2d(xValues, [batchSamples.length, sequenceLength], 'int32'),
+    yBatch: tf.tensor2d(yValues, [batchSamples.length, sequenceLength], 'int32'),
+  };
+}
+
+function computeMaskedLoss(logits, labels, padId = 0) {
+  return tf.tidy(() => {
+    const vocabularySize = logits.shape[logits.shape.length - 1];
+    const flatLogits = logits.reshape([-1, vocabularySize]);
+    const flatLabels = labels.reshape([-1]);
+    const safeLabels = flatLabels.maximum(0).toInt();
+    const mask = safeLabels.notEqual(tf.scalar(padId, 'int32')).cast('float32');
+    const oneHotLabels = tf.oneHot(safeLabels, vocabularySize).toFloat();
+    const logProbabilities = tf.logSoftmax(flatLogits);
+    const tokenLosses = tf.neg(oneHotLabels.mul(logProbabilities).sum(-1));
+    const maskedLosses = tokenLosses.mul(mask);
+    const normalization = mask.sum().maximum(tf.scalar(1));
+    return maskedLosses.sum().div(normalization);
+  });
+}
+
+async function trainBatch({ runtime, optimizer, xBatch, yBatch, clipNorm = 1 }) {
+  const trainableVariables = runtime.model.trainableWeights.map((weight) => weight.val);
+
+  const { value: lossTensor, grads } = tf.variableGrads(() => {
+    const logits = runtime.model.apply(xBatch, { training: true });
+    return computeMaskedLoss(logits, yBatch);
+  }, trainableVariables);
+
+  const clippedEntries = Object.entries(grads).map(([name, gradTensor]) => {
+    const clipped = clipNorm > 0
+      ? tf.tidy(() => {
+        const gradientNorm = gradTensor.norm();
+        const scale = tf.minimum(
+          tf.scalar(1),
+          tf.scalar(clipNorm).div(gradientNorm.add(tf.scalar(1e-6)))
+        );
+        return gradTensor.mul(scale);
+      })
+      : gradTensor;
+    if (clipped !== gradTensor) {
+      gradTensor.dispose();
+    }
+    return [name, clipped];
+  });
+  const clippedGradients = Object.fromEntries(clippedEntries);
+
+  optimizer.applyGradients(clippedGradients);
+  Object.values(clippedGradients).forEach((tensor) => tensor.dispose());
+
+  const lossValue = Number((await lossTensor.data())[0] || 0);
+  lossTensor.dispose();
+  return lossValue;
+}
+
+async function evaluateDataset({ runtime, samples, sequenceLength, batchSize }) {
+  if (!samples.length) {
+    return null;
+  }
+
+  let totalLoss = 0;
+  let processedBatches = 0;
+
+  for (let batchStart = 0; batchStart < samples.length; batchStart += batchSize) {
+    const batchSamples = samples.slice(batchStart, batchStart + batchSize);
+    const { xBatch, yBatch } = createBatchTensors(batchSamples, sequenceLength);
+    const batchLossTensor = tf.tidy(() => {
+      const logits = runtime.model.predict(xBatch);
+      return computeMaskedLoss(logits, yBatch);
+    });
+
+    totalLoss += Number((await batchLossTensor.data())[0] || 0);
+    processedBatches += 1;
+    batchLossTensor.dispose();
+    xBatch.dispose();
+    yBatch.dispose();
+  }
+
+  return Number((totalLoss / Math.max(processedBatches, 1)).toFixed(4));
+}
+
 async function trainRuntime({
   runtime,
   dataset,
@@ -410,53 +816,55 @@ async function trainRuntime({
   onBatchEnd,
   shouldStop,
 }) {
-  await ensureBackend();
+  await ensureBackend(settings);
 
-  const samples = [...dataset.samples];
-  const totalEpochs = settings.training.epochs;
+  const optimizer = tf.train.adam(settings.training.learningRate);
+  const { trainingSamples, validationSamples } = splitDatasetSamples(dataset.samples);
   const batchSize = Math.max(1, settings.training.batchSize);
   const sequenceLength = settings.training.sequenceLength;
+  const baseEpochs = Math.max(Number(settings.training.epochs) || 1, 1);
+  const batchesPerEpoch = Math.max(Math.ceil(trainingSamples.length / batchSize), 1);
+  const stepBudget = deriveMinimumOptimizationSteps({
+    dataset,
+    settings,
+    batchSize,
+  });
+  const totalEpochs = baseEpochs;
   const history = [];
   let lastLoss = null;
   let totalLoss = 0;
   let processedBatches = 0;
   let completedEpochs = epochOffset;
   let stopRequested = false;
+  let lastValidationLoss = null;
+  let bestValidationLoss = null;
+  let bestEpoch = null;
+  let bestWeights = null;
+
+  const effectiveTrainingSamples = trainingSamples.length ? trainingSamples : [...dataset.samples];
 
   for (let epoch = 1; epoch <= totalEpochs; epoch += 1) {
-    shuffleInPlace(samples);
+    shuffleInPlace(effectiveTrainingSamples);
 
-    for (let batchStart = 0; batchStart < samples.length; batchStart += batchSize) {
+    for (let batchStart = 0; batchStart < effectiveTrainingSamples.length; batchStart += batchSize) {
       if (typeof shouldStop === 'function' && shouldStop()) {
         stopRequested = true;
         break;
       }
 
-      const batchSamples = samples.slice(batchStart, batchStart + batchSize);
-      const xValues = [];
-      const yValues = [];
-
-      batchSamples.forEach((sample) => {
-        xValues.push(...sample.x);
-        yValues.push(...sample.y);
+      const batchSamples = effectiveTrainingSamples.slice(batchStart, batchStart + batchSize);
+      const { xBatch, yBatch } = createBatchTensors(batchSamples, sequenceLength);
+      const batchLoss = await trainBatch({
+        runtime,
+        optimizer,
+        xBatch,
+        yBatch,
+        clipNorm: 1,
       });
-
-      const xBatch = tf.tensor2d(
-        xValues,
-        [batchSamples.length, sequenceLength],
-        'int32'
-      );
-      const yBatch = tf.tensor2d(
-        yValues,
-        [batchSamples.length, sequenceLength],
-        'int32'
-      );
-
-      const batchLoss = await runtime.model.trainOnBatch(xBatch, yBatch);
       xBatch.dispose();
       yBatch.dispose();
 
-      lastLoss = Number(normalizeLossValue(batchLoss).toFixed(4));
+      lastLoss = Number(batchLoss.toFixed(4));
       totalLoss += lastLoss;
       processedBatches += 1;
 
@@ -475,7 +883,11 @@ async function trainRuntime({
           processedBatches,
           epoch: epochOffset + epoch,
           batch: historyEntry.batch,
-          batchesThisEpoch: Math.ceil(samples.length / batchSize),
+          batchesThisEpoch: Math.ceil(effectiveTrainingSamples.length / batchSize),
+          effectiveEpochs: totalEpochs,
+          requestedEpochs: baseEpochs,
+          minimumTrainingSteps: stepBudget.minimumSteps,
+          enforcedStepBudget: stepBudget.enforced,
           historyEntry,
         });
       }
@@ -485,8 +897,29 @@ async function trainRuntime({
       break;
     }
 
+    lastValidationLoss = await evaluateDataset({
+      runtime,
+      samples: validationSamples,
+      sequenceLength,
+      batchSize,
+    });
+
+    if (lastValidationLoss !== null && (bestValidationLoss === null || lastValidationLoss < bestValidationLoss)) {
+      bestValidationLoss = lastValidationLoss;
+      bestEpoch = epochOffset + epoch;
+      bestWeights?.forEach((tensor) => tensor.dispose());
+      bestWeights = runtime.model.getWeights().map((weight) => weight.clone());
+    }
+
     completedEpochs = epochOffset + epoch;
   }
+
+  if (bestWeights?.length) {
+    runtime.model.setWeights(bestWeights);
+    bestWeights.forEach((tensor) => tensor.dispose());
+  }
+
+  optimizer.dispose?.();
 
   return {
     lastLoss,
@@ -494,22 +927,37 @@ async function trainRuntime({
     perplexity: processedBatches
       ? Number(Math.exp(totalLoss / processedBatches).toFixed(4))
       : null,
+    validationLoss: lastValidationLoss,
+    bestValidationLoss,
+    bestEpoch,
     processedBatches,
     completedEpochs,
+    effectiveEpochs: epochOffset + totalEpochs,
+    requestedEpochs: epochOffset + baseEpochs,
+    minimumTrainingSteps: stepBudget.minimumSteps,
+    enforcedStepBudget: stepBudget.enforced,
+    trainingSampleCount: effectiveTrainingSamples.length,
+    validationSampleCount: validationSamples.length,
     stopRequested,
     history,
   };
 }
 
 function applySamplingControls(probabilities, generatedTokens, bannedTokenIds, settings) {
+  const tokenFrequency = generatedTokens.reduce((result, tokenId) => {
+    result[tokenId] = (result[tokenId] || 0) + 1;
+    return result;
+  }, {});
+
   const nextProbabilities = probabilities.map((value, index) => {
     if (bannedTokenIds.has(index)) {
       return 0;
     }
 
     let nextValue = value;
-    if (generatedTokens.includes(index)) {
-      nextValue /= settings.generation.repetitionPenalty;
+    const repeats = tokenFrequency[index] || 0;
+    if (repeats > 0) {
+      nextValue /= Math.pow(settings.generation.repetitionPenalty, repeats);
     }
 
     return nextValue;
@@ -551,12 +999,31 @@ function sampleFromDistribution(probabilities) {
   return probabilities.findIndex((value) => value > 0);
 }
 
+function isUsableGeneratedText(text) {
+  const normalized = cleanText(text);
+  const tokens = tokenizeWords(normalized);
+  if (tokens.length < 3) {
+    return false;
+  }
+
+  const uniqueTokenRatio = new Set(tokens).size / Math.max(tokens.length, 1);
+  if (uniqueTokenRatio < 0.35) {
+    return false;
+  }
+
+  if (/[?!.,]{4,}/u.test(normalized)) {
+    return false;
+  }
+
+  return true;
+}
+
 async function generateText({
   runtime,
   promptText,
   settings,
 }) {
-  await ensureBackend();
+  await ensureBackend(settings);
 
   if (!runtime?.model || !runtime?.tokenizer) {
     return {
@@ -592,8 +1059,8 @@ async function generateText({
       const prediction = runtime.model.predict(inputTensor);
       const logits = prediction.slice([0, sequenceLength - 1, 0], [1, 1, runtime.tokenizer.idToToken.length]);
       const reshaped = logits.reshape([runtime.tokenizer.idToToken.length]);
-      const adjusted = tf.pow(reshaped, tf.scalar(1 / temperature));
-      const normalized = adjusted.div(adjusted.sum());
+      const scaled = reshaped.div(tf.scalar(temperature));
+      const normalized = tf.softmax(scaled);
       return Array.from(normalized.dataSync());
     });
 
@@ -609,11 +1076,20 @@ async function generateText({
       break;
     }
 
+    if (generatedTokenIds.length >= 4) {
+      const tail = generatedTokenIds.slice(-4);
+      if (tail.every((tokenId) => tokenId === nextTokenId)) {
+        break;
+      }
+    }
+
     generatedTokenIds.push(nextTokenId);
   }
 
+  const decodedText = decodeTokenIds(generatedTokenIds, tokenizer);
+
   return {
-    text: decodeTokenIds(generatedTokenIds, tokenizer),
+    text: isUsableGeneratedText(decodedText) ? decodedText : '',
     generatedTokenIds,
   };
 }
@@ -631,6 +1107,7 @@ module.exports = {
   generateText,
   loadRuntime,
   saveRuntime,
+  splitDatasetSamples,
   tokenizeForModel,
   trainRuntime,
 };

@@ -35,7 +35,7 @@ const DEFAULT_RUNTIME_CONFIG = {
     ollamaBaseUrl: 'http://127.0.0.1:11434',
     ollamaModel: '',
     systemPrompt:
-      'You are a helpful Russian-speaking assistant. Answer naturally, do not imitate the user, and prefer concise factual answers grounded in the provided knowledge.',
+      'Ты полезный русскоязычный ассистент. Отвечай естественно, не копируй пользователя и опирайся на предоставленные знания и контекст чата.',
   },
   feedback: {
     autoAcceptThreshold: 0.72,
@@ -91,7 +91,7 @@ async function initializeRuntimeConfig() {
 
 function getRuntimeConfig() {
   if (!runtimeConfig) {
-    throw new Error('Runtime config is not initialized.');
+    throw new Error('Runtime-конфиг еще не инициализирован.');
   }
 
   return runtimeConfig;

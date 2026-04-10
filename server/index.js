@@ -7,15 +7,29 @@ const { fetchPageContent } = require('./content');
 const { createModelEngine } = require('./modelEngine');
 const { initializeRuntimeConfig } = require('./runtimeConfig');
 const { getState, initializeStore, updateState } = require('./store');
-const { decodeBufferToText } = require('./text');
+const { cleanText, decodeBufferToText } = require('./text');
 
 const PORT = Number(process.env.PORT || 4000);
+const DEFAULT_MAX_UPLOAD_FILE_MB = 64;
+const DEFAULT_MAX_UPLOAD_FILES = 10;
+
+function readPositiveIntegerEnv(name, fallbackValue) {
+  const value = Number(process.env[name]);
+  if (!Number.isFinite(value) || value <= 0) {
+    return fallbackValue;
+  }
+  return Math.floor(value);
+}
+
+const MAX_UPLOAD_FILE_MB = readPositiveIntegerEnv('MAX_UPLOAD_FILE_MB', DEFAULT_MAX_UPLOAD_FILE_MB);
+const MAX_UPLOAD_FILES = readPositiveIntegerEnv('MAX_UPLOAD_FILES', DEFAULT_MAX_UPLOAD_FILES);
+
 const app = express();
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 12 * 1024 * 1024,
-    files: 10,
+    fileSize: MAX_UPLOAD_FILE_MB * 1024 * 1024,
+    files: MAX_UPLOAD_FILES,
   },
 });
 
@@ -30,10 +44,20 @@ function sendSuccess(response, payload) {
 }
 
 function sendError(response, error) {
+  const message = error?.code === 'LIMIT_FILE_SIZE'
+    ? `Файл слишком большой. Максимальный размер: ${MAX_UPLOAD_FILE_MB} МБ на файл.`
+    : error?.code === 'LIMIT_FILE_COUNT'
+      ? `Слишком много файлов в одном запросе. Максимум: ${MAX_UPLOAD_FILES}.`
+      : cleanText(error?.message || 'Неизвестная ошибка сервера.');
+
   response.status(400).json({
     ok: false,
-    error: error.message || 'Unknown server error',
+    error: message,
   });
+}
+
+function writeNdjsonChunk(response, payload) {
+  response.write(`${JSON.stringify(payload)}\n`);
 }
 
 async function bootstrap() {
@@ -77,25 +101,59 @@ async function bootstrap() {
   });
 
   app.post('/api/sources/files', upload.array('files'), async (request, response) => {
-    try {
-      const files = request.files || [];
-      if (!files.length) {
-        throw new Error('Не переданы файлы.');
-      }
+    const files = request.files || [];
+    if (!files.length) {
+      sendError(response, new Error('Файлы не переданы.'));
+      return;
+    }
 
+    response.status(200);
+    response.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+    response.setHeader('Cache-Control', 'no-cache, no-transform');
+    response.setHeader('X-Accel-Buffering', 'no');
+
+    try {
+      const totalFiles = files.length;
       let snapshot = null;
-      for (const file of files) {
+      writeNdjsonChunk(response, {
+        type: 'processing_progress',
+        processedFiles: 0,
+        totalFiles,
+        percent: 0,
+      });
+
+      for (let index = 0; index < files.length; index += 1) {
+        const file = files[index];
         const content = decodeBufferToText(file.buffer);
         snapshot = await engine.addSource({
           type: 'file',
           label: file.originalname,
           content,
         });
+
+        const processedFiles = index + 1;
+        const percent = Number(((processedFiles / totalFiles) * 100).toFixed(1));
+        writeNdjsonChunk(response, {
+          type: 'processing_progress',
+          processedFiles,
+          totalFiles,
+          percent,
+          fileName: file.originalname,
+        });
       }
 
-      sendSuccess(response, { snapshot });
+      writeNdjsonChunk(response, {
+        type: 'result',
+        ok: true,
+        snapshot,
+      });
+      response.end();
     } catch (error) {
-      sendError(response, error);
+      writeNdjsonChunk(response, {
+        type: 'error',
+        message: cleanText(error?.message || 'Ошибка загрузки файлов.'),
+      });
+      response.end();
     }
   });
 
@@ -221,17 +279,24 @@ async function bootstrap() {
     app.get('/', (_request, response) => {
       response.json({
         ok: true,
-        message: 'Server is running. Build directory was not found, so only API mode is active.',
+        message: 'Сервер запущен. Папка build не найдена, поэтому сейчас активен только API-режим.',
       });
     });
   }
 
+  app.use((error, _request, response, _next) => {
+    if (response.headersSent) {
+      return;
+    }
+    sendError(response, error);
+  });
+
   app.listen(PORT, () => {
-    console.log(`Liquid Glass AI server listening on http://localhost:${PORT}`);
+    console.log(`Сервер Liquid Glass AI запущен: http://localhost:${PORT}`);
   });
 }
 
 bootstrap().catch((error) => {
-  console.error('Failed to bootstrap server:', error);
+  console.error('Не удалось запустить сервер:', error);
   process.exit(1);
 });

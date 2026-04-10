@@ -153,13 +153,43 @@
   background: rgba(255, 255, 255, 0.05);
 }
 
+.feedback-button.MuiIconButton-root {
+  border: 1px solid var(--panel-border);
+  background: rgba(255, 255, 255, 0.05);
+  color: rgba(255, 255, 255, 0.72);
+  transition: transform 0.18s ease, border-color 0.18s ease, background 0.18s ease, color 0.18s ease;
+}
+
+.feedback-button.MuiIconButton-root:hover {
+  transform: translateY(-1px);
+}
+
 .feedback-button--negative {
   color: rgba(255, 150, 150, 0.92);
 }
 
-.feedback-button--active {
+.feedback-button--active,
+.feedback-button--active.MuiIconButton-root {
   border-color: rgba(140, 225, 199, 0.42);
   background: rgba(140, 225, 199, 0.14);
+  color: rgba(140, 225, 199, 1);
+  box-shadow: inset 0 0 0 1px rgba(140, 225, 199, 0.22);
+}
+
+.feedback-button--negative.feedback-button--active,
+.feedback-button--negative.feedback-button--active.MuiIconButton-root {
+  border-color: rgba(255, 150, 150, 0.45);
+  background: rgba(255, 150, 150, 0.16);
+  color: rgba(255, 174, 174, 1);
+  box-shadow: inset 0 0 0 1px rgba(255, 150, 150, 0.18);
+}
+
+.message-bubble__loading {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 28px;
+  color: var(--text-muted);
 }
 
 .chat-input-row {

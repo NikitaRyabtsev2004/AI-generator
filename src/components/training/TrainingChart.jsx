@@ -1,4 +1,4 @@
-import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
+import { Area, AreaChart, CartesianGrid, Tooltip, XAxis, YAxis } from 'recharts';
 import { Typography } from '@mui/material';
 import { formatDecimal } from '../../utils/text';
 
@@ -7,16 +7,18 @@ export default function TrainingChart({ history }) {
     return (
       <div className="chart-empty">
         <Typography variant="body2">
-          После запуска обучения здесь появится график loss по батчам.
+          После запуска обучения здесь появится график `loss` по батчам.
         </Typography>
       </div>
     );
   }
 
+  const chartWidth = Math.max(720, history.length * 32);
+
   return (
     <div className="training-chart">
-      <ResponsiveContainer width="100%" height={320}>
-        <AreaChart data={history}>
+      <div className="training-chart__scroll">
+        <AreaChart width={chartWidth} height={320} data={history}>
           <defs>
             <linearGradient id="lossChartGradient" x1="0" y1="0" x2="0" y2="1">
               <stop offset="5%" stopColor="#8ce1c7" stopOpacity={0.65} />
@@ -45,7 +47,7 @@ export default function TrainingChart({ history }) {
             labelFormatter={(value) => `Шаг ${value}`}
             formatter={(value, _name, payload) => [
               formatDecimal(value, 4),
-              `loss • эпоха ${payload?.payload?.epoch}, батч ${payload?.payload?.batch}`,
+              `loss, эпоха ${payload?.payload?.epoch}, батч ${payload?.payload?.batch}`,
             ]}
           />
           <Area
@@ -57,7 +59,7 @@ export default function TrainingChart({ history }) {
             dot={false}
           />
         </AreaChart>
-      </ResponsiveContainer>
+      </div>
     </div>
   );
 }

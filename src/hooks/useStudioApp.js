@@ -22,6 +22,18 @@ const ACTIVE_POLL_STATUSES = new Set([
   'learning_from_feedback',
 ]);
 
+const ACTIVE_POLL_LIFECYCLES = new Set([
+  'training',
+  'generating_reply',
+  'syncing_knowledge',
+]);
+
+const FAST_REFRESH_ACTIONS = new Set([
+  'trainModel',
+  'pauseModel',
+  'resetModel',
+]);
+
 export function useStudioApp() {
   const [snapshot, setSnapshot] = useState(null);
   const [selectedChatId, setSelectedChatId] = useState(null);
@@ -29,12 +41,18 @@ export function useStudioApp() {
     loading: true,
     busy: false,
     error: '',
+    action: '',
   });
+  const [pendingReply, setPendingReply] = useState(null);
+  const [pendingRatings, setPendingRatings] = useState({});
+  const [uploadProgress, setUploadProgress] = useState(null);
+  const [processingProgress, setProcessingProgress] = useState(null);
 
   const snapshotRef = useRef(null);
   const selectedChatIdRef = useRef(null);
   const dashboardAbortRef = useRef(null);
   const dashboardRequestIdRef = useRef(0);
+  const followUpRefreshRef = useRef([]);
 
   useEffect(() => {
     snapshotRef.current = snapshot;
@@ -89,11 +107,19 @@ export function useStudioApp() {
     }
   }, []);
 
+  const scheduleDashboardRefresh = useCallback((delays, chatId = selectedChatIdRef.current) => {
+    followUpRefreshRef.current.forEach((timeoutId) => clearTimeout(timeoutId));
+    followUpRefreshRef.current = delays.map((delay) => setTimeout(() => {
+      loadDashboard(chatId);
+    }, delay));
+  }, [loadDashboard]);
+
   useEffect(() => {
     loadDashboard(null);
 
     return () => {
       dashboardAbortRef.current?.abort();
+      followUpRefreshRef.current.forEach((timeoutId) => clearTimeout(timeoutId));
     };
   }, [loadDashboard]);
 
@@ -114,24 +140,39 @@ export function useStudioApp() {
       return undefined;
     }
 
+    const shouldUseFastPolling =
+      ACTIVE_POLL_STATUSES.has(snapshotRef.current?.training?.status) ||
+      ACTIVE_POLL_LIFECYCLES.has(snapshotRef.current?.model?.lifecycle) ||
+      FAST_REFRESH_ACTIONS.has(requestState.action);
+
     const interval = setInterval(() => {
       loadDashboard(selectedChatIdRef.current);
-    }, ACTIVE_POLL_STATUSES.has(snapshotRef.current?.training?.status) ? 1800 : 6000);
+    }, shouldUseFastPolling ? 1200 : 6000);
 
     return () => clearInterval(interval);
-  }, [loadDashboard, snapshot?.training?.status]);
+  }, [loadDashboard, requestState.action, snapshot?.model?.lifecycle, snapshot?.training?.status]);
 
-  const runAction = useCallback(async (action) => {
+  const runAction = useCallback(async (action, options = {}) => {
+    const {
+      actionName = '',
+      onStart,
+      onSuccess,
+      onFinish,
+    } = options;
+
+    onStart?.();
     setRequestState((current) => ({
       ...current,
       busy: true,
       error: '',
+      action: actionName,
     }));
 
     try {
       const nextSnapshot = await action();
       setSnapshot(nextSnapshot);
       setSelectedChatId(nextSnapshot.activeChat?.id || nextSnapshot.chats?.[0]?.id || null);
+      await onSuccess?.(nextSnapshot);
       return nextSnapshot;
     } catch (error) {
       setRequestState((current) => ({
@@ -140,28 +181,99 @@ export function useStudioApp() {
       }));
       return null;
     } finally {
+      onFinish?.();
       setRequestState((current) => ({
         ...current,
         busy: false,
+        action: '',
       }));
     }
   }, []);
 
   const actions = useMemo(() => ({
     refresh: () => loadDashboard(selectedChatIdRef.current),
-    saveSettings: (nextSettings) => runAction(() => saveSettings(nextSettings)),
-    uploadFiles: (files) => runAction(() => uploadFiles(files)),
-    addUrlSource: (url) => runAction(() => addUrlSource(url)),
-    removeSource: (sourceId) => runAction(() => removeSource(sourceId)),
-    createModel: () => runAction(() => createModel()),
-    trainModel: () => runAction(() => trainModel()),
-    pauseModel: () => runAction(() => pauseModel()),
-    resetModel: () => runAction(() => resetModel()),
-    createChat: () => runAction(() => createChat()),
-    deleteChat: (chatId) => runAction(() => deleteChat(chatId)),
-    sendMessage: (chatId, content) => runAction(() => sendChatMessage(chatId, content)),
-    rateMessage: (messageId, score) => runAction(() => rateMessage(messageId, score)),
-  }), [loadDashboard, runAction]);
+    saveSettings: (nextSettings) => runAction(() => saveSettings(nextSettings), { actionName: 'saveSettings' }),
+    uploadFiles: (files) => runAction(
+      () => uploadFiles(files, {
+        onUploadProgress: (percent) => setUploadProgress(percent),
+        onProcessingProgress: ({ percent }) => setProcessingProgress(percent),
+      }),
+      {
+        actionName: 'uploadFiles',
+        onStart: () => {
+          setUploadProgress(0);
+          setProcessingProgress(0);
+        },
+        onFinish: () => {
+          setUploadProgress(null);
+          setProcessingProgress(null);
+        },
+      }
+    ),
+    addUrlSource: (url) => runAction(() => addUrlSource(url), { actionName: 'addUrlSource' }),
+    removeSource: (sourceId) => runAction(() => removeSource(sourceId), { actionName: 'removeSource' }),
+    createModel: () => runAction(() => createModel(), { actionName: 'createModel' }),
+    trainModel: () => runAction(() => trainModel(), {
+      actionName: 'trainModel',
+      onSuccess: async (nextSnapshot) => {
+        const chatId = nextSnapshot.activeChat?.id || selectedChatIdRef.current;
+        await loadDashboard(chatId);
+        scheduleDashboardRefresh([500, 1500, 3500], chatId);
+      },
+    }),
+    pauseModel: () => runAction(() => pauseModel(), {
+      actionName: 'pauseModel',
+      onSuccess: async (nextSnapshot) => {
+        const chatId = nextSnapshot.activeChat?.id || selectedChatIdRef.current;
+        await loadDashboard(chatId);
+        scheduleDashboardRefresh([500, 1500], chatId);
+      },
+    }),
+    resetModel: () => runAction(() => resetModel(), {
+      actionName: 'resetModel',
+      onSuccess: async (nextSnapshot) => {
+        const chatId = nextSnapshot.activeChat?.id || selectedChatIdRef.current;
+        await loadDashboard(chatId);
+      },
+    }),
+    createChat: () => runAction(() => createChat(), { actionName: 'createChat' }),
+    deleteChat: (chatId) => runAction(() => deleteChat(chatId), { actionName: 'deleteChat' }),
+    sendMessage: (chatId, content) => runAction(
+      () => sendChatMessage(chatId, content),
+      {
+        actionName: 'sendMessage',
+        onStart: () => {
+          setPendingReply({
+            chatId,
+            content,
+            createdAt: new Date().toISOString(),
+          });
+        },
+        onFinish: () => {
+          setPendingReply(null);
+        },
+      }
+    ),
+    rateMessage: (messageId, score) => runAction(
+      () => rateMessage(messageId, score),
+      {
+        actionName: 'rateMessage',
+        onStart: () => {
+          setPendingRatings((current) => ({
+            ...current,
+            [messageId]: score,
+          }));
+        },
+        onFinish: () => {
+          setPendingRatings((current) => {
+            const nextState = { ...current };
+            delete nextState[messageId];
+            return nextState;
+          });
+        },
+      }
+    ),
+  }), [loadDashboard, runAction, scheduleDashboardRefresh]);
 
   return {
     snapshot,
@@ -170,6 +282,11 @@ export function useStudioApp() {
     loading: requestState.loading,
     busy: requestState.busy,
     error: requestState.error,
+    pendingAction: requestState.action,
+    uploadProgress,
+    processingProgress,
+    pendingReply,
+    pendingRatings,
     actions,
   };
 }

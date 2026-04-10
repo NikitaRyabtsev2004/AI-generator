@@ -92,6 +92,16 @@
   border: 1px solid var(--panel-border);
 }
 
+.toggle-control .MuiFormControlLabel-root {
+  align-items: flex-start;
+  margin-left: 0;
+  margin-right: 0;
+}
+
+.toggle-control .MuiRadio-root {
+  padding-top: 2px;
+}
+
 .upload-actions {
   flex-direction: column;
 }
@@ -103,7 +113,6 @@
 .source-list,
 .timeline-list {
   flex-direction: column;
-  max-height: 420px;
   overflow-y: auto;
   padding-right: 6px;
 }
@@ -204,6 +213,17 @@
 .training-chart {
   width: 100%;
   min-height: 320px;
+}
+
+.training-chart__scroll {
+  width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-bottom: 6px;
+}
+
+.training-chart__scroll svg {
+  display: block;
 }
 
 .info-icon {

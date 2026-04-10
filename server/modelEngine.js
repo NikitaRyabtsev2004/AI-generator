@@ -1,6 +1,7 @@
 ﻿const crypto = require('crypto');
 const path = require('path');
 const { Worker } = require('node:worker_threads');
+const fs = require('fs/promises');
 const {
   MODEL_STATUS_FLOW,
   createDefaultKnowledgeState,
@@ -74,19 +75,23 @@ function createEmptyChat() {
   };
 }
 
-function pushStatus(state, status, phase, message) {
+function pushStatus(state, status, phase, message, options = {}) {
+  const { updateTrainingState = true } = options;
+  const normalizedMessage = cleanText(message);
   const entry = {
     id: createId('status'),
     status,
     phase,
-    message,
+    message: normalizedMessage,
     createdAt: nowIso(),
   };
 
-  state.training.status = status;
-  state.training.phase = phase;
-  state.training.message = message;
-  state.training.updatedAt = entry.createdAt;
+  if (updateTrainingState) {
+    state.training.status = status;
+    state.training.phase = phase;
+    state.training.message = normalizedMessage;
+    state.training.updatedAt = entry.createdAt;
+  }
   state.training.recentStatuses = [entry, ...(state.training.recentStatuses || [])].slice(0, 32);
 }
 
@@ -142,11 +147,11 @@ function createTermMap(tokens, allowedTerms = null) {
 
 function normalizeSpeakerLabel(value) {
   const normalized = cleanText(value).toLowerCase();
-  if (['user', 'human', 'client', 'пользователь', 'клиент', 'юзер'].includes(normalized)) {
+  if (['user', 'human', 'client', 'пользователь', 'клиент', 'юзер', 'a', 'а'].includes(normalized)) {
     return 'user';
   }
 
-  if (['assistant', 'bot', 'ассистент', 'бот', 'ai'].includes(normalized)) {
+  if (['assistant', 'bot', 'ассистент', 'бот', 'ai', 'b', 'б'].includes(normalized)) {
     return 'assistant';
   }
 
@@ -155,7 +160,7 @@ function normalizeSpeakerLabel(value) {
 
 function extractDialogueTurns(text) {
   const cleanValue = cleanText(text);
-  const speakerPattern = /(Пользователь|Клиент|Юзер|User|Human|Client|Ассистент|Бот|Assistant|Bot|AI)\s*:\s*/giu;
+  const speakerPattern = /(Пользователь|Клиент|Юзер|User|Human|Client|Ассистент|Бот|Assistant|Bot|AI|A|B|А|Б)\s*:\s*/giu;
   const matches = Array.from(cleanValue.matchAll(speakerPattern));
   const turns = [];
 
@@ -214,13 +219,14 @@ function extractDialoguePairsFromSource(source) {
 }
 
 function startsWithSpeakerLabel(text) {
-  return /^\s*(пользователь|user|assistant|ассистент|бот|bot|client|клиент)\s*:/iu.test(text);
+  return /^\s*(пользователь|user|assistant|ассистент|бот|bot|client|клиент|human|ai|a|b|а|б)\s*:/iu.test(text);
 }
 
 function sanitizeReplyText(text) {
   return cleanText(text)
     .replace(/^\s*[-вЂ“вЂ”]\s*/u, '')
-    .replace(/^\s*(пользователь|user|assistant|ассистент|бот|bot|client|клиент)\s*:\s*/iu, '')
+    .replace(/^\s*(пользователь|user|assistant|ассистент|бот|bot|client|клиент|human|ai|a|b|а|б)\s*:\s*/iu, '')
+    .replace(/\b(пользователь|user|assistant|ассистент|бот|bot|client|клиент|human|ai|a|b|а|б)\s*:\s*/giu, '')
     .trim();
 }
 
@@ -457,23 +463,87 @@ function selectKnowledgeSentences(chunks, queryMap, maxSentences) {
     .map((candidate) => candidate.sentence);
 }
 
-function isPositiveMessageFeedback(metadata, runtimeConfig) {
+function appendUniqueSentences(target, sentences, limit) {
+  const seen = new Set(target.map((sentence) => sentence.toLowerCase()));
+
+  sentences.forEach((sentence) => {
+    const cleanSentence = sanitizeReplyText(sentence);
+    const normalized = cleanSentence.toLowerCase();
+    if (!cleanSentence || seen.has(normalized) || target.length >= limit) {
+      return;
+    }
+
+    seen.add(normalized);
+    target.push(cleanSentence);
+  });
+
+  return target;
+}
+
+function buildHybridReply({
+  bestReply,
+  neuralReply,
+  knowledgeSentences,
+  maxSentences,
+}) {
+  const selected = [];
+
+  if (bestReply?.responseText) {
+    appendUniqueSentences(
+      selected,
+      splitIntoSentences(bestReply.responseText).slice(0, 2),
+      maxSentences
+    );
+  }
+
+  if (neuralReply) {
+    appendUniqueSentences(
+      selected,
+      splitIntoSentences(neuralReply).slice(0, 2),
+      maxSentences
+    );
+  }
+
+  appendUniqueSentences(selected, knowledgeSentences, maxSentences);
+
+  return cleanText(selected.join(' '));
+}
+
+function buildGroundedFallback(chunkCandidates, maxSentences) {
+  const selected = [];
+
+  chunkCandidates.forEach((chunk) => {
+    appendUniqueSentences(
+      selected,
+      chunk.sentences.filter((sentence) => isAllowedKnowledgeSentence(sentence)),
+      maxSentences
+    );
+  });
+
+  if (!selected.length && chunkCandidates[0]?.text) {
+    appendUniqueSentences(
+      selected,
+      splitIntoSentences(chunkCandidates[0].text),
+      maxSentences
+    );
+  }
+
+  return cleanText(selected.join(' '));
+}
+
+function isPositiveMessageFeedback(metadata) {
   if (!metadata) {
     return false;
   }
 
-  if (metadata.userRating === 1) {
-    return true;
-  }
-
-  return metadata.selfScore >= runtimeConfig.feedback.autoAcceptThreshold && metadata.userRating !== -1;
+  return metadata.userRating === 1;
 }
 
 function isNegativeMessageFeedback(metadata) {
   return metadata?.userRating === -1;
 }
 
-function extractDialoguePairsFromChat(chat, runtimeConfig) {
+function extractDialoguePairsFromChat(chat) {
   const pairs = [];
 
   for (let index = 1; index < chat.messages.length; index += 1) {
@@ -487,7 +557,7 @@ function extractDialoguePairsFromChat(chat, runtimeConfig) {
       continue;
     }
 
-    if (!isPositiveMessageFeedback(currentMessage.metadata, runtimeConfig)) {
+    if (!isPositiveMessageFeedback(currentMessage.metadata)) {
       continue;
     }
 
@@ -572,7 +642,7 @@ function buildTrainingTexts(state, replyMemories, runtimeConfig) {
 function buildKnowledgeArtifacts(state) {
   const runtimeConfig = getRuntimeConfig();
   const sourceReplyMemories = state.sources.flatMap((source) => extractDialoguePairsFromSource(source));
-  const chatReplyMemories = state.chats.flatMap((chat) => extractDialoguePairsFromChat(chat, runtimeConfig));
+  const chatReplyMemories = state.chats.flatMap((chat) => extractDialoguePairsFromChat(chat));
   const blockedReplies = collectBlockedReplies(state);
 
   const replyMemories = [...sourceReplyMemories, ...chatReplyMemories]
@@ -683,7 +753,7 @@ function selectContextMessages(chat, userMessage, runtimeConfig) {
       index,
     }));
 
-  const recentMessages = messages.slice(-10);
+  const recentMessages = messages.slice(-12);
   const queryTokens = new Set(tokenizeWords(userMessage));
   const scored = messages
     .filter((message) => message.content !== userMessage)
@@ -696,13 +766,20 @@ function selectContextMessages(chat, userMessage, runtimeConfig) {
         }
       });
 
+      const recencyWeight = messages.length
+        ? (message.index + 1) / messages.length
+        : 0;
+
       return {
         message,
-        score: lexicalScore + (message.role === 'assistant' ? 0.15 : 0.35),
+        score:
+          lexicalScore * 1.15 +
+          recencyWeight * 1.6 +
+          (message.role === 'assistant' ? 0.12 : 0.28),
       };
     })
     .sort((left, right) => right.score - left.score)
-    .slice(0, 8)
+    .slice(0, 14)
     .map((entry) => entry.message);
 
   const merged = new Map();
@@ -710,9 +787,25 @@ function selectContextMessages(chat, userMessage, runtimeConfig) {
     merged.set(message.id, message);
   });
 
-  return [...merged.values()]
+  const ordered = [...merged.values()]
     .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
     .slice(-runtimeConfig.context.maxMessages);
+
+  const bounded = [];
+  let totalCharacters = 0;
+
+  for (let index = ordered.length - 1; index >= 0; index -= 1) {
+    const message = ordered[index];
+    const nextTotal = totalCharacters + message.content.length;
+    if (bounded.length && nextTotal > runtimeConfig.context.maxCharacters) {
+      continue;
+    }
+
+    bounded.unshift(message);
+    totalCharacters = nextTotal;
+  }
+
+  return bounded;
 }
 
 function buildWeightedQueryMap(userMessage, chat, runtimeConfig) {
@@ -876,6 +969,8 @@ function chooseBestReplyCandidate({
   neuralReply,
   bestReply,
   knowledgeText,
+  knowledgeSentences,
+  maxSentences,
   chunkCandidates,
   replyCandidates,
   contextMessages,
@@ -911,6 +1006,28 @@ function chooseBestReplyCandidate({
         contextMessages,
         recentAssistantReplies,
       }),
+    });
+  }
+
+  const hybridReply = buildHybridReply({
+    bestReply,
+    neuralReply,
+    knowledgeSentences,
+    maxSentences,
+  });
+
+  if (hybridReply) {
+    candidates.push({
+      mode: 'hybrid',
+      content: hybridReply,
+      score: computeSelfScore({
+        userMessage,
+        replyText: hybridReply,
+        chunkCandidates,
+        replyCandidates,
+        contextMessages,
+        recentAssistantReplies,
+      }) + (bestReply ? 0.06 : 0),
     });
   }
 
@@ -980,6 +1097,8 @@ function resetTrainedModelState(state) {
   state.model.batchesProcessed = 0;
   state.model.lastLoss = null;
   state.model.averageLoss = null;
+  state.model.validationLoss = null;
+  state.model.bestValidationLoss = null;
   state.model.perplexity = null;
   state.model.lastTrainingAt = null;
   state.model.corpusSignature = null;
@@ -1030,6 +1149,9 @@ function buildDashboard(state, chatId = null) {
   return {
     settings: state.settings,
     model: state.model,
+    knowledge: {
+      languageModel: state.knowledge.languageModel,
+    },
     training: {
       ...state.training,
       availableStatuses: MODEL_STATUS_FLOW,
@@ -1037,6 +1159,9 @@ function buildDashboard(state, chatId = null) {
     runtime: {
       contextStrategy: runtimeConfig.context.strategy,
       generatorBackend: getGeneratorBackend(runtimeConfig),
+      trainingExecutionMode: state.settings.training.executionMode,
+      trainingBackend: state.model.computeBackendLabel || state.model.computeBackend,
+      trainingBackendWarning: state.model.computeBackendWarning || '',
       storage: state.model.storage,
       ratedMessages,
     },
@@ -1048,12 +1173,82 @@ function buildDashboard(state, chatId = null) {
 
 function createModelEngine({ getState, updateState }) {
   let activeTrainingPromise = null;
+  let activeTrainingStartPromise = null;
+  let activeTrainingStartResolve = null;
+  let activeTrainingStartReject = null;
   let activeTrainingWorker = null;
+  let activeTrainingStopSignal = null;
+  let activeTrainingTerminationMode = null;
   let neuralRuntime = null;
 
   async function disposeNeuralRuntime() {
     disposeRuntime(neuralRuntime);
     neuralRuntime = null;
+  }
+
+  function createStopSignal() {
+    activeTrainingStopSignal = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+    Atomics.store(activeTrainingStopSignal, 0, 0);
+    return activeTrainingStopSignal;
+  }
+
+  function createTrainingStartSignal() {
+    activeTrainingStartPromise = new Promise((resolve, reject) => {
+      activeTrainingStartResolve = resolve;
+      activeTrainingStartReject = reject;
+    });
+    return activeTrainingStartPromise;
+  }
+
+  function resolveTrainingStartSignal() {
+    if (activeTrainingStartResolve) {
+      activeTrainingStartResolve();
+    }
+    activeTrainingStartResolve = null;
+    activeTrainingStartReject = null;
+  }
+
+  function rejectTrainingStartSignal(error) {
+    if (activeTrainingStartReject) {
+      activeTrainingStartReject(error);
+    }
+    activeTrainingStartResolve = null;
+    activeTrainingStartReject = null;
+  }
+
+  function requestTrainingStop() {
+    if (activeTrainingStopSignal) {
+      Atomics.store(activeTrainingStopSignal, 0, 1);
+    }
+
+    activeTrainingWorker?.postMessage({ type: 'stop' });
+  }
+
+  async function removeModelArtifacts(storage) {
+    const fileTargets = [
+      storage?.manifestPath,
+      storage?.knowledgeIndexPath,
+      storage?.languageModelPath,
+      storage?.tokenizerPath,
+      storage?.neuralWeightsPath,
+      storage?.neuralSpecPath,
+    ].filter(Boolean);
+
+    await Promise.all(fileTargets.map(async (targetPath) => {
+      try {
+        await fs.rm(targetPath, { force: true });
+      } catch (error) {
+        // Ignore missing files.
+      }
+    }));
+
+    if (storage?.neuralModelDir) {
+      try {
+        await fs.mkdir(storage.neuralModelDir, { recursive: true });
+      } catch (error) {
+        // Ignore directory recreation failures.
+      }
+    }
   }
 
   async function ensureRuntimeLoaded(state) {
@@ -1124,6 +1319,7 @@ function createModelEngine({ getState, updateState }) {
       return activeTrainingPromise;
     }
 
+    createTrainingStartSignal();
     activeTrainingPromise = (async () => {
       const initialState = getState();
       const initialArtifacts = buildKnowledgeArtifacts(initialState);
@@ -1140,8 +1336,12 @@ function createModelEngine({ getState, updateState }) {
         initialState.model.configSnapshot?.training?.embeddingSize === initialState.settings.training.embeddingSize &&
         initialState.model.configSnapshot?.training?.hiddenSize === initialState.settings.training.hiddenSize &&
         initialState.model.configSnapshot?.training?.recurrentLayers === initialState.settings.training.recurrentLayers;
+      const resumeEpochOffset = sameArchitecture
+        ? Math.max(Number(initialState.model.trainedEpochs) || 0, 0)
+        : 0;
 
       await disposeNeuralRuntime();
+      const stopSignal = createStopSignal();
 
       await updateState(async (state) => {
         state.model.exists = true;
@@ -1153,15 +1353,15 @@ function createModelEngine({ getState, updateState }) {
           ...createDefaultTrainingState(),
           status: 'training',
           phase: 'building_tokenizer',
-          message: 'Сервер собирает токенизатор, обучающие последовательности и готовит background worker.',
+          message: 'Сервер собирает токенизатор, обучающие последовательности и готовит отдельный воркер обучения.',
           startedAt: nowIso(),
           updatedAt: nowIso(),
           requestedStop: false,
         };
         pushStatus(state, 'training', 'building_tokenizer', 'Подготовка корпуса и запуск отдельного процесса обучения.');
       });
+      resolveTrainingStartSignal();
 
-      const denominatorBase = Math.max(initialState.settings.training.epochs, 1);
       const workerPath = path.join(__dirname, 'trainingWorker.js');
       const manifest = buildTrainingManifest(initialState, initialArtifacts);
 
@@ -1172,9 +1372,11 @@ function createModelEngine({ getState, updateState }) {
             trainingTexts,
             storage: initialState.model.storage,
             resumeFromCheckpoint: Boolean(sameArchitecture),
+            resumeEpochOffset,
             manifest,
             tokenizerTokenCount: initialArtifacts.tokenizerTokenCount,
             positiveFeedbackCount: initialArtifacts.positiveFeedbackCount,
+            stopSignalBuffer: stopSignal.buffer,
           },
         });
 
@@ -1185,6 +1387,11 @@ function createModelEngine({ getState, updateState }) {
 
         const finalizeFailure = (error) => {
           if (finished) {
+            return;
+          }
+
+          if (activeTrainingTerminationMode === 'model_deleted') {
+            finalizeSuccess();
             return;
           }
 
@@ -1213,7 +1420,7 @@ function createModelEngine({ getState, updateState }) {
           }
 
           if (message.type === 'error') {
-            finalizeFailure(new Error(message.error?.message || 'Training worker failed.'));
+            finalizeFailure(new Error(message.error?.message || 'Ошибка воркера обучения.'));
             return;
           }
 
@@ -1221,17 +1428,23 @@ function createModelEngine({ getState, updateState }) {
             enqueueWorkerUpdate(async () => {
               knownBatchesPerEpoch = Math.max(message.batchesPerEpoch || 1, 1);
               await updateState(async (state) => {
-                state.model.trainingItemCount = message.datasetSampleCount;
+                const batchSizeNote = message.batchSizeAdjusted
+                  ? ` Размер батча автоматически скорректирован: ${message.requestedBatchSize} → ${message.effectiveBatchSize}, чтобы не падать в режим одной итерации на эпоху.`
+                  : '';
+                state.model.trainingItemCount = message.trainingSampleCount;
                 state.model.batchesPerEpoch = message.batchesPerEpoch;
                 state.model.parameterCount = message.parameterCount;
-                state.model.targetEpochs = state.settings.training.epochs;
+                state.model.computeBackend = message.backendName || state.model.computeBackend;
+                state.model.computeBackendLabel = message.backendLabel || state.model.computeBackendLabel;
+                state.model.computeBackendWarning = message.backendWarning || '';
+                state.model.targetEpochs = resumeEpochOffset + state.settings.training.epochs;
                 state.training.phase = 'training_batches';
-                state.training.message = `Подготовлено ${message.datasetSampleCount} sequence-window примеров, ${message.batchesPerEpoch} батчей на эпоху и ${message.tokenizerVocabularySize} токенов словаря.`;
+                state.training.message = `Подготовлено ${message.trainingSampleCount} обучающих окон, ${message.validationSampleCount} валидационных и ${message.batchesPerEpoch} батчей на эпоху. Backend: ${message.backendLabel || message.backendName}.${batchSizeNote}`;
                 pushStatus(
                   state,
                   'training',
                   'training_batches',
-                  `Нейросеть обучается в отдельном worker: ${message.parameterCount} параметров, ${message.tokenizerVocabularySize} токенов, ${message.datasetSampleCount} примеров.`
+                  `Нейросеть обучается в отдельном воркере: ${message.parameterCount} параметров, ${message.trainingSampleCount} обучающих окон и ${message.validationSampleCount} окон для валидации. Backend: ${message.backendLabel || message.backendName}.${batchSizeNote}`
                 );
               });
             });
@@ -1240,14 +1453,20 @@ function createModelEngine({ getState, updateState }) {
 
           if (message.type === 'batch') {
             enqueueWorkerUpdate(async () => {
-              const totalBatches = Math.max(knownBatchesPerEpoch * denominatorBase, 1);
+              knownBatchesPerEpoch = Math.max(message.batchesThisEpoch || knownBatchesPerEpoch, 1);
+              const totalEpochs = Math.max(message.effectiveEpochs || initialState.settings.training.epochs, 1);
+              const totalBatches = Math.max(message.batchesThisEpoch * totalEpochs, 1);
               await updateState(async (state) => {
                 state.training.status = 'training';
                 state.training.phase = 'training_batches';
-                state.training.message = `Обучение идет: эпоха ${message.epoch}/${state.settings.training.epochs}, батч ${message.batch}/${message.batchesThisEpoch}.`;
+                state.model.batchesPerEpoch = message.batchesThisEpoch;
+                state.model.targetEpochs = totalEpochs;
+                state.training.message = message.enforcedStepBudget
+                  ? `Обучение идет: эпоха ${message.epoch}/${totalEpochs}, батч ${message.batch}/${message.batchesThisEpoch}. Минимальный бюджет обучения увеличил число эпох.`
+                  : `Обучение идет: эпоха ${message.epoch}/${totalEpochs}, батч ${message.batch}/${message.batchesThisEpoch}.`;
                 state.training.progress = {
                   currentEpoch: message.epoch,
-                  totalEpochs: state.settings.training.epochs,
+                  totalEpochs,
                   currentBatch: message.batch,
                   totalBatches: message.batchesThisEpoch,
                   percent: Number(((message.processedBatches / totalBatches) * 100).toFixed(1)),
@@ -1291,10 +1510,12 @@ function createModelEngine({ getState, updateState }) {
                 state.model.exists = true;
                 state.model.lastLoss = message.trainingResult.lastLoss;
                 state.model.averageLoss = message.trainingResult.averageLoss;
+                state.model.validationLoss = message.trainingResult.validationLoss;
+                state.model.bestValidationLoss = message.trainingResult.bestValidationLoss;
                 state.model.perplexity = message.trainingResult.perplexity;
                 state.model.lastTrainingAt = nowIso();
                 state.model.batchesProcessed = message.trainingResult.processedBatches;
-                state.model.targetEpochs = state.settings.training.epochs;
+                state.model.targetEpochs = message.trainingResult.effectiveEpochs;
                 state.model.parameterCount = message.parameterCount;
 
                 if (corpusChanged) {
@@ -1321,7 +1542,7 @@ function createModelEngine({ getState, updateState }) {
                   : 'Обучение завершено. Нейросеть, токенизатор и индекс знаний сохранены на сервере.';
                 state.training.progress = {
                   currentEpoch: message.trainingResult.completedEpochs,
-                  totalEpochs: state.settings.training.epochs,
+                  totalEpochs: message.trainingResult.effectiveEpochs,
                   currentBatch: 0,
                   totalBatches: knownBatchesPerEpoch,
                   percent: message.trainingResult.stopRequested ? state.training.progress.percent : 100,
@@ -1344,12 +1565,18 @@ function createModelEngine({ getState, updateState }) {
             return;
           }
 
-          finalizeFailure(new Error(`Training worker stopped with code ${code}.`));
+          finalizeFailure(new Error(`Воркер обучения завершился с кодом ${code}.`));
         });
       });
-    })().finally(() => {
+    })().catch((error) => {
+      rejectTrainingStartSignal(error);
+      throw error;
+    }).finally(() => {
       activeTrainingPromise = null;
+      activeTrainingStartPromise = null;
       activeTrainingWorker = null;
+      activeTrainingStopSignal = null;
+      activeTrainingTerminationMode = null;
     });
 
     return activeTrainingPromise;
@@ -1392,11 +1619,12 @@ function createModelEngine({ getState, updateState }) {
       .slice(0, state.settings.training.topKChunks);
 
     const bestReply = replyCandidates[0] || null;
-    const knowledgeText = selectKnowledgeSentences(
+    const knowledgeSentences = selectKnowledgeSentences(
       chunkCandidates,
       queryMap,
       state.settings.generation.maxReplySentences
-    ).join(' ');
+    );
+    const knowledgeText = knowledgeSentences.join(' ');
 
     await ensureRuntimeLoaded(state);
     let neuralReply = '';
@@ -1421,6 +1649,8 @@ function createModelEngine({ getState, updateState }) {
       neuralReply,
       bestReply,
       knowledgeText,
+      knowledgeSentences,
+      maxSentences: state.settings.generation.maxReplySentences,
       chunkCandidates,
       replyCandidates,
       contextMessages,
@@ -1428,6 +1658,35 @@ function createModelEngine({ getState, updateState }) {
     });
 
     if (!candidate) {
+      const groundedFallback = buildGroundedFallback(
+        chunkCandidates,
+        state.settings.generation.maxReplySentences
+      );
+
+      if (groundedFallback) {
+        const fallbackScore = computeSelfScore({
+          userMessage,
+          replyText: groundedFallback,
+          chunkCandidates,
+          replyCandidates,
+          contextMessages,
+          recentAssistantReplies,
+        });
+
+        return {
+          content: previewText(groundedFallback, state.settings.generation.maxReplyCharacters),
+          metadata: {
+            mode: 'knowledge',
+            usedContextMessages: contextMessages.length,
+            matchedSourceLabels: chunkCandidates.map((chunk) => chunk.label).slice(0, 4),
+            matchedMemoryScore: bestReply?.score || 0,
+            chunkMatches: chunkCandidates.length,
+            selfScore: Number(fallbackScore.toFixed(3)),
+            userRating: 0,
+          },
+        };
+      }
+
       return {
         content: 'Пока в базе знаний не нашлось достаточно сильного ответа по этому запросу. Добавьте больше данных, оцените хорошие ответы и повторите обучение.',
         metadata: {
@@ -1485,7 +1744,7 @@ function createModelEngine({ getState, updateState }) {
           const signatureMismatch =
             !state.model.corpusSignature || state.model.corpusSignature !== artifacts.corpusSignature;
 
-          if (signatureMismatch || !neuralRuntime?.model) {
+          if (signatureMismatch) {
             await disposeNeuralRuntime();
             resetTrainedModelState(state);
             state.model.lifecycle = state.model.exists ? 'ready_for_training' : 'not_created';
@@ -1495,6 +1754,16 @@ function createModelEngine({ getState, updateState }) {
               'idle',
               'model_rehydrated_retrain_required',
               'Сервер нашел изменения корпуса или не смог восстановить чекпоинт. Для корректной работы модель нужно обучить заново.'
+            );
+          } else if (!neuralRuntime?.model) {
+            state.model.lifecycle = 'trained';
+            state.model.status = 'ready';
+            pushStatus(
+              state,
+              'completed',
+              'checkpoint_restore_partial',
+              'Сервер восстановил корпус и метаданные модели, но нейросетевой чекпоинт не загрузился. Ответы будут опираться на память чата и базу знаний, пока вы не переобучите или не удалите модель.',
+              { updateTrainingState: false }
             );
           } else {
             state.model.parameterCount = neuralRuntime.parameterCount || state.model.parameterCount;
@@ -1528,7 +1797,7 @@ function createModelEngine({ getState, updateState }) {
         assertTrainingUnlocked(state, 'Изменение источников');
         const text = cleanText(content);
         if (!text) {
-          throw new Error('РСЃС‚РѕС‡РЅРёРє РЅРµ СЃРѕРґРµСЂР¶РёС‚ С‚РµРєСЃС‚Р°.');
+          throw new Error('Источник не содержит текста.');
         }
 
         state.sources.unshift({
@@ -1548,7 +1817,7 @@ function createModelEngine({ getState, updateState }) {
           state.model.status = 'ready';
         }
 
-        pushStatus(state, 'idle', 'source_added', `РСЃС‚РѕС‡РЅРёРє ${label} РґРѕР±Р°РІР»РµРЅ РІ РєРѕСЂРїСѓСЃ.`);
+        pushStatus(state, 'idle', 'source_added', `Источник ${label} добавлен в корпус.`);
         await rebuildKnowledge(state);
       }).then((state) => buildDashboard(state));
     },
@@ -1565,7 +1834,7 @@ function createModelEngine({ getState, updateState }) {
           state.model.status = 'ready';
         }
 
-        pushStatus(state, 'idle', 'source_removed', 'РСЃС‚РѕС‡РЅРёРє СѓРґР°Р»РµРЅ РёР· РєРѕСЂРїСѓСЃР°.');
+        pushStatus(state, 'idle', 'source_removed', 'Источник удален из корпуса.');
         await rebuildKnowledge(state);
       }).then((state) => buildDashboard(state));
     },
@@ -1594,7 +1863,7 @@ function createModelEngine({ getState, updateState }) {
             state,
             'idle',
             'settings_updated_retrain_required',
-            'РР·РјРµРЅРµРЅС‹ Р°СЂС…РёС‚РµРєС‚СѓСЂР° РёР»Рё РєРѕСЂРїСѓСЃРЅС‹Рµ РїР°СЂР°РјРµС‚СЂС‹. Р”Р»СЏ РЅРѕРІРѕР№ РєРѕРЅС„РёРіСѓСЂР°С†РёРё С‚СЂРµР±СѓРµС‚СЃСЏ РїРѕРІС‚РѕСЂРЅРѕРµ РѕР±СѓС‡РµРЅРёРµ.'
+            'Изменены архитектура или корпусные параметры. Для новой конфигурации требуется повторное обучение.'
           );
         } else {
           pushStatus(state, 'idle', 'settings_updated', 'РќР°СЃС‚СЂРѕР№РєРё СЃРµСЂРІРµСЂР° РѕР±РЅРѕРІР»РµРЅС‹.');
@@ -1622,25 +1891,40 @@ function createModelEngine({ getState, updateState }) {
     },
 
     async pauseTraining() {
+      if (!activeTrainingWorker || !activeTrainingPromise) {
+        throw new Error('Сейчас нет активного обучения, которое можно поставить на паузу.');
+      }
+
       await updateState(async (state) => {
         state.training.requestedStop = true;
-        pushStatus(state, 'training', 'pause_requested', 'РћСЃС‚Р°РЅРѕРІРєР° Р±СѓРґРµС‚ РІС‹РїРѕР»РЅРµРЅР° РїРѕСЃР»Рµ С‚РµРєСѓС‰РµРіРѕ Р±Р°С‚С‡Р°.');
+        pushStatus(state, 'training', 'pause_requested', 'Пауза будет выполнена после завершения текущего батча и сохранения чекпоинта.');
       }, { persist: false });
-      activeTrainingWorker?.postMessage({ type: 'stop' });
+      requestTrainingStop();
       return buildDashboard(getState());
     },
 
     async resetModel() {
+      if (activeTrainingWorker || activeTrainingPromise) {
+        activeTrainingTerminationMode = 'model_deleted';
+        requestTrainingStop();
+        try {
+          await activeTrainingWorker?.terminate();
+        } catch (error) {
+          // Ignore termination failures and continue cleanup.
+        } finally {
+          activeTrainingWorker = null;
+          activeTrainingPromise = null;
+          activeTrainingStopSignal = null;
+        }
+      }
+
       await updateState(async (state) => {
-        assertTrainingUnlocked(state, 'Сброс модели');
         await disposeNeuralRuntime();
+        await removeModelArtifacts(state.model.storage);
         state.model = createDefaultModelState();
         state.training = createDefaultTrainingState();
         state.knowledge = createDefaultKnowledgeState();
-        state.model.exists = true;
-        state.model.lifecycle = 'ready_for_training';
-        state.model.status = 'ready';
-        pushStatus(state, 'idle', 'model_reset', 'РњРѕРґРµР»СЊ СЃР±СЂРѕС€РµРЅР°. РСЃС‚РѕС‡РЅРёРєРё Рё С‡Р°С‚С‹ СЃРѕС…СЂР°РЅРµРЅС‹.');
+        pushStatus(state, 'idle', 'model_deleted', 'Обучение остановлено, артефакты модели удалены. Источники и чаты сохранены.');
         await rebuildKnowledge(state);
       });
       return buildDashboard(getState());
@@ -1648,7 +1932,8 @@ function createModelEngine({ getState, updateState }) {
 
     async trainModel() {
       await ensureModelExists();
-      runTrainingJob().catch(async (error) => {
+      const trainingPromise = runTrainingJob();
+      trainingPromise.catch(async (error) => {
         await updateState(async (state) => {
           state.model.lifecycle = 'error';
           state.model.status = 'error';
@@ -1657,6 +1942,9 @@ function createModelEngine({ getState, updateState }) {
           pushStatus(state, 'error', 'training_failed', error.message);
         });
       });
+      if (activeTrainingStartPromise) {
+        await activeTrainingStartPromise;
+      }
       return buildDashboard(getState());
     },
 
@@ -1695,7 +1983,13 @@ function createModelEngine({ getState, updateState }) {
         } else {
           state.model.lifecycle = 'generating_reply';
           state.model.status = 'busy';
-          pushStatus(state, 'syncing_knowledge', 'generating_reply', 'Сервер формирует ответ по обученной нейросети и индексу знаний.');
+          pushStatus(
+            state,
+            'syncing_knowledge',
+            'generating_reply',
+            'Сервер формирует ответ по обученной нейросети и индексу знаний.',
+            { updateTrainingState: false }
+          );
 
           const reply = await renderReply({
             state,
@@ -1755,7 +2049,8 @@ function createModelEngine({ getState, updateState }) {
             state,
             'learning_from_feedback',
             'feedback_recorded',
-            'РџРѕР»РѕР¶РёС‚РµР»СЊРЅР°СЏ РѕС†РµРЅРєР° СЃРѕС…СЂР°РЅРµРЅР°. Р­С‚РѕС‚ РѕС‚РІРµС‚ РІРѕР№РґРµС‚ РІ РїР°РјСЏС‚СЊ РјРѕРґРµР»Рё Рё РІ СЃР»РµРґСѓСЋС‰РёР№ РѕР±СѓС‡Р°СЋС‰РёР№ РїСЂРѕРіРѕРЅ.'
+            'РџРѕР»РѕР¶РёС‚РµР»СЊРЅР°СЏ РѕС†РµРЅРєР° СЃРѕС…СЂР°РЅРµРЅР°. Р­С‚РѕС‚ РѕС‚РІРµС‚ РІРѕР№РґРµС‚ РІ РїР°РјСЏС‚СЊ РјРѕРґРµР»Рё Рё РІ СЃР»РµРґСѓСЋС‰РёР№ РѕР±СѓС‡Р°СЋС‰РёР№ РїСЂРѕРіРѕРЅ.',
+            { updateTrainingState: false }
           );
         } else {
           state.model.negativeFeedbackCount += 1;
@@ -1763,7 +2058,8 @@ function createModelEngine({ getState, updateState }) {
             state,
             'learning_from_feedback',
             'feedback_recorded',
-            'РћС‚СЂРёС†Р°С‚РµР»СЊРЅР°СЏ РѕС†РµРЅРєР° СЃРѕС…СЂР°РЅРµРЅР°. Р­С‚РѕС‚ РѕС‚РІРµС‚ Р±СѓРґРµС‚ РїРѕРґР°РІР»СЏС‚СЊСЃСЏ РІ Р±СѓРґСѓС‰РёС… РѕС‚РІРµС‚Р°С… Рё РёСЃРєР»СЋС‡РµРЅ РёР· РѕР±СѓС‡Р°СЋС‰РёС… РїСЂРёРјРµСЂРѕРІ.'
+            'РћС‚СЂРёС†Р°С‚РµР»СЊРЅР°СЏ РѕС†РµРЅРєР° СЃРѕС…СЂР°РЅРµРЅР°. Р­С‚РѕС‚ РѕС‚РІРµС‚ Р±СѓРґРµС‚ РїРѕРґР°РІР»СЏС‚СЊСЃСЏ РІ Р±СѓРґСѓС‰РёС… РѕС‚РІРµС‚Р°С… Рё РёСЃРєР»СЋС‡РµРЅ РёР· РѕР±СѓС‡Р°СЋС‰РёС… РїСЂРёРјРµСЂРѕРІ.',
+            { updateTrainingState: false }
           );
         }
 

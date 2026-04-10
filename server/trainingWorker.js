@@ -8,33 +8,49 @@ const {
   ensureBackend,
   loadRuntime,
   saveRuntime,
+  splitDatasetSamples,
   trainRuntime,
 } = require('./neuralModel');
 
 let stopRequested = false;
 
-function buildEffectiveSettings(settings, backendName) {
+function buildEffectiveSettings(settings) {
   const effectiveSettings = structuredClone(settings);
   const requestedBatchSize = Math.max(1, Number(settings.training.batchSize) || 1);
-  const isPureCpuBackend = backendName === 'cpu';
-  const heavySequenceModel =
-    Number(settings.training.sequenceLength) >= 80 ||
-    Number(settings.training.hiddenSize) >= 192 ||
-    Number(settings.training.recurrentLayers) >= 2;
-
-  if (isPureCpuBackend) {
-    effectiveSettings.training.batchSize = Math.min(
-      requestedBatchSize,
-      heavySequenceModel ? 1 : 2
-    );
-  } else {
-    effectiveSettings.training.batchSize = requestedBatchSize;
-  }
+  effectiveSettings.training.batchSize = requestedBatchSize;
 
   return {
     effectiveSettings,
     requestedBatchSize,
     effectiveBatchSize: effectiveSettings.training.batchSize,
+  };
+}
+
+function deriveBatchPlan(trainingSampleCount, requestedBatchSize) {
+  const safeSampleCount = Math.max(Number(trainingSampleCount) || 0, 0);
+  const cappedRequestedBatchSize = safeSampleCount
+    ? Math.min(requestedBatchSize, safeSampleCount)
+    : requestedBatchSize;
+
+  const minimumBatchesPerEpoch = safeSampleCount >= 16
+    ? 4
+    : safeSampleCount >= 4
+      ? 2
+      : 1;
+
+  const maxBatchSizeForMinimumBatches = minimumBatchesPerEpoch > 1
+    ? Math.max(Math.floor(safeSampleCount / minimumBatchesPerEpoch), 1)
+    : Math.max(cappedRequestedBatchSize, 1);
+
+  const effectiveBatchSize = Math.max(
+    1,
+    Math.min(cappedRequestedBatchSize, maxBatchSizeForMinimumBatches)
+  );
+
+  return {
+    minimumBatchesPerEpoch,
+    effectiveBatchSize,
+    adjusted: effectiveBatchSize !== requestedBatchSize,
   };
 }
 
@@ -85,16 +101,16 @@ if (parentPort) {
     trainingTexts,
     storage,
     resumeFromCheckpoint,
+    resumeEpochOffset = 0,
     manifest,
     tokenizerTokenCount,
     positiveFeedbackCount,
+    stopSignalBuffer = null,
   } = workerData;
+  const stopSignalView = stopSignalBuffer ? new Int32Array(stopSignalBuffer) : null;
 
-  const backendName = await ensureBackend();
-  const { effectiveSettings, requestedBatchSize, effectiveBatchSize } = buildEffectiveSettings(
-    settings,
-    backendName
-  );
+  const backendInfo = await ensureBackend(settings);
+  const { effectiveSettings, requestedBatchSize } = buildEffectiveSettings(settings);
 
   const tokenizer = buildTokenizer(
     trainingTexts,
@@ -134,29 +150,43 @@ if (parentPort) {
   }
 
   const parameterCount = countParameters(runtime.model);
+  const { trainingSamples, validationSamples } = splitDatasetSamples(dataset.samples);
+  const batchPlan = deriveBatchPlan(trainingSamples.length, requestedBatchSize);
+  effectiveSettings.training.batchSize = batchPlan.effectiveBatchSize;
   const batchesPerEpoch = Math.max(
-    Math.ceil(dataset.sampleCount / Math.max(1, effectiveSettings.training.batchSize)),
+    Math.ceil(trainingSamples.length / Math.max(1, effectiveSettings.training.batchSize)),
     1
   );
 
   postMessage('prepared', {
     datasetSampleCount: dataset.sampleCount,
+    trainingSampleCount: trainingSamples.length,
+    validationSampleCount: validationSamples.length,
     batchesPerEpoch,
     tokenizerVocabularySize: tokenizer.vocabularySize,
     parameterCount,
-    backendName,
+    backendName: backendInfo.backendName,
+    backendLabel: backendInfo.label,
+    executionMode: backendInfo.executionMode,
+    backendWarning: backendInfo.warning,
     requestedBatchSize,
-    effectiveBatchSize,
+    effectiveBatchSize: batchPlan.effectiveBatchSize,
+    batchSizeAdjusted: batchPlan.adjusted,
+    minimumBatchesPerEpoch: batchPlan.minimumBatchesPerEpoch,
   });
 
   const trainingResult = await trainRuntime({
     runtime,
     dataset,
     settings: effectiveSettings,
+    epochOffset: Math.max(Number(resumeEpochOffset) || 0, 0),
     onBatchEnd: async (payload) => {
       postMessage('batch', payload);
     },
-    shouldStop: () => stopRequested,
+    shouldStop: () => (
+      stopRequested ||
+      (stopSignalView ? Atomics.load(stopSignalView, 0) === 1 : false)
+    ),
   });
 
   if (!trainingResult.processedBatches && !trainingResult.stopRequested) {
@@ -194,6 +224,10 @@ if (parentPort) {
       trainingSequenceCount: dataset.sampleCount,
       corpusTokenCount: tokenizerTokenCount,
       feedbackExampleCount: positiveFeedbackCount,
+      validationLoss: trainingResult.validationLoss,
+      bestValidationLoss: trainingResult.bestValidationLoss,
+      trainingSampleCount: trainingResult.trainingSampleCount,
+      validationSampleCount: trainingResult.validationSampleCount,
     },
   });
 
@@ -201,7 +235,7 @@ if (parentPort) {
 })().catch((error) => {
   postMessage('error', {
     error: {
-      message: error.message || 'Training worker failed.',
+      message: error.message || 'Ошибка воркера обучения.',
       stack: error.stack || '',
     },
   });

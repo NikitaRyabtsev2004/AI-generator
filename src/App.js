@@ -69,15 +69,10 @@ function App() {
             <div className="hero-panel__title-wrap">
               <div className="hero-panel__badge">
                 <AutoAwesomeIcon fontSize="small" />
-                <span>Liquid Glass AI Studio</span>
+                <span>AI Studio</span>
               </div>
               <Typography variant="h2" className="hero-panel__title">
-                Серверная AI-студия с обучением, контекстными чатами и памятью диалогов
-              </Typography>
-              <Typography variant="body1" className="hero-panel__description">
-                Теперь обучение и ответы живут на Node.js-сервере, а интерфейс управляет корпусом,
-                чатами, оценками и статусом модели. Если раньше модель выглядела игрушечной, теперь
-                это уже полноценный локальный проект с сохранением артефактов и памяти диалогов.
+                AI Generator
               </Typography>
             </div>
 
@@ -93,8 +88,8 @@ function App() {
           <div className="hero-panel__tabs">
             <Tabs value={tab} onChange={(_event, nextTab) => setTab(nextTab)}>
               <Tab icon={<MemoryIcon />} iconPosition="start" label="Обучение модели" />
-              <Tab icon={<ForumIcon />} iconPosition="start" label="Чаты и контекст" />
-              <Tab icon={<HubRoundedIcon />} iconPosition="start" label="О модели" disabled />
+              <Tab icon={<ForumIcon />} iconPosition="start" label="Чаты и память" />
+              <Tab icon={<HubRoundedIcon />} iconPosition="start" label="О проекте" disabled />
             </Tabs>
           </div>
         </GlassPanel>
@@ -110,6 +105,9 @@ function App() {
             snapshot={studio.snapshot}
             busy={studio.busy}
             error={studio.error}
+            pendingAction={studio.pendingAction}
+            uploadProgress={studio.uploadProgress}
+            processingProgress={studio.processingProgress}
             onSaveSettings={studio.actions.saveSettings}
             onUploadFiles={studio.actions.uploadFiles}
             onAddUrlSource={studio.actions.addUrlSource}
@@ -125,6 +123,9 @@ function App() {
             selectedChatId={studio.selectedChatId}
             setSelectedChatId={studio.setSelectedChatId}
             busy={studio.busy}
+            pendingAction={studio.pendingAction}
+            pendingReply={studio.pendingReply}
+            pendingRatings={studio.pendingRatings}
             error={studio.error}
             onCreateChat={studio.actions.createChat}
             onDeleteChat={studio.actions.deleteChat}
