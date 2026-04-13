@@ -1,7 +1,7 @@
 .chat-tab {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
   height: 100%;
   min-height: 0;
   overflow: hidden;
@@ -9,8 +9,8 @@
 
 .chat-layout {
   display: grid;
-  grid-template-columns: 320px 1fr;
-  gap: 10px;
+  grid-template-columns: 340px 1fr;
+  gap: 12px;
   align-items: stretch;
   height: 100%;
   min-height: 0;
@@ -26,7 +26,7 @@
 .chat-sidebar-panel--plain,
 .chat-main-panel--plain {
   width: 100%;
-  border-radius: 32px;
+  border-radius: 34px;
   border: 1px solid var(--panel-border);
   background: rgba(9, 18, 29, 0.22);
 }
@@ -35,8 +35,8 @@
   width: 100%;
   height: 100%;
   min-height: 0;
-  padding: 12px;
-  gap: 14px;
+  padding: 14px;
+  gap: 16px;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -49,8 +49,8 @@
 
 .chat-main-panel__inner {
   width: 100%;
-  padding: 5px;
-  gap: 5px;
+  padding: 12px;
+  gap: 10px;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -62,11 +62,11 @@
   gap: 10px;
   flex: 1;
   min-height: 0;
-  overflow-y: scroll;
+  overflow-y: auto;
   padding-right: 4px;
-  padding-left: 4px;
+  padding-left: 2px;
   padding-top: 5px;
-  width: 95%;
+  width: 100%;
 }
 
 .chat-sidebar-action-shell,
@@ -144,7 +144,7 @@
   display: flex;
   flex-wrap: wrap;
   justify-content: flex-end;
-  gap: 10px;
+  gap: 8px;
 }
 
 .chat-main-panel__heading-primary {
@@ -163,7 +163,7 @@
 .message-list {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
   flex: 1;
   min-height: 0;
   max-height: none;
@@ -294,8 +294,8 @@
 
 .chat-input-row {
   display: grid;
-  grid-template-columns: 1fr 180px;
-  gap: 10px;
+  grid-template-columns: 1fr 196px;
+  gap: 12px;
   align-items: stretch;
 }
 
@@ -391,7 +391,7 @@
 
 @media (max-width: 768px) {
   .chat-main-panel__inner {
-    padding: 3px;
+    padding: 8px;
   }
 
   .chat-sidebar-panel__inner {
@@ -432,7 +432,7 @@
   }
 
   .chat-main-panel__inner {
-    gap: 2px;
+    gap: 8px;
   }
 
   .message-list {

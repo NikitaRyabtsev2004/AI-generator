@@ -117,13 +117,47 @@ function pickKnownKeys(input, defaults) {
 
 function normalizeSource(source = {}) {
   const content = cleanText(source.content || '');
+  const contentPath = cleanText(source.contentPath || '');
+  const fallbackStats = computeStats(content);
+  const sourceStats = source.stats && typeof source.stats === 'object'
+    ? source.stats
+    : fallbackStats;
+  const tokenCount = Math.max(
+    Number(sourceStats.tokenCount) || 0,
+    Number(fallbackStats.tokenCount) || 0,
+    0
+  );
+  const charCount = Math.max(
+    Number(sourceStats.charCount) || 0,
+    Number(fallbackStats.charCount) || 0,
+    0
+  );
+  const rowCount = Math.max(Number(sourceStats.rowCount) || 0, 0);
+  const columnCount = Math.max(Number(sourceStats.columnCount) || 0, 0);
+  const format = cleanText(sourceStats.format || '');
+  const columns = Array.isArray(sourceStats.columns)
+    ? sourceStats.columns.map((value) => cleanText(String(value))).filter(Boolean).slice(0, 64)
+    : [];
+  const stats = {
+    tokenCount,
+    charCount,
+    ...(rowCount > 0 ? { rowCount } : {}),
+    ...(columnCount > 0 ? { columnCount } : {}),
+    ...(format ? { format } : {}),
+    ...(columns.length ? { columns } : {}),
+  };
 
   return {
     ...source,
     label: cleanText(source.label || '') || source.label || 'Источник',
     url: source.url || null,
     content,
-    stats: computeStats(content),
+    stats,
+    contentPath: contentPath || null,
+    contentSize: Math.max(
+      Number(source.contentSize) || 0,
+      content ? Buffer.byteLength(content, 'utf8') : 0
+    ),
   };
 }
 
@@ -399,6 +433,8 @@ async function ensureStorageLayout() {
         label TEXT NOT NULL,
         url TEXT,
         content TEXT NOT NULL,
+        content_path TEXT,
+        content_size INTEGER DEFAULT 0,
         stats_json TEXT NOT NULL,
         added_at TEXT NOT NULL
       );
@@ -454,6 +490,15 @@ async function ensureStorageLayout() {
     }
     if (!knownQueueSourceColumns.has('content_size')) {
       db.exec('ALTER TABLE training_queue_sources ADD COLUMN content_size INTEGER DEFAULT 0;');
+    }
+
+    const sourceColumns = db.prepare('PRAGMA table_info(sources)').all();
+    const knownSourceColumns = new Set(sourceColumns.map((column) => column.name));
+    if (!knownSourceColumns.has('content_path')) {
+      db.exec('ALTER TABLE sources ADD COLUMN content_path TEXT;');
+    }
+    if (!knownSourceColumns.has('content_size')) {
+      db.exec('ALTER TABLE sources ADD COLUMN content_size INTEGER DEFAULT 0;');
     }
   }
 }
@@ -637,8 +682,8 @@ function writeStateToDatabase(currentState, options = {}) {
       db.exec('DELETE FROM sources;');
 
       const insertSource = db.prepare(`
-        INSERT INTO sources(id, type, label, url, content, stats_json, added_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO sources(id, type, label, url, content, content_path, content_size, stats_json, added_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       currentState.sources.forEach((source) => {
         insertSource.run(
@@ -647,6 +692,8 @@ function writeStateToDatabase(currentState, options = {}) {
           source.label,
           source.url || null,
           source.content,
+          source.contentPath || null,
+          Math.max(Number(source.contentSize) || 0, 0),
           JSON.stringify(source.stats || {}),
           source.addedAt
         );
@@ -773,7 +820,7 @@ function readStateFromDatabase() {
   });
 
   baseState.sources = db.prepare(`
-    SELECT id, type, label, url, content, stats_json, added_at
+    SELECT id, type, label, url, content, content_path, content_size, stats_json, added_at
     FROM sources
     ORDER BY added_at DESC
   `).all().map((row) => ({
@@ -782,6 +829,11 @@ function readStateFromDatabase() {
     label: row.label,
     url: row.url,
     content: row.content,
+    contentPath: cleanText(row.content_path || '') || null,
+    contentSize: Math.max(
+      Number(row.content_size) || 0,
+      row.content ? Buffer.byteLength(String(row.content), 'utf8') : 0
+    ),
     stats: safeParseJson(row.stats_json, {}, `source:${row.id}:stats_json`) || {},
     addedAt: row.added_at,
   }));

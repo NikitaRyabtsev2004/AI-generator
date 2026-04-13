@@ -1,8 +1,8 @@
 .training-tab {
   display: grid;
   grid-template-columns: 1.16fr 1fr 1fr;
-  grid-template-rows: minmax(0, 1.08fr) minmax(0, 0.92fr);
-  gap: 10px;
+  grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
   height: 100%;
   min-height: 0;
 }
@@ -79,7 +79,7 @@
   min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
   overflow-y: auto;
   padding-right: 6px;
 }
@@ -120,10 +120,10 @@
 .settings-group {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 12px;
-  border-radius: 16px;
-  background: rgba(255, 255, 255, 0.04);
+  gap: 10px;
+  padding: 14px;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.035);
   border: 1px solid var(--panel-border);
 }
 
@@ -136,7 +136,7 @@
 .settings-control {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
 }
 
 .settings-control__header {
@@ -153,8 +153,17 @@
 }
 
 .settings-control__value {
-  font-size: 0.9rem;
+  font-size: 0.82rem;
   color: var(--accent);
+}
+
+.settings-group .MuiTypography-subtitle2 {
+  font-size: 0.9rem;
+}
+
+.settings-group .MuiTypography-body2 {
+  font-size: 0.82rem;
+  line-height: 1.42;
 }
 
 .settings-footer {
@@ -194,7 +203,7 @@
   gap: 10px;
   flex: none;
   min-height: 0;
-  max-height: 220px;
+  max-height: min(42vh, 420px);
   overflow-y: auto;
   padding-right: 6px;
 }
@@ -203,8 +212,8 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
-  padding: 12px;
-  border-radius: 16px;
+  padding: 14px;
+  border-radius: 18px;
   background: rgba(255, 255, 255, 0.05);
   border: 1px solid var(--panel-border);
 }
@@ -252,8 +261,8 @@
   display: flex;
   flex-direction: column;
   gap: 10px;
-  padding: 12px;
-  border-radius: 16px;
+  padding: 14px;
+  border-radius: 18px;
   background: rgba(255, 255, 255, 0.05);
   border: 1px solid var(--panel-border);
 }
@@ -279,7 +288,7 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
-  max-height: 180px;
+  max-height: min(34vh, 280px);
   overflow-y: auto;
   padding-right: 4px;
 }
@@ -295,7 +304,7 @@
 .state-scroll {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
   flex: 1;
   min-height: 0;
   overflow-y: auto;
@@ -305,17 +314,17 @@
 .metric-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
+  gap: 10px;
 }
 
 .training-tab .metric-card {
-  border-radius: 16px;
-  padding: 12px;
+  border-radius: 18px;
+  padding: 14px;
   gap: 4px;
 }
 
 .training-tab .metric-card__value {
-  font-size: 1.06rem !important;
+  font-size: 1rem !important;
 }
 
 .status-flow {
@@ -329,8 +338,8 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
-  padding: 12px;
-  border-radius: 16px;
+  padding: 14px;
+  border-radius: 18px;
   background: rgba(255, 255, 255, 0.04);
   border: 1px solid var(--panel-border);
 }
@@ -350,7 +359,7 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
-  max-height: 228px;
+  max-height: min(35vh, 360px);
   overflow-y: auto;
   padding-right: 4px;
 }
@@ -427,7 +436,7 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
-  max-height: 136px;
+  max-height: min(32vh, 260px);
   overflow-y: auto;
   padding-right: 4px;
 }

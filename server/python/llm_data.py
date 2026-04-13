@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Generator, Iterable, Iterator, List, Sequence
 
-import tensorflow as tf
+try:
+    import tensorflow as tf
+except Exception:  # pragma: no cover - TensorFlow is optional for dataset inspection.
+    tf = None
 
 from llm_tokenizer import SimpleSubwordTokenizer, normalize_text
 
@@ -14,6 +18,32 @@ from llm_tokenizer import SimpleSubwordTokenizer, normalize_text
 DEFAULT_MAX_DATASET_RECORDS_PER_FILE = 250_000
 DEFAULT_MAX_CHARS_PER_RECORD = 12_000
 DEFAULT_PARQUET_BATCH_SIZE = 256
+TEXT_FIELD_HINTS = (
+    "text",
+    "content",
+    "body",
+    "question",
+    "answer",
+    "solution",
+    "prompt",
+    "response",
+    "instruction",
+    "output",
+    "title",
+    "summary",
+    "dialog",
+    "dialogue",
+    "caption",
+    "description",
+    "comment",
+)
+PAIR_KEYS = (
+    ("question", "answer"),
+    ("problem", "solution"),
+    ("prompt", "response"),
+    ("instruction", "output"),
+)
+TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]", flags=re.UNICODE)
 
 
 @dataclass
@@ -47,6 +77,173 @@ def _safe_int(value, fallback: int) -> int:
     return parsed
 
 
+def _is_text_like_key(key: str) -> bool:
+    normalized = normalize_text(str(key)).lower()
+    if not normalized:
+        return False
+    return any(hint in normalized for hint in TEXT_FIELD_HINTS)
+
+
+def _split_into_chunks(text: str, max_chars: int) -> List[str]:
+    normalized = normalize_text(text)
+    if not normalized:
+        return []
+
+    limit = max(64, int(max_chars))
+    if len(normalized) <= limit:
+        return [normalized]
+
+    chunks: List[str] = []
+    start = 0
+    while start < len(normalized):
+        target_end = min(start + limit, len(normalized))
+        if target_end >= len(normalized):
+            chunk = normalize_text(normalized[start:target_end])
+            if chunk:
+                chunks.append(chunk)
+            break
+
+        boundary = max(
+            normalized.rfind(". ", start, target_end),
+            normalized.rfind("! ", start, target_end),
+            normalized.rfind("? ", start, target_end),
+            normalized.rfind("; ", start, target_end),
+            normalized.rfind(", ", start, target_end),
+            normalized.rfind(" ", start, target_end),
+        )
+
+        if boundary <= start + (limit // 3):
+            boundary = target_end
+        else:
+            boundary += 1
+
+        chunk = normalize_text(normalized[start:boundary])
+        if chunk:
+            chunks.append(chunk)
+        start = boundary
+
+    return chunks
+
+
+def _label_text(label: str, text: str, max_chars: int) -> List[str]:
+    prepared_chunks = _split_into_chunks(text, max_chars)
+    if not prepared_chunks:
+        return []
+
+    normalized_label = normalize_text(label)
+    if not normalized_label or _is_text_like_key(normalized_label):
+        return prepared_chunks
+
+    return [f"{normalized_label}: {chunk}" for chunk in prepared_chunks]
+
+
+def _dedupe_records(records: Iterable[str]) -> List[str]:
+    result: List[str] = []
+    seen: set[str] = set()
+    for record in records:
+        normalized = normalize_text(record)
+        if len(normalized) < 8:
+            continue
+        signature = normalized.lower()
+        if signature in seen:
+            continue
+        seen.add(signature)
+        result.append(normalized)
+    return result
+
+
+def _decode_binary_value(value: object) -> str:
+    if not isinstance(value, (bytes, bytearray, memoryview)):
+        return ""
+
+    payload = bytes(value)
+    if not payload:
+        return ""
+
+    for encoding in ("utf-8", "utf-16", "cp1251", "latin-1"):
+        try:
+            decoded = payload.decode(encoding)
+            normalized = normalize_text(decoded)
+            if normalized:
+                return normalized
+        except Exception:
+            continue
+    return ""
+
+
+def extract_text_records(value: object, max_chars_per_record: int) -> List[str]:
+    max_chars = max(64, int(max_chars_per_record))
+    records: List[str] = []
+
+    def walk(node: object, prefix: str = "", depth: int = 0) -> None:
+        if node is None or depth > 10:
+            return
+
+        if isinstance(node, str):
+            records.extend(_label_text(prefix, node, max_chars))
+            return
+
+        if isinstance(node, (bytes, bytearray, memoryview)):
+            decoded = _decode_binary_value(node)
+            if decoded:
+                records.extend(_label_text(prefix, decoded, max_chars))
+            return
+
+        if isinstance(node, (int, float, bool)):
+            records.extend(_label_text(prefix, str(node), max_chars))
+            return
+
+        if isinstance(node, list):
+            for item in node:
+                walk(item, prefix, depth + 1)
+            return
+
+        if isinstance(node, dict):
+            normalized_keys = {
+                normalize_text(str(key)).lower(): key
+                for key in node.keys()
+            }
+
+            for left_key, right_key in PAIR_KEYS:
+                if left_key in normalized_keys and right_key in normalized_keys:
+                    left_value = normalize_text(str(node.get(normalized_keys[left_key]) or ""))
+                    right_value = normalize_text(str(node.get(normalized_keys[right_key]) or ""))
+                    if left_value and right_value:
+                        records.extend(
+                            _split_into_chunks(
+                                f"Вопрос: {left_value} Ответ: {right_value}",
+                                max_chars,
+                            )
+                        )
+
+            metadata_lines: List[str] = []
+            for raw_key, raw_value in node.items():
+                key = normalize_text(str(raw_key))
+                if not key:
+                    continue
+
+                if isinstance(raw_value, (str, int, float, bool)):
+                    value_text = normalize_text(str(raw_value))
+                    if not value_text:
+                        continue
+                    if _is_text_like_key(key) or len(value_text) >= max(64, max_chars // 4):
+                        records.extend(_label_text(key, value_text, max_chars))
+                    else:
+                        metadata_lines.append(f"{key}: {value_text}")
+                    continue
+
+                walk(raw_value, key, depth + 1)
+
+            if metadata_lines:
+                records.extend(_split_into_chunks(" | ".join(metadata_lines), max_chars))
+            return
+
+        records.extend(_label_text(prefix, str(node), max_chars))
+
+    walk(value)
+    return _dedupe_records(records)
+
+
 def resolve_dataset_options(options: Dict[str, object] | None = None) -> Dict[str, object]:
     payload = options if isinstance(options, dict) else {}
     parquet_columns = payload.get("parquetColumns")
@@ -58,47 +255,17 @@ def resolve_dataset_options(options: Dict[str, object] | None = None) -> Dict[st
     }
 
 
-def flatten_json_value(value, prefix: str = "") -> List[str]:
-    if value is None:
-        return []
-    if isinstance(value, dict):
-        lines: List[str] = []
-        for key, nested in value.items():
-            next_prefix = f"{prefix}.{key}" if prefix else str(key)
-            lines.extend(flatten_json_value(nested, next_prefix))
-        return lines
-    if isinstance(value, list):
-        lines: List[str] = []
-        for index, nested in enumerate(value):
-            next_prefix = f"{prefix}[{index}]" if prefix else f"[{index}]"
-            lines.extend(flatten_json_value(nested, next_prefix))
-        return lines
-
-    text = normalize_text(str(value))
-    if not text:
-        return []
-    return [f"{prefix}: {text}" if prefix else text]
-
-
-def _compose_flattened_text(entry: object, max_chars_per_record: int) -> str:
-    lines = flatten_json_value(entry)
-    text = normalize_text("\n".join(lines))
-    if not text:
-        return ""
-    return text[: max(64, max_chars_per_record)]
-
-
 def iter_texts_from_json(path: Path, options: Dict[str, object]) -> Iterator[str]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     entries = payload if isinstance(payload, list) else [payload]
     max_records = int(options["maxRecordsPerFile"])
     max_chars = int(options["maxCharsPerRecord"])
     yielded = 0
+
     for entry in entries:
-        if yielded >= max_records:
-            break
-        text = _compose_flattened_text(entry, max_chars)
-        if text:
+        for text in extract_text_records(entry, max_chars):
+            if yielded >= max_records:
+                return
             yielded += 1
             yield text
 
@@ -107,19 +274,24 @@ def iter_texts_from_jsonl(path: Path, options: Dict[str, object]) -> Iterator[st
     max_records = int(options["maxRecordsPerFile"])
     max_chars = int(options["maxCharsPerRecord"])
     yielded = 0
+
     with path.open("r", encoding="utf-8", errors="ignore") as handle:
         for raw_line in handle:
             if yielded >= max_records:
-                break
+                return
             line = normalize_text(raw_line)
             if not line:
                 continue
+
             try:
                 payload = json.loads(line)
-                text = _compose_flattened_text(payload, max_chars)
+                records = extract_text_records(payload, max_chars)
             except Exception:
-                text = line[: max(64, max_chars)]
-            if text:
+                records = _split_into_chunks(line, max_chars)
+
+            for text in records:
+                if yielded >= max_records:
+                    return
                 yielded += 1
                 yield text
 
@@ -128,21 +300,15 @@ def iter_texts_from_csv(path: Path, options: Dict[str, object]) -> Iterator[str]
     max_records = int(options["maxRecordsPerFile"])
     max_chars = int(options["maxCharsPerRecord"])
     yielded = 0
+
     with path.open("r", encoding="utf-8", newline="", errors="ignore") as handle:
         reader = csv.DictReader(handle)
         for row in reader:
-            if yielded >= max_records:
-                break
-            lines = []
-            for key, value in row.items():
-                key_text = normalize_text(str(key))
-                value_text = normalize_text(str(value or ""))
-                if value_text:
-                    lines.append(f"{key_text}: {value_text}" if key_text else value_text)
-            text = normalize_text("\n".join(lines))
-            if text:
+            for text in extract_text_records(row, max_chars):
+                if yielded >= max_records:
+                    return
                 yielded += 1
-                yield text[: max(64, max_chars)]
+                yield text
 
 
 def iter_texts_from_parquet(path: Path, options: Dict[str, object]) -> Iterator[str]:
@@ -155,15 +321,14 @@ def iter_texts_from_parquet(path: Path, options: Dict[str, object]) -> Iterator[
     try:
         import pyarrow.parquet as pq  # pylint: disable=import-outside-toplevel
     except Exception:
-        return iter(())
+        return
 
     parquet_file = pq.ParquetFile(path)
     for batch in parquet_file.iter_batches(batch_size=batch_size, columns=columns):
         for row in batch.to_pylist():
-            if yielded >= max_records:
-                return
-            text = _compose_flattened_text(row, max_chars)
-            if text:
+            for text in extract_text_records(row, max_chars):
+                if yielded >= max_records:
+                    return
                 yielded += 1
                 yield text
 
@@ -174,12 +339,11 @@ def iter_texts_from_txt(path: Path, options: Dict[str, object]) -> Iterator[str]
     yielded = 0
     with path.open("r", encoding="utf-8", errors="ignore") as handle:
         for line in handle:
-            if yielded >= max_records:
-                break
-            text = normalize_text(line)
-            if text:
+            for text in _split_into_chunks(line, max_chars):
+                if yielded >= max_records:
+                    return
                 yielded += 1
-                yield text[: max(64, max_chars)]
+                yield text
 
 
 def iter_texts_from_dataset_files(paths: Sequence[str], options: Dict[str, object] | None = None) -> Iterator[str]:
@@ -274,6 +438,9 @@ def create_datasets(
     validation_split: float = 0.1,
     shuffle_buffer: int = 4096,
 ) -> DatasetBundle:
+    if tf is None:
+        raise RuntimeError("TensorFlow is required to build tf.data datasets.")
+
     validation_split = min(0.4, max(0.0, float(validation_split)))
     validation_period = max(2, int(round(1.0 / validation_split))) if validation_split > 0 else 0
     stride = max(1, context_length // 2)
@@ -355,3 +522,7 @@ def iter_collected_texts(payload: Dict[str, object]) -> Iterator[str]:
 
 def collect_texts(payload: Dict[str, object]) -> List[str]:
     return list(clean_text_stream(iter_collected_texts(payload)))
+
+
+def approximate_token_count(text: str) -> int:
+    return len(TOKEN_PATTERN.findall(normalize_text(text)))

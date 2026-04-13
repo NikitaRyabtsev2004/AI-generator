@@ -104,10 +104,24 @@ function formatQueueSourceStats(source = {}) {
   const typeLabel = String(source.type || 'file').toUpperCase();
   const tokenCount = Math.max(Number(source.stats?.tokenCount) || 0, 0);
   const charCount = Math.max(Number(source.stats?.charCount) || 0, 0);
+  const rowCount = Math.max(Number(source.stats?.rowCount) || 0, 0);
+  const columnCount = Math.max(Number(source.stats?.columnCount) || 0, 0);
   const contentSize = Math.max(Number(source.contentSize) || 0, 0);
+  const datasetMeta = [];
+
+  if (rowCount > 0) {
+    datasetMeta.push(`${formatNumber(rowCount)} записей`);
+  }
+  if (columnCount > 0) {
+    datasetMeta.push(`${formatNumber(columnCount)} колонок`);
+  }
 
   if (tokenCount > 0 || charCount > 0) {
-    return `${typeLabel} | ${formatNumber(tokenCount)} токенов | ${formatNumber(charCount)} символов`;
+    return `${typeLabel} | ${formatNumber(tokenCount)} токенов | ${formatNumber(charCount)} символов${datasetMeta.length ? ` | ${datasetMeta.join(', ')}` : ''}`;
+  }
+
+  if (datasetMeta.length) {
+    return `${typeLabel} | ${datasetMeta.join(', ')} | токены будут подсчитаны при обучении`;
   }
 
   if (contentSize > 0) {
@@ -115,6 +129,23 @@ function formatQueueSourceStats(source = {}) {
   }
 
   return `${typeLabel} | токены будут подсчитаны при обучении`;
+}
+
+function formatSourceStats(source = {}) {
+  const typeLabel = String(source.type || 'file').toUpperCase();
+  const tokenCount = Math.max(Number(source.stats?.tokenCount) || 0, 0);
+  const charCount = Math.max(Number(source.stats?.charCount) || 0, 0);
+  const rowCount = Math.max(Number(source.stats?.rowCount) || 0, 0);
+  const columnCount = Math.max(Number(source.stats?.columnCount) || 0, 0);
+  const datasetMeta = [];
+  if (rowCount > 0) {
+    datasetMeta.push(`${formatNumber(rowCount)} записей`);
+  }
+  if (columnCount > 0) {
+    datasetMeta.push(`${formatNumber(columnCount)} колонок`);
+  }
+
+  return `${typeLabel} | ${formatNumber(tokenCount)} токенов | ${formatNumber(charCount)} символов${datasetMeta.length ? ` | ${datasetMeta.join(', ')}` : ''}`;
 }
 
 export default function TrainingTab({
@@ -752,7 +783,7 @@ export default function TrainingTab({
                   <div>
                     <Typography variant="subtitle2">{source.label}</Typography>
                     <Typography variant="caption" className="muted-text">
-                      {source.type.toUpperCase()} | {formatNumber(source.stats.tokenCount)} токенов | {formatNumber(source.stats.charCount)} символов
+                      {formatSourceStats(source)}
                     </Typography>
                   </div>
                   <IconButton onClick={() => onRemoveSource(source.id)} disabled={busy || trainingLocked}>

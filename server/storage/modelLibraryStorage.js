@@ -3,8 +3,16 @@ const path = require('path');
 
 const MODEL_LIBRARY_DIR = path.join(__dirname, '..', 'data', 'model-library');
 
+function normalizeModelId(modelId) {
+  const normalized = String(modelId || '').trim();
+  if (!normalized) {
+    throw new Error('Model id is required for model library operation.');
+  }
+  return normalized;
+}
+
 function getModelLibraryItemDir(modelId) {
-  return path.join(MODEL_LIBRARY_DIR, modelId);
+  return path.join(MODEL_LIBRARY_DIR, normalizeModelId(modelId));
 }
 
 function getModelLibraryPackagePath(modelId) {

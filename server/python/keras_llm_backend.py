@@ -6,6 +6,7 @@ import json
 import math
 import os
 import platform
+import re
 import tempfile
 import time
 from dataclasses import asdict
@@ -333,6 +334,111 @@ def command_generate(config: Dict[str, Any]) -> int:
             "text": text,
             "generatedTokenIds": generated_ids,
             "manifest": manifest,
+        }
+    )
+    return 0
+
+
+def inspect_parquet_metadata(path: Path) -> Dict[str, Any]:
+    try:
+        import pyarrow.parquet as pq  # pylint: disable=import-outside-toplevel
+    except Exception:
+        return {}
+
+    try:
+        parquet_file = pq.ParquetFile(path)
+        names = [str(name) for name in getattr(parquet_file.schema, "names", [])]
+        row_count = safe_int(getattr(parquet_file.metadata, "num_rows", 0), 0)
+        return {
+            "rowCount": max(row_count, 0),
+            "columnCount": len(names),
+            "columns": names[:128],
+        }
+    except Exception:
+        return {}
+
+
+def command_inspect_dataset(config: Dict[str, Any]) -> int:
+    from llm_data import iter_texts_from_dataset_files, resolve_dataset_options, approximate_token_count  # pylint: disable=import-outside-toplevel
+
+    raw_dataset_files = config.get("datasetFiles")
+    dataset_files = [str(item) for item in raw_dataset_files] if isinstance(raw_dataset_files, list) else []
+    dataset_options = resolve_dataset_options(
+        config.get("datasetOptions") if isinstance(config.get("datasetOptions"), dict) else {}
+    )
+    inspect_options = config.get("inspect") if isinstance(config.get("inspect"), dict) else {}
+    preview_records = max(1, safe_int(inspect_options.get("previewRecords"), 256))
+    estimate_sample_records = max(preview_records, safe_int(inspect_options.get("estimateSampleRecords"), 2048))
+    preview_chars = max(64, safe_int(inspect_options.get("previewChars"), 16000))
+
+    files_payload: List[Dict[str, Any]] = []
+    for raw_path in dataset_files:
+        source_path = Path(str(raw_path)).expanduser()
+        file_payload: Dict[str, Any] = {
+            "path": str(source_path),
+            "name": source_path.name,
+            "format": source_path.suffix.lower().lstrip(".") or "txt",
+            "exists": source_path.exists() and source_path.is_file(),
+            "sizeBytes": safe_int(source_path.stat().st_size, 0) if source_path.exists() else 0,
+            "previewRecords": [],
+            "sampleRecordCount": 0,
+            "estimatedTokenCount": 0,
+            "estimatedCharCount": 0,
+        }
+
+        if not file_payload["exists"]:
+            file_payload["error"] = "not_found"
+            files_payload.append(file_payload)
+            continue
+
+        if source_path.suffix.lower() == ".parquet":
+            file_payload.update(inspect_parquet_metadata(source_path))
+
+        sample_record_count = 0
+        sample_char_count = 0
+        sample_token_count = 0
+        preview_items: List[str] = []
+
+        for text in iter_texts_from_dataset_files([str(source_path)], dataset_options):
+            normalized = clean_message(text)
+            if not normalized:
+                continue
+
+            if len(preview_items) < preview_records:
+                preview_items.append(normalized[:preview_chars])
+
+            if sample_record_count < estimate_sample_records:
+                sample_record_count += 1
+                sample_char_count += len(normalized)
+                sample_token_count += approximate_token_count(normalized)
+
+            if len(preview_items) >= preview_records and sample_record_count >= estimate_sample_records:
+                break
+
+        row_count = safe_int(file_payload.get("rowCount"), 0)
+        if row_count > sample_record_count > 0:
+            scale = row_count / sample_record_count
+            estimated_char_count = int(sample_char_count * scale)
+            estimated_token_count = int(sample_token_count * scale)
+        else:
+            estimated_char_count = sample_char_count
+            estimated_token_count = sample_token_count
+
+        file_payload.update(
+            {
+                "previewRecords": preview_items,
+                "sampleRecordCount": sample_record_count,
+                "estimatedRecordCount": row_count if row_count > 0 else sample_record_count,
+                "estimatedTokenCount": max(0, estimated_token_count),
+                "estimatedCharCount": max(0, estimated_char_count),
+            }
+        )
+        files_payload.append(file_payload)
+
+    emit(
+        {
+            "ok": True,
+            "files": files_payload,
         }
     )
     return 0
@@ -770,7 +876,7 @@ def command_train(config: Dict[str, Any]) -> int:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="TensorFlow/Keras backend for AI-generator.")
-    parser.add_argument("command", choices=["load_runtime", "train", "generate"])
+    parser.add_argument("command", choices=["load_runtime", "train", "generate", "inspect_dataset"])
     parser.add_argument("--config", required=True, help="Path to JSON config file.")
     return parser
 
@@ -786,6 +892,8 @@ def main() -> int:
         return command_train(config)
     if args.command == "generate":
         return command_generate(config)
+    if args.command == "inspect_dataset":
+        return command_inspect_dataset(config)
     emit({"ok": False, "error": f"Unsupported command: {args.command}"})
     return 2
 

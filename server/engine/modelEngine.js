@@ -412,6 +412,7 @@ function summarizeSource(source) {
     url: source.url || null,
     addedAt: source.addedAt,
     stats: source.stats,
+    contentSize: Math.max(Number(source.contentSize) || 0, 0),
     preview: previewText(source.content, 220),
   };
 }
@@ -628,6 +629,22 @@ function sanitizeReplyText(text) {
     .trim();
 }
 
+function isSimpleGreetingMessage(userMessage) {
+  const normalized = cleanText(userMessage || '').toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  const tokens = tokenizeWords(normalized);
+  return tokens.length <= 4 && SHORT_SOCIAL_MESSAGE_PATTERN.test(normalized);
+}
+
+function buildGreetingReply(language = 'auto') {
+  if (language === 'en') {
+    return 'Hi! I am ready to help. Tell me what you need and I will answer briefly and clearly.';
+  }
+  return 'Привет! Я на связи. Напишите задачу, и я отвечу коротко и по делу.';
+}
+
 function shouldSkipWebSearchForMessage(userMessage) {
   const normalized = cleanText(userMessage || '').toLowerCase();
   const tokens = tokenizeWords(normalized);
@@ -794,7 +811,9 @@ function collapseDuplicateSentences(text) {
 }
 
 function stripLinkNoise(text) {
-  const value = cleanText(text);
+  const value = cleanText(text)
+    .replace(/([^\s])(\[[^\]]{1,120}\]\(https?:\/\/[^\s)]+\))/giu, '$1 $2')
+    .replace(/(\))(?![\s.,!?;:])/gu, '$1 ');
   const linkCount = (value.match(MARKDOWN_LINK_PATTERN) || []).length;
   const urlCount = (value.match(URL_PATTERN) || []).length;
   let cleaned = value;
@@ -807,16 +826,95 @@ function stripLinkNoise(text) {
   return cleanText(cleaned);
 }
 
+function pruneLinkDenseFragments(text) {
+  const normalized = cleanText(text);
+  if (!normalized) {
+    return '';
+  }
+
+  const sentences = splitIntoSentences(normalized);
+  if (!sentences.length) {
+    return normalized;
+  }
+
+  let totalLinkCount = 0;
+  let totalUrlCount = 0;
+  const selected = [];
+  const selectedSet = new Set();
+
+  sentences.forEach((sentence) => {
+    const cleanSentence = cleanText(sentence);
+    if (!cleanSentence) {
+      return;
+    }
+
+    const linkCount = (cleanSentence.match(MARKDOWN_LINK_PATTERN) || []).length;
+    const urlCount = (cleanSentence.match(URL_PATTERN) || []).length;
+    totalLinkCount += linkCount;
+    totalUrlCount += urlCount;
+
+    if (linkCount >= 2 || urlCount >= 2) {
+      return;
+    }
+
+    const normalizedSentence = cleanSentence.toLowerCase();
+    if (selectedSet.has(normalizedSentence)) {
+      return;
+    }
+
+    selectedSet.add(normalizedSentence);
+    selected.push(cleanSentence);
+  });
+
+  if (!selected.length && (totalLinkCount > 0 || totalUrlCount > 0)) {
+    return cleanText(
+      normalized
+        .replace(MARKDOWN_LINK_PATTERN, '$1')
+        .replace(URL_PATTERN, '')
+    );
+  }
+
+  return selected.length ? cleanText(selected.join(' ')) : normalized;
+}
+
+function clampReplySentenceCount(text, maxSentences = 0) {
+  const normalized = cleanText(text);
+  if (!normalized) {
+    return '';
+  }
+
+  const limit = Math.max(Number(maxSentences) || 0, 0);
+  if (!limit) {
+    return normalized;
+  }
+
+  const selected = [];
+  appendUniqueSentences(selected, splitIntoSentences(normalized), limit);
+  return cleanText(selected.join(' ')) || normalized;
+}
+
 function normalizeFinalReplyText(text) {
   const base = sanitizeReplyText(text);
   const withoutLinkNoise = stripLinkNoise(base);
-  const withoutRepeatedWords = collapseRepeatedWords(withoutLinkNoise);
+  const withoutDenseLinkFragments = pruneLinkDenseFragments(withoutLinkNoise);
+  const withoutRepeatedWords = collapseRepeatedWords(withoutDenseLinkFragments);
   const withoutRepeatedSentences = collapseDuplicateSentences(withoutRepeatedWords);
-  return cleanText(withoutRepeatedSentences || withoutRepeatedWords || withoutLinkNoise || base);
+  return cleanText(
+    withoutRepeatedSentences ||
+    withoutRepeatedWords ||
+    withoutDenseLinkFragments ||
+    withoutLinkNoise ||
+    base
+  );
 }
 
-function finalizeReplyForOutput(text) {
+function finalizeReplyForOutput(text, options = {}) {
+  const maxSentences = Math.max(Number(options.maxSentences) || 0, 0);
   const normalized = normalizeFinalReplyText(text);
+  const sentenceClamped = clampReplySentenceCount(normalized, maxSentences);
+  if (sentenceClamped) {
+    return sentenceClamped;
+  }
   if (normalized) {
     return normalized;
   }
@@ -843,6 +941,12 @@ function isNoisyWebChunk(chunk = {}) {
   }
 
   const uniqueRatio = new Set(tokens.map((token) => token.toLowerCase())).size / tokens.length;
+  if ((markdownLinkCount || urlCount) && tokens.length < 18) {
+    return true;
+  }
+  if ((markdownLinkCount > 0 || urlCount > 0) && /\b(перевод|словарь|синоним|translation|dictionary)\b/iu.test(text)) {
+    return true;
+  }
   if (markdownLinkCount >= 3 || urlCount >= 6) {
     return true;
   }
@@ -1572,15 +1676,19 @@ function resolveQueuedSources(state, options = {}) {
   return options.includeQueuedSources === false ? [] : state.sources;
 }
 
+function resolveDatasetSourcePath(source = {}) {
+  return cleanText(source?.contentPath || source?.datasetFilePath || '');
+}
+
 function isDatasetFileSource(source = {}) {
-  return source?.type === 'dataset_file' && Boolean(cleanText(source?.contentPath || ''));
+  return source?.type === 'dataset_file' && Boolean(resolveDatasetSourcePath(source));
 }
 
 function collectDatasetFileDescriptors(sources = []) {
   const descriptors = (Array.isArray(sources) ? sources : [])
     .filter((source) => isDatasetFileSource(source))
     .map((source) => ({
-      path: cleanText(source.contentPath || ''),
+      path: resolveDatasetSourcePath(source),
       size: Math.max(Number(source.contentSize) || 0, 0),
       label: cleanText(source.label || '') || 'dataset_file',
     }))
@@ -1599,7 +1707,7 @@ async function materializeTrainingSources(sources = [], options = {}) {
     throwIfTrainingPreparationStopped(shouldStop);
     const source = inputSources[index];
     if (isDatasetFileSource(source)) {
-      const datasetPath = cleanText(source.contentPath || '');
+      const datasetPath = resolveDatasetSourcePath(source);
       try {
         await fs.access(datasetPath);
       } catch (error) {
@@ -3523,14 +3631,48 @@ function markQueueAsRunning(state, queueId) {
           return null;
         }
 
+        const fallbackStats = computeStats(text);
+        const sourceStats = source?.stats && typeof source.stats === 'object' ? source.stats : null;
+        const tokenCount = Math.max(
+          Number(sourceStats?.tokenCount) || 0,
+          Number(fallbackStats.tokenCount) || 0,
+          0
+        );
+        const charCount = Math.max(
+          Number(sourceStats?.charCount) || 0,
+          Number(fallbackStats.charCount) || 0,
+          0
+        );
+        const rowCount = Math.max(Number(sourceStats?.rowCount) || 0, 0);
+        const columnCount = Math.max(Number(sourceStats?.columnCount) || 0, 0);
+        const format = cleanText(sourceStats?.format || '');
+        const columns = Array.isArray(sourceStats?.columns)
+          ? sourceStats.columns.map((value) => cleanText(String(value))).filter(Boolean).slice(0, 64)
+          : [];
+        const contentPath = cleanText(source?.contentPath || source?.datasetFilePath || '');
+        const contentSize = Math.max(
+          Number(source?.contentSize) || 0,
+          text ? Buffer.byteLength(text, 'utf8') : 0
+        );
+        const mergedStats = {
+          tokenCount,
+          charCount,
+          ...(rowCount > 0 ? { rowCount } : {}),
+          ...(columnCount > 0 ? { columnCount } : {}),
+          ...(format ? { format } : {}),
+          ...(columns.length ? { columns } : {}),
+        };
+
         return {
           id: createId('source'),
           type: source.type,
           label: source.label,
           url: source.url || null,
           content: text,
-          stats: computeStats(text),
+          stats: mergedStats,
           addedAt: nowIso(),
+          contentPath: contentPath || null,
+          contentSize,
         };
       })
       .filter(Boolean);
@@ -4016,6 +4158,17 @@ function markQueueAsRunning(state, queueId) {
                   markQueueAsPendingAfterInterruption(state, queueContext.queueId, 'paused');
                 }
                 if (!queueContext?.queueId && !message.trainingResult.stopRequested && shouldAutoClearSources(state)) {
+                  await Promise.all((state.sources || []).map(async (source) => {
+                    const datasetPath = resolveDatasetSourcePath(source);
+                    if (!datasetPath) {
+                      return;
+                    }
+                    try {
+                      await fs.rm(datasetPath, { force: true });
+                    } catch (_error) {
+                      // Ignore cleanup failures for source dataset files.
+                    }
+                  }));
                   state.sources = [];
                   state.model.sourceCount = 0;
                 }
@@ -4260,6 +4413,23 @@ function markQueueAsRunning(state, queueId) {
   async function renderReply({ state, chat, userMessage }) {
     const runtimeConfig = getRuntimeConfig();
     const userLanguage = detectMessageLanguage(userMessage);
+    if (isSimpleGreetingMessage(userMessage)) {
+      return {
+        content: buildGreetingReply(userLanguage),
+        metadata: {
+          mode: 'system',
+          type: 'system',
+          usedContextMessages: 0,
+          matchedSourceLabels: [],
+          matchedMemoryScore: 0,
+          chunkMatches: 0,
+          selfScore: 0.92,
+          userRating: 0,
+          usedWebSources: [],
+        },
+      };
+    }
+
     const { queryMap, contextMessages } = buildWeightedQueryMap(userMessage, chat, runtimeConfig);
     const recentAssistantReplies = (chat.messages || [])
       .filter((message) => message.role === 'assistant')
@@ -4480,7 +4650,9 @@ function markQueueAsRunning(state, queueId) {
 
         return {
           content: previewText(
-            finalizeReplyForOutput(groundedFallback),
+            finalizeReplyForOutput(groundedFallback, {
+              maxSentences: state.settings.generation.maxReplySentences,
+            }),
             state.settings.generation.maxReplyCharacters
           ),
           metadata: {
@@ -4526,7 +4698,9 @@ function markQueueAsRunning(state, queueId) {
 
     return {
       content: previewText(
-        finalizeReplyForOutput(candidate.content),
+        finalizeReplyForOutput(candidate.content, {
+          maxSentences: state.settings.generation.maxReplySentences,
+        }),
         state.settings.generation.maxReplyCharacters
       ),
       metadata: {
@@ -4734,11 +4908,20 @@ function markQueueAsRunning(state, queueId) {
       await repairStaleExecutionStateIfNeeded();
       return updateState(async (state) => {
         assertTrainingUnlocked(state, 'Изменение источников');
+        const removedSource = state.sources.find((source) => source.id === sourceId) || null;
+        const removedDatasetPath = resolveDatasetSourcePath(removedSource || {});
         state.sources = state.sources.filter((source) => source.id !== sourceId);
         state.model.sourceCount = state.sources.length;
         if (state.model.exists) {
           state.model.lifecycle = state.model.trainedEpochs ? 'trained' : 'ready_for_training';
           state.model.status = 'ready';
+        }
+        if (removedDatasetPath) {
+          try {
+            await fs.rm(removedDatasetPath, { force: true });
+          } catch (_error) {
+            // Ignore cleanup failures for removed source dataset files.
+          }
         }
 
         pushStatus(state, 'idle', 'source_removed', 'Источник удален из очереди обучения.');

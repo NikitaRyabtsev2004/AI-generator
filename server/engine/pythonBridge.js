@@ -18,6 +18,8 @@ const PIP_INSTALL_TIMEOUT_MS = 45 * 60 * 1000;
 
 let resolvedPythonRuntime = null;
 let resolvingPythonRuntimePromise = null;
+let resolvedPythonRuntimeNoTensorflow = null;
+let resolvingPythonRuntimeNoTensorflowPromise = null;
 const pythonBridgeHealth = {
   runtimeResolved: false,
   runtime: '',
@@ -565,6 +567,118 @@ async function resolvePythonRuntime() {
   return resolvingPythonRuntimePromise;
 }
 
+function runModuleImportProbe(candidate, moduleName, timeoutMs = 60000) {
+  const normalizedModule = String(moduleName || '').trim();
+  if (!normalizedModule) {
+    return Promise.resolve({ ok: false, stdout: '', stderr: 'Module name is empty.' });
+  }
+
+  return new Promise((resolve) => {
+    const args = [
+      ...candidate.argsPrefix,
+      '-c',
+      `import ${normalizedModule}; print(${normalizedModule}.__name__)`,
+    ];
+    const child = spawn(candidate.command, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const timeoutId = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      child.kill('SIGTERM');
+      resolve({
+        ok: false,
+        stdout,
+        stderr: `${stderr}\nModule probe timed out.`,
+      });
+    }, timeoutMs);
+
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on('error', (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeoutId);
+      resolve({
+        ok: false,
+        stdout,
+        stderr: `${stderr}\n${error.message}`,
+      });
+    });
+    child.on('exit', (code) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeoutId);
+      resolve({
+        ok: code === 0,
+        stdout,
+        stderr,
+      });
+    });
+  });
+}
+
+async function resolvePythonRuntimeNoTensorflow() {
+  if (resolvedPythonRuntimeNoTensorflow) {
+    return resolvedPythonRuntimeNoTensorflow;
+  }
+
+  if (!resolvingPythonRuntimeNoTensorflowPromise) {
+    resolvingPythonRuntimeNoTensorflowPromise = (async () => {
+      try {
+        const candidates = await buildPythonCandidates();
+        let fallbackCandidate = null;
+        for (const candidate of candidates) {
+          const probe = await runProbe(candidate);
+          if (!probe.ok) {
+            continue;
+          }
+          fallbackCandidate = fallbackCandidate || candidate;
+
+          const pyarrowProbe = await runModuleImportProbe(candidate, 'pyarrow');
+          if (pyarrowProbe.ok) {
+            resolvedPythonRuntimeNoTensorflow = candidate;
+            setRuntimeResolved(candidate);
+            return candidate;
+          }
+        }
+
+        if (fallbackCandidate) {
+          resolvedPythonRuntimeNoTensorflow = fallbackCandidate;
+          setRuntimeResolved(fallbackCandidate);
+          return fallbackCandidate;
+        }
+
+        throw new Error(
+          'Python interpreter was not found. Install Python 3.9+ and set AI_GENERATOR_PYTHON if needed.'
+        );
+      } catch (error) {
+        setRuntimeResolveError(error);
+        throw error;
+      } finally {
+        resolvingPythonRuntimeNoTensorflowPromise = null;
+      }
+    })();
+  }
+
+  return resolvingPythonRuntimeNoTensorflowPromise;
+}
+
 async function createTempConfigFile(prefix, payload) {
   const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), `${prefix}-`));
   const filePath = path.join(targetDir, 'config.json');
@@ -587,13 +701,17 @@ async function cleanupTempConfig(targetDir) {
 }
 
 async function startPythonBackendProcess(commandName, configPath, options = {}) {
-  const runtime = await resolvePythonRuntime();
+  const runtime = options.requireTensorflow === false
+    ? await resolvePythonRuntimeNoTensorflow()
+    : await resolvePythonRuntime();
   const args = [...runtime.argsPrefix, BACKEND_SCRIPT_PATH, commandName, '--config', configPath];
   const child = spawn(runtime.command, args, {
     cwd: options.cwd || process.cwd(),
     env: {
       ...process.env,
       ...(options.env || {}),
+      PYTHONUTF8: '1',
+      PYTHONIOENCODING: 'utf-8',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,

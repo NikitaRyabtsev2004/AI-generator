@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const multer = require('multer');
 const { cleanText, computeStats, decodeBufferToText } = require('../lib/text');
 const { writeNdjsonChunk } = require('../core/apiResponse');
+const { runPythonBackendJson } = require('../engine/pythonBridge');
 
 const UPLOADS_DIR = path.join(__dirname, '..', 'data', 'uploaded-datasets');
 const DEFAULT_MAX_UPLOAD_FILE_MB = 2048;
@@ -16,6 +17,9 @@ const DEFAULT_MAX_STRUCTURED_RECORDS_PER_FILE = 500;
 const DEFAULT_UPLOAD_YIELD_EVERY_FILES = 4;
 const DEFAULT_HEAD_SAMPLE_BYTES = 6 * 1024 * 1024;
 const DEFAULT_DATASET_REFERENCE_MIN_MB = 8;
+const DEFAULT_PARQUET_PREVIEW_RECORDS = 320;
+const DEFAULT_PARQUET_ESTIMATE_SAMPLE_RECORDS = 2400;
+const DEFAULT_PARQUET_PREVIEW_CHARS = 10000;
 
 function readOptionalLimitEnv(name, fallback) {
   const rawValue = process.env[name];
@@ -47,6 +51,18 @@ const HEAD_SAMPLE_BYTES = readOptionalLimitEnv('UPLOAD_HEAD_SAMPLE_BYTES', DEFAU
 const DATASET_REFERENCE_MIN_MB = readOptionalLimitEnv(
   'DATASET_REFERENCE_MIN_MB',
   DEFAULT_DATASET_REFERENCE_MIN_MB
+);
+const PARQUET_PREVIEW_RECORDS = readOptionalLimitEnv(
+  'PARQUET_PREVIEW_RECORDS',
+  DEFAULT_PARQUET_PREVIEW_RECORDS
+);
+const PARQUET_ESTIMATE_SAMPLE_RECORDS = readOptionalLimitEnv(
+  'PARQUET_ESTIMATE_SAMPLE_RECORDS',
+  DEFAULT_PARQUET_ESTIMATE_SAMPLE_RECORDS
+);
+const PARQUET_PREVIEW_CHARS = readOptionalLimitEnv(
+  'PARQUET_PREVIEW_CHARS',
+  DEFAULT_PARQUET_PREVIEW_CHARS
 );
 
 const DATASET_REFERENCE_MIN_BYTES = Math.max(1, DATASET_REFERENCE_MIN_MB) * 1024 * 1024;
@@ -271,6 +287,113 @@ async function readLimitedLines(filePath, maxLines) {
   return lines;
 }
 
+function buildDatasetStatsFromInspection(inspection = {}, fallbackStats = {}) {
+  const tokenCount = Math.max(
+    Number(inspection.estimatedTokenCount) || 0,
+    Number(fallbackStats.tokenCount) || 0,
+    0
+  );
+  const charCount = Math.max(
+    Number(inspection.estimatedCharCount) || 0,
+    Number(fallbackStats.charCount) || 0,
+    0
+  );
+  const rowCount = Math.max(
+    Number(inspection.estimatedRecordCount) || 0,
+    Number(inspection.rowCount) || 0,
+    0
+  );
+  const columnCount = Math.max(Number(inspection.columnCount) || 0, 0);
+  const columns = Array.isArray(inspection.columns)
+    ? inspection.columns.map((value) => cleanText(String(value))).filter(Boolean).slice(0, 64)
+    : [];
+
+  return {
+    tokenCount,
+    charCount,
+    rowCount,
+    columnCount,
+    format: cleanText(inspection.format || '') || '',
+    ...(columns.length ? { columns } : {}),
+  };
+}
+
+function buildDatasetPreviewSourceContent(file, inspection = {}) {
+  const summaryLines = [
+    `Файл: ${cleanText(file.originalname || '') || 'dataset_file'}`,
+    `Формат: ${cleanText(inspection.format || '') || 'dataset'}`,
+    'Режим: превью для вкладки «Источники» (для полного обучения загружайте parquet в очередь обучения).',
+  ];
+
+  const rowCount = Math.max(Number(inspection.estimatedRecordCount) || 0, 0);
+  const columnCount = Math.max(Number(inspection.columnCount) || 0, 0);
+  if (rowCount > 0) {
+    summaryLines.push(`Оценка записей: ${rowCount}`);
+  }
+  if (columnCount > 0) {
+    summaryLines.push(`Колонок: ${columnCount}`);
+  }
+
+  const columns = Array.isArray(inspection.columns)
+    ? inspection.columns.map((value) => cleanText(String(value))).filter(Boolean).slice(0, 20)
+    : [];
+  if (columns.length) {
+    summaryLines.push(`Колонки: ${columns.join(', ')}`);
+  }
+
+  const previewRecords = Array.isArray(inspection.previewRecords)
+    ? inspection.previewRecords.map((value) => cleanText(String(value))).filter(Boolean)
+    : [];
+  if (previewRecords.length) {
+    summaryLines.push(`Показано примеров: ${previewRecords.length}`);
+  }
+  const bodyLines = previewRecords.map((text, index) => `[пример ${index + 1}] ${text}`);
+  return trimSourceText(`${summaryLines.join('\n')}\n\n${bodyLines.join('\n\n')}`);
+}
+
+async function inspectDatasetFile(file, fileKind) {
+  if (fileKind !== 'parquet') {
+    return null;
+  }
+
+  const datasetPath = cleanText(file.path || '');
+  if (!datasetPath) {
+    return null;
+  }
+
+  try {
+    const payload = await runPythonBackendJson(
+      'inspect_dataset',
+      {
+        datasetFiles: [datasetPath],
+        datasetOptions: {
+          maxRecordsPerFile: Math.max(PARQUET_ESTIMATE_SAMPLE_RECORDS, PARQUET_PREVIEW_RECORDS),
+          maxCharsPerRecord: Math.max(MAX_SOURCE_TEXT_CHARS, PARQUET_PREVIEW_CHARS),
+          parquetBatchSize: Math.max(32, Math.min(512, PARQUET_PREVIEW_RECORDS)),
+        },
+        inspect: {
+          previewRecords: PARQUET_PREVIEW_RECORDS,
+          estimateSampleRecords: PARQUET_ESTIMATE_SAMPLE_RECORDS,
+          previewChars: PARQUET_PREVIEW_CHARS,
+        },
+      },
+      {
+        timeoutMs: 180000,
+        requireTensorflow: false,
+      }
+    );
+
+    const fileSummary = Array.isArray(payload?.files) ? payload.files[0] : null;
+    if (!fileSummary || typeof fileSummary !== 'object') {
+      return null;
+    }
+    return fileSummary;
+  } catch (_error) {
+    return null;
+  }
+}
+
+
 async function buildSourcesFromJsonFile(file, mode = 'knowledge') {
   const fileText = await decodeTextFromFileHead(file);
   let parsed;
@@ -397,7 +520,11 @@ async function buildSourcesFromTxtFile(file) {
   }] : [];
 }
 
-async function buildKnowledgeSourcesFromUploadedFile(file, fileKind) {
+async function buildKnowledgeSourcesFromUploadedFile(file, fileKind, options = {}) {
+  const datasetInspection = options.datasetInspection && typeof options.datasetInspection === 'object'
+    ? options.datasetInspection
+    : null;
+
   if (fileKind === 'json') {
     return buildSourcesFromJsonFile(file, 'knowledge');
   }
@@ -408,14 +535,20 @@ async function buildKnowledgeSourcesFromUploadedFile(file, fileKind) {
     return buildSourcesFromJsonlFile(file);
   }
   if (fileKind === 'parquet') {
-    const metaText = trimSourceText(
-      `Файл ${file.originalname} (${Math.max(Number(file.size) || 0, 0)} bytes) в формате parquet загружен. ` +
-      'Для обучения добавляйте parquet в очередь обучения: сервер передаст его напрямую в Python-обработчик.'
+    const inspection = datasetInspection || {};
+    const previewContent = buildDatasetPreviewSourceContent(file, inspection);
+    const fallbackText = trimSourceText(
+      `Файл ${cleanText(file.originalname || '') || 'dataset_file'} (${Math.max(Number(file.size) || 0, 0)} bytes) в формате parquet загружен.`
     );
+    const content = previewContent || fallbackText;
+    const previewStats = computeStats(content);
+    const stats = buildDatasetStatsFromInspection(inspection, previewStats);
+
     return [{
       type: 'file',
       label: file.originalname,
-      content: metaText,
+      content,
+      stats,
     }];
   }
 
@@ -423,26 +556,41 @@ async function buildKnowledgeSourcesFromUploadedFile(file, fileKind) {
 }
 
 function shouldUseDatasetFileReference(file, fileKind, mode = 'knowledge') {
+  if (fileKind === 'parquet') {
+    return true;
+  }
+
   if (mode !== 'training_queue') {
     return false;
   }
 
-  if (fileKind === 'parquet' || fileKind === 'jsonl') {
+  if (fileKind === 'jsonl') {
     return true;
   }
 
   return Math.max(Number(file.size) || 0, 0) >= DATASET_REFERENCE_MIN_BYTES;
 }
 
-function createDatasetFileReference(file) {
+function createDatasetFileReferenceWithInspection(file, inspection = null, options = {}) {
   const filePath = cleanText(file.path || '');
+  const fallbackStats = computeStats('');
+  const stats = inspection && typeof inspection === 'object'
+    ? buildDatasetStatsFromInspection(inspection, fallbackStats)
+    : fallbackStats;
+  const previewContent = cleanText(options.previewContent || '');
+
   return {
     type: 'dataset_file',
     label: cleanText(file.originalname || '') || path.basename(filePath) || 'dataset_file',
     datasetFilePath: filePath,
     contentSize: Math.max(Number(file.size) || 0, 0),
-    stats: computeStats(''),
+    stats,
+    ...(previewContent ? { content: previewContent } : {}),
   };
+}
+
+function createDatasetFileReference(file) {
+  return createDatasetFileReferenceWithInspection(file, null);
 }
 
 async function cleanupUploadedFile(file) {
@@ -475,6 +623,7 @@ async function prepareUploadedSources(files, response = null, options = {}) {
     const file = files[index];
     const fileKind = detectStructuredFileKind(file);
     const keepAsDatasetReference = shouldUseDatasetFileReference(file, fileKind, mode);
+    const datasetInspection = await inspectDatasetFile(file, fileKind);
 
     try {
       if (keepAsDatasetReference) {
@@ -483,9 +632,20 @@ async function prepareUploadedSources(files, response = null, options = {}) {
           throw new Error(`Не удалось сохранить файл "${cleanText(file.originalname || '') || 'без имени'}" во временное хранилище.`);
         }
         await fsPromises.access(datasetPath);
-        preparedSources.push(createDatasetFileReference(file));
+        if (mode === 'knowledge') {
+          const previewContent = fileKind === 'parquet'
+            ? buildDatasetPreviewSourceContent(file, datasetInspection || {})
+            : '';
+          preparedSources.push(createDatasetFileReferenceWithInspection(file, datasetInspection, {
+            previewContent,
+          }));
+        } else {
+          preparedSources.push(createDatasetFileReferenceWithInspection(file, datasetInspection));
+        }
       } else {
-        preparedSources.push(...(await buildKnowledgeSourcesFromUploadedFile(file, fileKind)));
+        preparedSources.push(...(await buildKnowledgeSourcesFromUploadedFile(file, fileKind, {
+          datasetInspection,
+        })));
       }
     } catch (error) {
       if (error?.code === 'ENOENT') {

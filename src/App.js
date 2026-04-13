@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   Badge,
@@ -30,6 +30,32 @@ import { formatNumber } from './utils/text';
 import './styles/global.css';
 import './styles/app-shell.css';
 
+function resolveStatusTheme(snapshot) {
+  if (!snapshot) {
+    return 'not_created';
+  }
+
+  const trainingStatus = String(snapshot.training?.status || '').toLowerCase();
+  if (['training', 'paused', 'error'].includes(trainingStatus)) {
+    return trainingStatus;
+  }
+
+  const lifecycle = String(snapshot.model?.lifecycle || '').toLowerCase();
+  if (['training', 'paused', 'generating_reply', 'syncing_knowledge', 'learning_from_feedback', 'error'].includes(lifecycle)) {
+    return lifecycle;
+  }
+
+  if (!snapshot.model?.exists) {
+    return 'not_created';
+  }
+
+  if (lifecycle === 'ready_for_training' || !Number(snapshot.model?.trainedEpochs || 0)) {
+    return 'ready_for_training';
+  }
+
+  return 'trained';
+}
+
 function LoadingState() {
   return (
     <div className="loading-state">
@@ -42,8 +68,40 @@ function LoadingState() {
 function App() {
   const [tab, setTab] = useState(0);
   const [statusDialogOpen, setStatusDialogOpen] = useState(false);
+  const [baseStatusTheme, setBaseStatusTheme] = useState('not_created');
+  const [overlayStatusTheme, setOverlayStatusTheme] = useState('not_created');
+  const [overlayActive, setOverlayActive] = useState(false);
   const importInputRef = useRef(null);
   const studio = useStudioApp();
+  const resolvedStatusTheme = useMemo(
+    () => resolveStatusTheme(studio.snapshot),
+    [studio.snapshot]
+  );
+
+  useEffect(() => {
+    if (resolvedStatusTheme === baseStatusTheme) {
+      setOverlayStatusTheme(resolvedStatusTheme);
+      setOverlayActive(false);
+      return;
+    }
+
+    setOverlayStatusTheme(resolvedStatusTheme);
+    setOverlayActive(false);
+
+    const revealTimeoutId = setTimeout(() => {
+      setOverlayActive(true);
+    }, 24);
+    const settleTimeoutId = setTimeout(() => {
+      setBaseStatusTheme(resolvedStatusTheme);
+      setOverlayStatusTheme(resolvedStatusTheme);
+      setOverlayActive(false);
+    }, 1200);
+
+    return () => {
+      clearTimeout(revealTimeoutId);
+      clearTimeout(settleTimeoutId);
+    };
+  }, [baseStatusTheme, resolvedStatusTheme]);
 
   const summaryItems = useMemo(() => {
     if (!studio.snapshot) {
@@ -58,14 +116,22 @@ function App() {
     ];
   }, [studio.snapshot]);
 
-  const backgroundImg = 'b-1.gif'
+  const backgroundImg = 'b-4.gif'
 
   if (studio.loading || !studio.snapshot) {
     return (
       <Box
-        className="app-shell app-shell--loading"
+        className={`app-shell app-shell--loading app-shell--status-${resolvedStatusTheme}`}
         style={{ '--app-bg-image': `url(${process.env.PUBLIC_URL}/${backgroundImg})` }}
       >
+        <div
+          aria-hidden="true"
+          className={`app-shell__status-layer app-shell__status-layer--current app-shell__status-layer--${baseStatusTheme}`}
+        />
+        <div
+          aria-hidden="true"
+          className={`app-shell__status-layer app-shell__status-layer--overlay app-shell__status-layer--${overlayStatusTheme} ${overlayActive ? 'app-shell__status-layer--active' : ''}`.trim()}
+        />
         <LoadingState />
       </Box>
     );
@@ -82,9 +148,17 @@ function App() {
 
   return (
     <Box
-      className="app-shell"
+      className={`app-shell app-shell--status-${resolvedStatusTheme}`}
       style={{ '--app-bg-image': `url(${process.env.PUBLIC_URL}/${backgroundImg})` }}
     >
+      <div
+        aria-hidden="true"
+        className={`app-shell__status-layer app-shell__status-layer--current app-shell__status-layer--${baseStatusTheme}`}
+      />
+      <div
+        aria-hidden="true"
+        className={`app-shell__status-layer app-shell__status-layer--overlay app-shell__status-layer--${overlayStatusTheme} ${overlayActive ? 'app-shell__status-layer--active' : ''}`.trim()}
+      />
       <Container maxWidth="xl" className="app-shell__container">
         <GlassPanel className="hero-panel">
           <div className="hero-panel__topline">
@@ -93,9 +167,9 @@ function App() {
                 <AutoAwesomeIcon fontSize="medium" />
                 <span className="hero-panel__badge-text">
                   <span>
-                    <strong style={{fontSize: '30px'}}>AI Generator</strong>
+                    <strong className="hero-panel__brand">AI Generator</strong>
                   </span>
-                  <strong style={{textDecoration: 'underline'}}>Studio</strong>
+                  <strong className="hero-panel__brand-accent">Studio</strong>
                 </span>
               </div>
             </div>
@@ -143,6 +217,7 @@ function App() {
                   </Badge>
                 </IconButton>
               </Tooltip>
+              <StatusPill label={studio.realtimeConnected ? 'Realtime online' : 'Realtime reconnecting'} tone="neutral" />
               <StatusPill label={studio.snapshot.model.engine} active tone="accent" />
               <StatusPill label={`Статус: ${studio.snapshot.model.lifecycle}`} tone="neutral" />
               {summaryItems.map((item) => (
