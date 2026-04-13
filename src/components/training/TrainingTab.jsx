@@ -35,6 +35,8 @@ import {
 } from '../../utils/text';
 import '../../styles/training-tab.css';
 
+const SUPPORTED_SOURCE_FILE_ACCEPT = '.txt,.csv,.json,.jsonl,.ndjson,.parquet,text/plain,text/csv,application/json,application/x-ndjson,application/parquet,application/vnd.apache.parquet';
+
 function formatSettingValue(control, value) {
   if (control.precision) {
     return valueWithUnit(value, control.unit, control.precision);
@@ -78,6 +80,41 @@ function modelFactRows(snapshot) {
     ['Train-примеров в LM', formatNumber(knowledge?.languageModel?.trainingSampleCount || 0)],
     ['Validation-примеров', formatNumber(knowledge?.languageModel?.validationSampleCount || 0)],
   ];
+}
+
+function formatBytes(value) {
+  const size = Math.max(Number(value) || 0, 0);
+  if (!size) {
+    return '0 B';
+  }
+
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let normalized = size;
+  let unitIndex = 0;
+  while (normalized >= 1024 && unitIndex < units.length - 1) {
+    normalized /= 1024;
+    unitIndex += 1;
+  }
+
+  const precision = normalized >= 100 || unitIndex === 0 ? 0 : 1;
+  return `${normalized.toFixed(precision)} ${units[unitIndex]}`;
+}
+
+function formatQueueSourceStats(source = {}) {
+  const typeLabel = String(source.type || 'file').toUpperCase();
+  const tokenCount = Math.max(Number(source.stats?.tokenCount) || 0, 0);
+  const charCount = Math.max(Number(source.stats?.charCount) || 0, 0);
+  const contentSize = Math.max(Number(source.contentSize) || 0, 0);
+
+  if (tokenCount > 0 || charCount > 0) {
+    return `${typeLabel} | ${formatNumber(tokenCount)} токенов | ${formatNumber(charCount)} символов`;
+  }
+
+  if (contentSize > 0) {
+    return `${typeLabel} | ${formatBytes(contentSize)} | токены будут подсчитаны при обучении`;
+  }
+
+  return `${typeLabel} | токены будут подсчитаны при обучении`;
 }
 
 export default function TrainingTab({
@@ -657,7 +694,7 @@ export default function TrainingTab({
               <input
                 hidden
                 type="file"
-                accept=".txt,.csv,.json,text/plain,text/csv,application/json"
+                accept={SUPPORTED_SOURCE_FILE_ACCEPT}
                 multiple
                 onChange={async (event) => {
                   const files = Array.from(event.target.files || []);
@@ -685,6 +722,10 @@ export default function TrainingTab({
             >
               Добавить URL
             </Button>
+
+            <Typography variant="caption" className="muted-text">
+              Поддерживаемые форматы: TXT, CSV, JSON, JSONL/NDJSON, PARQUET.
+            </Typography>
 
             {isUploadingFiles ? (
               <div className="upload-progress-wrap">
@@ -815,7 +856,7 @@ export default function TrainingTab({
                       <input
                         hidden
                         type="file"
-                        accept=".txt,.csv,.json,text/plain,text/csv,application/json"
+                        accept={SUPPORTED_SOURCE_FILE_ACCEPT}
                         multiple
                         onChange={async (event) => {
                           const files = Array.from(event.target.files || []);
@@ -834,7 +875,7 @@ export default function TrainingTab({
                         <div>
                           <Typography variant="body2">{source.label}</Typography>
                           <Typography variant="caption" className="muted-text">
-                            {`${formatNumber(source.stats.tokenCount)} токенов`}
+                            {formatQueueSourceStats(source)}
                           </Typography>
                         </div>
                         <IconButton

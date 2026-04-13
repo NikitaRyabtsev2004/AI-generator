@@ -38,6 +38,7 @@ const {
 const {
   cleanupTrainingQueueStorage,
   createTrainingJobPayloadFile,
+  persistTrainingQueueDatasetFile,
   readTrainingQueueSourceContent,
   removeTrainingJobPayloadFile,
   removeTrainingQueueDirectory,
@@ -1598,6 +1599,18 @@ async function materializeTrainingSources(sources = [], options = {}) {
     throwIfTrainingPreparationStopped(shouldStop);
     const source = inputSources[index];
     if (isDatasetFileSource(source)) {
+      const datasetPath = cleanText(source.contentPath || '');
+      try {
+        await fs.access(datasetPath);
+      } catch (error) {
+        if (error?.code === 'ENOENT') {
+          throw new Error(
+            `Файл датасета «${cleanText(source.label || '') || path.basename(datasetPath) || 'без имени'}» не найден на диске. ` +
+            'Перезагрузите файл в очередь обучения.'
+          );
+        }
+        throw error;
+      }
       materialized.push({
         ...source,
         content: '',
@@ -4776,8 +4789,10 @@ function markQueueAsRunning(state, queueId) {
       for (const source of sources) {
         const datasetPath = cleanText(source.datasetFilePath || '');
         if (datasetPath) {
+          const sourceId = createId('queued_source');
+          const persistedDataset = await persistTrainingQueueDatasetFile(queueId, sourceId, datasetPath);
           preparedSources.push({
-            id: createId('queued_source'),
+            id: sourceId,
             type: 'dataset_file',
             label: cleanText(source.label || '') || path.basename(datasetPath),
             url: source.url || null,
@@ -4785,8 +4800,11 @@ function markQueueAsRunning(state, queueId) {
               ? source.stats
               : computeStats(''),
             addedAt: nowIso(),
-            contentPath: datasetPath,
-            contentSize: Math.max(Number(source.contentSize) || 0, 0),
+            contentPath: persistedDataset.contentPath,
+            contentSize: Math.max(
+              Number(source.contentSize) || 0,
+              Number(persistedDataset.contentSize) || 0
+            ),
           });
           continue;
         }
@@ -4908,6 +4926,7 @@ function markQueueAsRunning(state, queueId) {
     },
 
     async deleteTrainingQueue(queueId) {
+      let removedSources = [];
       const snapshot = await updateState(async (state) => {
         assertTrainingUnlocked(state, 'Изменение очередей обучения');
         prepareTrainingQueuesState(state);
@@ -4923,6 +4942,7 @@ function markQueueAsRunning(state, queueId) {
           return;
         }
 
+        removedSources = cloneTrainingQueueSources(queue.sources || []);
         state.trainingQueues.items = state.trainingQueues.items.filter((entry) => entry.id !== queueId);
         state.trainingQueues.runner.pendingQueueIds = state.trainingQueues.runner.pendingQueueIds
           .filter((entryId) => entryId !== queueId);
@@ -4948,6 +4968,7 @@ function markQueueAsRunning(state, queueId) {
       });
 
       try {
+        await Promise.all((removedSources || []).map((source) => removeTrainingQueueSourceContent(source)));
         await removeTrainingQueueDirectory(queueId);
         await cleanupTrainingQueueStorage(getState().trainingQueues);
       } catch (error) {

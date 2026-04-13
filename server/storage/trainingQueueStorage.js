@@ -23,6 +23,25 @@ function getTrainingQueueSourceFilePath(queueId, sourceId) {
   );
 }
 
+function sanitizeDatasetExtension(filePath) {
+  const extension = String(path.extname(filePath || '') || '').trim().toLowerCase();
+  if (!extension) {
+    return '.bin';
+  }
+  if (!/^\.[a-z0-9._-]{1,16}$/iu.test(extension)) {
+    return '.bin';
+  }
+  return extension;
+}
+
+function getTrainingQueueDatasetFilePath(queueId, sourceId, sourceFilePath = '') {
+  const extension = sanitizeDatasetExtension(sourceFilePath);
+  return path.join(
+    getTrainingQueueDirectory(queueId),
+    `${normalizePathSegment(sourceId, 'source')}${extension}`
+  );
+}
+
 async function removeDirectoryIfEmpty(directoryPath) {
   if (!directoryPath) {
     return;
@@ -75,6 +94,39 @@ async function writeTrainingQueueSourceContent(queueId, sourceId, content) {
   return {
     contentPath: targetPath,
     contentSize: Buffer.byteLength(normalizedContent, 'utf8'),
+  };
+}
+
+async function persistTrainingQueueDatasetFile(queueId, sourceId, sourceFilePath) {
+  const normalizedSourcePath = cleanText(sourceFilePath || '');
+  if (!normalizedSourcePath) {
+    throw new Error('Путь к датасет-файлу не передан.');
+  }
+
+  const queueDir = getTrainingQueueDirectory(queueId);
+  const targetPath = getTrainingQueueDatasetFilePath(queueId, sourceId, normalizedSourcePath);
+  const sourceAbsolutePath = path.resolve(normalizedSourcePath);
+  const targetAbsolutePath = path.resolve(targetPath);
+
+  await fs.mkdir(queueDir, { recursive: true });
+  await fs.rm(targetAbsolutePath, { force: true });
+
+  if (sourceAbsolutePath !== targetAbsolutePath) {
+    try {
+      await fs.rename(sourceAbsolutePath, targetAbsolutePath);
+    } catch (error) {
+      if (error?.code !== 'EXDEV') {
+        throw error;
+      }
+      await fs.copyFile(sourceAbsolutePath, targetAbsolutePath);
+      await fs.rm(sourceAbsolutePath, { force: true });
+    }
+  }
+
+  const stats = await fs.stat(targetAbsolutePath);
+  return {
+    contentPath: targetAbsolutePath,
+    contentSize: Math.max(Number(stats.size) || 0, 0),
   };
 }
 
@@ -183,6 +235,11 @@ async function cleanupTrainingQueueStorage(trainingQueues = {}) {
       if (!source?.id) {
         return;
       }
+      const explicitContentPath = cleanText(source.contentPath || '');
+      if (explicitContentPath) {
+        expectedFiles.add(explicitContentPath);
+        return;
+      }
       expectedFiles.add(getTrainingQueueSourceFilePath(queue.id, source.id));
     });
     expectedQueueDirs.set(queueDir, expectedFiles);
@@ -245,7 +302,9 @@ module.exports = {
   ensureTrainingQueueStorageLayout,
   externalizeTrainingQueueSources,
   getTrainingQueueDirectory,
+  getTrainingQueueDatasetFilePath,
   getTrainingQueueSourceFilePath,
+  persistTrainingQueueDatasetFile,
   readTrainingQueueSourceContent,
   removeTrainingJobPayloadFile,
   removeTrainingQueueDirectory,

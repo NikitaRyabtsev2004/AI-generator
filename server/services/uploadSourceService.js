@@ -86,7 +86,12 @@ function createSourceStorage() {
   ensureUploadsDir();
   return multer.diskStorage({
     destination: (_request, _file, callback) => {
-      callback(null, UPLOADS_DIR);
+      try {
+        ensureUploadsDir();
+        callback(null, UPLOADS_DIR);
+      } catch (error) {
+        callback(error);
+      }
     },
     filename: (_request, file, callback) => {
       const extension = path.extname(file.originalname || '').slice(0, 16);
@@ -473,10 +478,23 @@ async function prepareUploadedSources(files, response = null, options = {}) {
 
     try {
       if (keepAsDatasetReference) {
+        const datasetPath = cleanText(file.path || '');
+        if (!datasetPath) {
+          throw new Error(`Не удалось сохранить файл "${cleanText(file.originalname || '') || 'без имени'}" во временное хранилище.`);
+        }
+        await fsPromises.access(datasetPath);
         preparedSources.push(createDatasetFileReference(file));
       } else {
         preparedSources.push(...(await buildKnowledgeSourcesFromUploadedFile(file, fileKind)));
       }
+    } catch (error) {
+      if (error?.code === 'ENOENT') {
+        throw new Error(
+          `Файл "${cleanText(file.originalname || '') || 'без имени'}" не найден во временном хранилище. ` +
+          'Повторите загрузку: файл мог быть удален до завершения обработки.'
+        );
+      }
+      throw error;
     } finally {
       if (!keepAsDatasetReference) {
         await cleanupUploadedFile(file);
