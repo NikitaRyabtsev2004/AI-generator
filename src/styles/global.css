@@ -10,6 +10,27 @@
 
 * {
   box-sizing: border-box;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.34) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+  background: transparent;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.34);
+  border-radius: 999px;
+}
+
+*::-webkit-scrollbar-corner {
+  background: transparent;
 }
 
 html,
@@ -84,9 +105,10 @@ textarea {
 
 .panel-heading {
   display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 14px;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: center;
+  gap: 2px;
 }
 
 .panel-actions {

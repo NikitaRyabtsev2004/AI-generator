@@ -1,4 +1,4 @@
-import { Area, AreaChart, CartesianGrid, Tooltip, XAxis, YAxis } from 'recharts';
+import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { Typography } from '@mui/material';
 import { formatDecimal } from '../../utils/text';
 
@@ -13,12 +13,14 @@ export default function TrainingChart({ history }) {
     );
   }
 
-  const chartWidth = Math.max(720, history.length * 32);
-
   return (
     <div className="training-chart">
-      <div className="training-chart__scroll">
-        <AreaChart width={chartWidth} height={320} data={history}>
+      <div className="training-chart__canvas">
+        <ResponsiveContainer width="100%" height="100%">
+        <AreaChart
+          data={history}
+          margin={{ top: 12, right: 14, left: 2, bottom: 6 }}
+        >
           <defs>
             <linearGradient id="lossChartGradient" x1="0" y1="0" x2="0" y2="1">
               <stop offset="5%" stopColor="#8ce1c7" stopOpacity={0.65} />
@@ -36,6 +38,16 @@ export default function TrainingChart({ history }) {
             tick={{ fill: 'rgba(255,255,255,0.72)', fontSize: 12 }}
             axisLine={{ stroke: 'rgba(255,255,255,0.08)' }}
             tickLine={false}
+            domain={[
+              (dataMin) => {
+                const min = Number(dataMin) || 0;
+                return Math.max(0, min - (Math.abs(min) * 0.08 + 0.04));
+              },
+              (dataMax) => {
+                const max = Number(dataMax) || 0;
+                return max + (Math.abs(max) * 0.08 + 0.04);
+              },
+            ]}
             width={60}
           />
           <Tooltip
@@ -59,6 +71,7 @@ export default function TrainingChart({ history }) {
             dot={false}
           />
         </AreaChart>
+        </ResponsiveContainer>
       </div>
     </div>
   );

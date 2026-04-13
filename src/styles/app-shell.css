@@ -1,10 +1,15 @@
 .app-shell {
   min-height: 100vh;
-  background-image:
-    linear-gradient(180deg, rgba(4, 10, 18, 0.76) 0%, rgba(6, 14, 24, 0.84) 100%),
+  height: 100vh;
+  overflow: hidden;
+  z-index: 0;
+  background:
+          radial-gradient(ellipse at top, rgb(255 0 0 / 0.11), rgb(0 0 0 / 0.3)),
+          radial-gradient(ellipse at bottom, rgb(33 73 83 / 0.93), rgb(0 0 0 / 0.3)),
     var(--app-bg-image);
   background-position: center center;
   background-repeat: no-repeat;
+  background-blend-mode: difference;
   background-size: cover;
   background-attachment: fixed;
 }
@@ -12,49 +17,70 @@
 .app-shell__container {
   position: relative;
   z-index: 1;
-  padding-top: 24px;
-  padding-bottom: 24px;
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  transition: 500ms all ease-in-out;
+  padding-top: 12px;
+  padding-bottom: 12px;
 }
 
 .hero-panel {
+  flex: 0 0 auto;
   margin-bottom: 10px;
 }
 
+.hero-panel .glass-panel__inner {
+  padding: 12px 16px;
+  gap: 8px;
+}
+
 .hero-panel__topline {
+  min-height: 56px;
   display: flex;
   justify-content: space-between;
-  align-items: flex-start;
-  gap: 16px;
+  align-items: center;
+  gap: 10px;
 }
 
 .hero-panel__title-wrap {
+  justify-self: center;
   display: flex;
-  flex-direction: column;
-  gap: 12px;
-  max-width: 850px;
+  align-items: center;
+  justify-content: center;
 }
 
 .hero-panel__badge {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  width: fit-content;
-  padding: 8px 12px;
+  padding: 8px 14px;
   border-radius: 999px;
-  background: rgba(255, 157, 107, 0.16);
+  background: #FF6B6B29;
   border: 1px solid rgba(255, 157, 107, 0.24);
 }
 
-.hero-panel__title {
-  line-height: 1;
+.hero-panel__badge-text {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 2px;
+  color: #ffffff;
+  white-space: nowrap;
 }
 
-.hero-panel__description {
-  max-width: 780px;
-  color: var(--text-muted);
+.hero-panel__badge-text strong {
+  font-size: 0.98rem;
+}
+
+.hero-panel__badge-text span {
+  font-size: 0.86rem;
+  color: rgba(255, 255, 255, 0.82);
 }
 
 .hero-panel__status-wrap {
+  grid-column: 3;
+  justify-self: end;
   display: flex;
   flex-wrap: wrap;
   justify-content: flex-end;
@@ -62,12 +88,139 @@
   max-width: 460px;
 }
 
+.hero-status-button {
+  color: rgba(255, 255, 255, 0.86) !important;
+  border: 1px solid rgba(255, 255, 255, 0.14) !important;
+  background: rgba(255, 255, 255, 0.06) !important;
+  border-radius: 12px !important;
+}
+
+.hero-model-button.MuiButton-root {
+  height: 36px;
+  border-radius: 12px;
+  padding: 0 14px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: rgba(255, 255, 255, 0.95);
+  background: rgba(140, 225, 199, 0.2);
+  border: 1px solid rgba(140, 225, 199, 0.34);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.07);
+}
+
+.hero-model-button--import.MuiButton-root {
+  background: rgba(100, 185, 255, 0.2);
+  border-color: rgba(100, 185, 255, 0.34);
+}
+
+.hero-status-button .MuiBadge-badge {
+  font-size: 0.64rem;
+  min-width: 16px;
+  height: 16px;
+}
+
+.status-dialog-paper {
+  width: min(760px, calc(100vw - 32px)) !important;
+  max-width: min(760px, calc(100vw - 32px)) !important;
+  height: min(74vh, 700px);
+  max-height: min(74vh, 700px);
+  border: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  overflow: visible !important;
+}
+
+.status-dialog-content {
+  padding: 0 !important;
+  height: 100%;
+  overflow: hidden !important;
+}
+
+.status-glass-panel {
+  width: 100%;
+  height: 100%;
+  border-radius: 24px !important;
+  background: rgba(5, 11, 20, 0.82) !important;
+  border: 1px solid rgba(255, 255, 255, 0.14) !important;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.56);
+}
+
+.status-glass-inner {
+  height: 100%;
+  min-height: 0;
+  color: #f3f8ff;
+  gap: 10px;
+  padding: 16px !important;
+}
+
+.status-glass-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.status-glass-list {
+  flex: 1;
+  display: flex;
+  max-height: 600px;
+  flex-direction: column;
+  overflow-y: scroll;
+  gap: 8px;
+  padding-right: 6px;
+}
+
+.status-glass-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.status-glass-card__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.status-dialog-time {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}
+
 .hero-panel__tabs {
   margin-top: 8px;
 }
 
 .top-alert {
+  flex: 0 0 auto;
   margin-bottom: 10px;
+}
+
+.app-shell__content {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  overflow: visible;
+}
+
+.app-shell__content--chat {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.app-shell__content--chat > * {
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+.app-shell__content > * {
+  flex: 1;
+  min-height: 0;
 }
 
 .loading-state {
@@ -81,11 +234,35 @@
 
 @media (max-width: 1080px) {
   .hero-panel__topline {
+    min-height: auto;
+    display: flex;
     flex-direction: column;
+    align-items: stretch;
   }
 
+  .hero-panel__title-wrap,
   .hero-panel__status-wrap {
+    grid-column: auto;
+    justify-self: auto;
     justify-content: flex-start;
     max-width: none;
+  }
+}
+
+@media (max-width: 1280px) {
+  .app-shell {
+    min-height: 100vh;
+    height: 100dvh;
+    overflow: hidden;
+  }
+
+  .app-shell__container {
+    height: 100%;
+    min-height: 0;
+  }
+
+  .app-shell__content {
+    display: flex;
+    overflow: hidden;
   }
 }

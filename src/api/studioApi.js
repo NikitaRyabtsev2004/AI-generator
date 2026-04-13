@@ -1,12 +1,54 @@
 async function requestJson(url, options = {}) {
-  const response = await fetch(url, options);
-  const payload = await response.json().catch(() => ({}));
+  const {
+    timeoutMs = 25000,
+    signal,
+    ...fetchOptions
+  } = options;
+  const controller = new AbortController();
+  const timeoutEnabled = Number(timeoutMs) > 0;
+  let timeoutId = null;
 
-  if (!response.ok || payload.ok === false) {
-    throw new Error(payload.error || 'Запрос к серверу завершился ошибкой.');
+  const handleAbort = () => {
+    controller.abort();
+  };
+
+  if (signal) {
+    if (signal.aborted) {
+      controller.abort();
+    } else {
+      signal.addEventListener('abort', handleAbort, { once: true });
+    }
   }
 
-  return payload;
+  if (timeoutEnabled) {
+    timeoutId = window.setTimeout(() => {
+      controller.abort();
+    }, Number(timeoutMs));
+  }
+
+  try {
+    const response = await fetch(url, {
+      ...fetchOptions,
+      signal: controller.signal,
+    });
+    const payload = await response.json().catch(() => ({}));
+
+    if (!response.ok || payload.ok === false) {
+      throw new Error(payload.error || 'Запрос к серверу завершился ошибкой.');
+    }
+
+    return payload;
+  } catch (error) {
+    if (error?.name === 'AbortError' && !signal?.aborted && timeoutEnabled) {
+      throw new Error('Сервер слишком долго не отвечает. Проверьте живой журнал и попробуйте снова.');
+    }
+    throw error;
+  } finally {
+    if (timeoutId !== null) {
+      window.clearTimeout(timeoutId);
+    }
+    signal?.removeEventListener?.('abort', handleAbort);
+  }
 }
 
 function uploadFormDataWithProgress(url, formData, handlers = {}) {
@@ -19,6 +61,7 @@ function uploadFormDataWithProgress(url, formData, handlers = {}) {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', url, true);
     xhr.setRequestHeader('Accept', 'application/x-ndjson');
+    xhr.timeout = 180000;
 
     let readOffset = 0;
     let pendingLine = '';
@@ -67,7 +110,7 @@ function uploadFormDataWithProgress(url, formData, handlers = {}) {
         .forEach((line) => {
           try {
             processMessage(JSON.parse(line));
-          } catch (error) {
+          } catch (_error) {
             // Ignore malformed incremental chunks and continue parsing.
           }
         });
@@ -75,7 +118,7 @@ function uploadFormDataWithProgress(url, formData, handlers = {}) {
       if (isFinal && pendingLine.trim()) {
         try {
           processMessage(JSON.parse(pendingLine.trim()));
-        } catch (error) {
+        } catch (_error) {
           // Ignore trailing malformed payload.
         }
         pendingLine = '';
@@ -103,6 +146,14 @@ function uploadFormDataWithProgress(url, formData, handlers = {}) {
       reject(new Error('Ошибка сети при загрузке файла.'));
     };
 
+    xhr.ontimeout = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      reject(new Error('Сервер слишком долго обрабатывает загрузку файлов.'));
+    };
+
     xhr.onload = () => {
       parseResponseChunks(true);
       if (settled) {
@@ -112,7 +163,7 @@ function uploadFormDataWithProgress(url, formData, handlers = {}) {
       let payload = {};
       try {
         payload = JSON.parse(xhr.responseText || '{}');
-      } catch (error) {
+      } catch (_error) {
         payload = {};
       }
 
@@ -136,6 +187,64 @@ export async function fetchDashboard(chatId = null, options = {}) {
   return payload.snapshot;
 }
 
+export async function fetchRecentLogs(limit = 120) {
+  const payload = await requestJson(`/api/logs/recent?limit=${encodeURIComponent(limit)}`, {
+    timeoutMs: 10000,
+  });
+  return payload.logs || [];
+}
+
+export async function fetchServerStatus() {
+  const payload = await requestJson('/api/status', {
+    timeoutMs: 12000,
+  });
+  return payload.status || null;
+}
+
+export function subscribeToServerEvents(handlers = {}) {
+  const eventSource = new EventSource('/api/events');
+
+  const parseEvent = (event, callback) => {
+    if (typeof callback !== 'function') {
+      return;
+    }
+
+    try {
+      callback(JSON.parse(event.data || '{}'));
+    } catch (_error) {
+      // Ignore malformed realtime payloads.
+    }
+  };
+
+  eventSource.onopen = () => {
+    handlers.onOpen?.();
+  };
+
+  eventSource.onerror = () => {
+    handlers.onConnectionError?.();
+  };
+
+  eventSource.addEventListener('snapshot', (event) => {
+    parseEvent(event, handlers.onSnapshot);
+  });
+  eventSource.addEventListener('log', (event) => {
+    parseEvent(event, handlers.onLog);
+  });
+  eventSource.addEventListener('logs', (event) => {
+    parseEvent(event, handlers.onLogs);
+  });
+  eventSource.addEventListener('server_error', (event) => {
+    parseEvent(event, handlers.onServerError);
+  });
+  eventSource.addEventListener('status', (event) => {
+    parseEvent(event, handlers.onStatus);
+  });
+
+  return () => {
+    eventSource.close();
+  };
+}
+
 export async function saveSettings(settings) {
   const payload = await requestJson('/api/settings', {
     method: 'POST',
@@ -143,6 +252,17 @@ export async function saveSettings(settings) {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(settings),
+  });
+  return payload.snapshot;
+}
+
+export async function saveRuntimeConfig(runtimeConfig) {
+  const payload = await requestJson('/api/runtime-config', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(runtimeConfig),
   });
   return payload.snapshot;
 }
@@ -178,9 +298,83 @@ export async function removeSource(sourceId) {
   return payload.snapshot;
 }
 
+export async function createTrainingQueue(name = '') {
+  const payload = await requestJson('/api/training-queues', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ name }),
+  });
+  return payload.snapshot;
+}
+
+export async function uploadQueueFiles(queueId, files, options = {}) {
+  const { onUploadProgress, onProcessingProgress } = options;
+  const formData = new FormData();
+  files.forEach((file) => formData.append('files', file));
+
+  const payload = await uploadFormDataWithProgress(`/api/training-queues/${encodeURIComponent(queueId)}/files`, formData, {
+    onUploadProgress,
+    onProcessingProgress,
+  });
+
+  return payload.snapshot;
+}
+
+export async function removeTrainingQueueSource(queueId, sourceId) {
+  const payload = await requestJson(
+    `/api/training-queues/${encodeURIComponent(queueId)}/files/${encodeURIComponent(sourceId)}`,
+    {
+      method: 'DELETE',
+    }
+  );
+  return payload.snapshot;
+}
+
+export async function deleteTrainingQueue(queueId) {
+  const payload = await requestJson(`/api/training-queues/${encodeURIComponent(queueId)}`, {
+    method: 'DELETE',
+  });
+  return payload.snapshot;
+}
+
 export async function createModel() {
   const payload = await requestJson('/api/model/create', {
     method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({}),
+    timeoutMs: 15000,
+  });
+  return payload.snapshot;
+}
+
+export async function createNamedModel(name) {
+  const payload = await requestJson('/api/model/create', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ name }),
+    timeoutMs: 15000,
+  });
+  return payload.snapshot;
+}
+
+export async function selectModel(modelId) {
+  const payload = await requestJson(`/api/models/${encodeURIComponent(modelId)}/select`, {
+    method: 'POST',
+    timeoutMs: 25000,
+  });
+  return payload.snapshot;
+}
+
+export async function deleteLibraryModel(modelId) {
+  const payload = await requestJson(`/api/models/${encodeURIComponent(modelId)}`, {
+    method: 'DELETE',
+    timeoutMs: 15000,
   });
   return payload.snapshot;
 }
@@ -188,6 +382,7 @@ export async function createModel() {
 export async function trainModel() {
   const payload = await requestJson('/api/model/train', {
     method: 'POST',
+    timeoutMs: 15000,
   });
   return payload.snapshot;
 }
@@ -195,6 +390,7 @@ export async function trainModel() {
 export async function pauseModel() {
   const payload = await requestJson('/api/model/pause', {
     method: 'POST',
+    timeoutMs: 15000,
   });
   return payload.snapshot;
 }
@@ -202,6 +398,49 @@ export async function pauseModel() {
 export async function resetModel() {
   const payload = await requestJson('/api/model/reset', {
     method: 'POST',
+    timeoutMs: 15000,
+  });
+  return payload.snapshot;
+}
+
+export async function rollbackTrainingToCheckpoint() {
+  const payload = await requestJson('/api/model/rollback', {
+    method: 'POST',
+    timeoutMs: 15000,
+  });
+  return payload.snapshot;
+}
+
+export async function exportModelPackage() {
+  const response = await fetch('/api/model/export', {
+    method: 'GET',
+  });
+
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload.error || 'Не удалось экспортировать модель.');
+  }
+
+  const blob = await response.blob();
+  const contentDisposition = response.headers.get('content-disposition') || '';
+  const match = contentDisposition.match(/filename="?([^"]+)"?/i);
+  const fileName = match?.[1] || 'model-export.aistudio.json';
+
+  return { blob, fileName };
+}
+
+export async function importModelPackage(file) {
+  if (!file) {
+    throw new Error('Файл пакета модели не выбран.');
+  }
+
+  const formData = new FormData();
+  formData.append('file', file);
+
+  const payload = await requestJson('/api/model/import', {
+    method: 'POST',
+    body: formData,
+    timeoutMs: 30000,
   });
   return payload.snapshot;
 }
@@ -227,6 +466,7 @@ export async function sendChatMessage(chatId, content) {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ content }),
+    timeoutMs: 70000,
   });
   return payload.snapshot;
 }

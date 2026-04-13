@@ -10,9 +10,16 @@
 
 # production
 /build
+/build-verify
 /server/artifacts
 /server/data/studio.db
 /server/data/runtime-config.json
+/server/python/.venv/
+.venv
+/server/data/model-library
+/server/data/training-jobs
+/server/data/training-queue-sources
+/server/data/studio.db-journal
 
 # misc
 .DS_Store

@@ -2,15 +2,16 @@ import React, { useState, useRef, forwardRef } from 'react';
 const LiquidGlass = forwardRef(({
     width,
     height,
-    baseFrequency = "0.007",
+    baseFrequency = "0.008",
     numOctaves = 1,
-    seed: initialSeed = 23,
+    seed: initialSeed = 32,
     turbulenceType = "fractalNoise",
     blurDeviation = 15,
-    displacementScale = 200,
+    displacementScale = 180,
     xChannelSelector = "R",
     yChannelSelector = "G",
     style = {},
+    filterStyle = {},
     className = "",
     children,
     ...props
@@ -34,23 +35,53 @@ const LiquidGlass = forwardRef(({
                 borderRadius: '2px',
                 overflow: 'hidden',
                 isolation: 'isolate',
-                background: 'rgba(255, 255, 255, 0.1)',
+                background: 'rgba(255, 255, 255, 0.4)',
                 boxShadow: '0 25px 50px rgba(0, 0, 0, 0.63), 0 0 0 1px rgba(255, 255, 255, 0.38), inset 0 1px 0 rgba(255, 255, 255, 0)',
                 ...style
             }}
             {...props}
         >
+
+            <div
+                style={{
+                    position: 'absolute', inset: 0, zIndex: 0
+                }}
+            />
+            <div
+                style={{
+                    position: 'absolute',
+                    width: '100%', height: '100%',
+                    backdropFilter: 'blur(4px)',
+                    filter: `url(#${uniqueId}-distortion)`,
+                    opacity: 1,
+                    background: 'radial-gradient(circle at 50% 50%, rgba(255, 255, 255, 0.098) 0%, transparent 5%)',
+                    zIndex: 5,
+                    pointerEvents: 'none',
+                    ...filterStyle
+                }}
+            />
+            <div
+                style={{
+                    position: 'relative',
+                    zIndex: 10,
+                    width: '100%',
+                    height: '100%',
+                    display: 'flex',
+                    justifyContent: 'center'
+                }}
+            >
+                {children}
+            </div>
             <svg
                 style={{
                     position: 'absolute',
                     width: 0,
                     height: 0,
                     overflow: 'hidden',
-                    pointerEvents: 'none'
                 }}
             >
                 <defs>
-                    <filter id={`${uniqueId}-distortion`} x="-50%" y="-50%" width="200%" height="200%">
+                    <filter id={`${uniqueId}-distortion`} x="-200%" y="-200%" width="800%" height="800%">
                         <feTurbulence
                             type={turbulenceType}
                             baseFrequency={baseFrequency}
@@ -76,36 +107,7 @@ const LiquidGlass = forwardRef(({
                     </filter>
                 </defs>
             </svg>
-            <div
-                style={{
-                    position: 'absolute', inset: 0, zIndex: 0
-                }}
-            />
-            <div
-                style={{
-                    position: 'absolute',
-                    width: '100%', height: '100%',
-                    backdropFilter: 'blur(3px)',
-                    filter: `url(#${uniqueId}-distortion)`,
-                    opacity: 1,
-                    background: 'radial-gradient(circle at 50% 50%, rgba(255, 255, 255, 0.198) 0%, transparent 50%)',
-                    zIndex: 1,
-                    pointerEvents: 'none'
-                }}
-            />
-            <div
-                style={{
-                    position: 'relative',
-                    zIndex: 10,
-                    width: '100%',
-                    height: '100%',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center'
-                }}
-            >
-                {children}
-            </div>
+
         </div>
     );
 });

@@ -19,6 +19,7 @@ import UploadFileRoundedIcon from '@mui/icons-material/UploadFileRounded';
 import CachedRoundedIcon from '@mui/icons-material/CachedRounded';
 import PlayArrowRoundedIcon from '@mui/icons-material/PlayArrowRounded';
 import PauseRoundedIcon from '@mui/icons-material/PauseRounded';
+import UndoRoundedIcon from '@mui/icons-material/UndoRounded';
 import DeleteForeverRoundedIcon from '@mui/icons-material/DeleteForeverRounded';
 import GlassPanel from '../shared/GlassPanel';
 import MetricCard from '../shared/MetricCard';
@@ -84,26 +85,49 @@ export default function TrainingTab({
   busy,
   error,
   pendingAction,
+  realtimeConnected,
+  serverLogs,
+  serverStatus,
   uploadProgress,
   processingProgress,
   onSaveSettings,
+  onSaveRuntimeConfig,
   onUploadFiles,
+  onCreateTrainingQueue,
+  onUploadQueueFiles,
+  onRemoveTrainingQueueSource,
+  onDeleteTrainingQueue,
   onAddUrlSource,
   onRemoveSource,
   onCreateModel,
+  onCreateNamedModel,
+  onSelectModel,
+  onDeleteLibraryModel,
   onTrainModel,
   onPauseModel,
+  onRollbackModel,
   onResetModel,
 }) {
   const snapshotSettingsKey = useMemo(() => JSON.stringify(snapshot.settings), [snapshot.settings]);
+  const runtimeConfig = useMemo(() => snapshot.runtime?.config || {}, [snapshot.runtime?.config]);
+  const runtimeSnapshotKey = useMemo(() => JSON.stringify(runtimeConfig), [runtimeConfig]);
   const [settingsDraft, setSettingsDraft] = useState(() => structuredClone(snapshot.settings));
+  const [runtimeDraft, setRuntimeDraft] = useState(() => structuredClone(runtimeConfig));
   const [urlInput, setUrlInput] = useState('');
+  const [queueNameInput, setQueueNameInput] = useState('');
+  const [modelNameInput, setModelNameInput] = useState('');
   const lastSnapshotKeyRef = useRef(snapshotSettingsKey);
   const currentDraftKeyRef = useRef(JSON.stringify(snapshot.settings));
+  const lastRuntimeSnapshotKeyRef = useRef(runtimeSnapshotKey);
+  const currentRuntimeDraftKeyRef = useRef(JSON.stringify(runtimeConfig));
 
   useEffect(() => {
     currentDraftKeyRef.current = JSON.stringify(settingsDraft);
   }, [settingsDraft]);
+
+  useEffect(() => {
+    currentRuntimeDraftKeyRef.current = JSON.stringify(runtimeDraft);
+  }, [runtimeDraft]);
 
   useEffect(() => {
     const previousSnapshotKey = lastSnapshotKeyRef.current;
@@ -117,17 +141,46 @@ export default function TrainingTab({
     lastSnapshotKeyRef.current = snapshotSettingsKey;
   }, [snapshot.settings, snapshotSettingsKey]);
 
+  useEffect(() => {
+    const previousSnapshotKey = lastRuntimeSnapshotKeyRef.current;
+    const currentDraftKey = currentRuntimeDraftKeyRef.current;
+
+    if (currentDraftKey === previousSnapshotKey || currentDraftKey === runtimeSnapshotKey) {
+      setRuntimeDraft(structuredClone(runtimeConfig));
+      currentRuntimeDraftKeyRef.current = runtimeSnapshotKey;
+    }
+
+    lastRuntimeSnapshotKeyRef.current = runtimeSnapshotKey;
+  }, [runtimeConfig, runtimeSnapshotKey]);
+
   const factRows = useMemo(() => modelFactRows(snapshot), [snapshot]);
+  const statusEntries = snapshot.training?.recentStatuses || [];
   const hasUnsavedSettings = useMemo(
     () => JSON.stringify(settingsDraft) !== snapshotSettingsKey,
     [settingsDraft, snapshotSettingsKey]
   );
-  const canTrain = snapshot.sources.length > 0;
+  const hasUnsavedRuntimeSettings = useMemo(
+    () => JSON.stringify(runtimeDraft) !== runtimeSnapshotKey,
+    [runtimeDraft, runtimeSnapshotKey]
+  );
+  const trainingQueues = snapshot.trainingQueues?.items || [];
+  const modelRegistry = snapshot.modelRegistry?.items || [];
+  const activeModelId = snapshot.modelRegistry?.activeModelId || null;
+  const queueRunner = snapshot.trainingQueues?.runner || null;
+  const queueRunnerAlertVisible = Boolean(
+    queueRunner?.active ||
+    ['error', 'paused', 'interrupted', 'rolled_back'].includes(queueRunner?.status)
+  );
+  const isQueueRunnerActive = Boolean(queueRunner?.active);
+  const pendingQueueItems = trainingQueues.filter((queue) => queue.sourceCount > 0 && queue.status !== 'completed');
+  const hasQueuedTraining = pendingQueueItems.length > 0;
+  const canTrain = snapshot.sources.length > 0 || hasQueuedTraining;
   const isTraining = snapshot.training.status === 'training';
   const isSavingCheckpoint = snapshot.model.status === 'saving_checkpoint';
-  const trainingLocked = isTraining || isSavingCheckpoint;
+  const trainingLocked = isTraining || isSavingCheckpoint || isQueueRunnerActive;
   const isPaused = snapshot.training.status === 'paused';
   const isUploadingFiles = pendingAction === 'uploadFiles';
+  const isUploadingQueueFiles = pendingAction === 'uploadQueueFiles';
   const normalizedUploadProgress = typeof uploadProgress === 'number'
     ? Math.min(100, Math.max(0, uploadProgress))
     : 0;
@@ -144,11 +197,23 @@ export default function TrainingTab({
     snapshot.knowledge?.languageModel?.checkpointReady
   );
   const trainActionLabel = isPaused ? 'Продолжить обучение' : 'Начать обучение';
-  const deleteActionLabel = trainingLocked ? 'Остановить и удалить модель' : 'Удалить модель';
+  const primaryTrainActionLabel = hasQueuedTraining
+    ? (isPaused ? 'Продолжить автоочередь' : 'Запустить автоочередь')
+    : trainActionLabel;
+  const canRollbackTraining = (isTraining || isSavingCheckpoint || isQueueRunnerActive) && snapshot.model.trainedEpochs > 0;
+  const rollbackActionLabel = 'Остановить и откатить';
+  const deleteActionLabel = trainingLocked ? 'Остановить и удалить' : 'Удалить модель';
 
   const handleTrainClick = async () => {
     if (hasUnsavedSettings) {
       const savedSnapshot = await onSaveSettings(settingsDraft);
+      if (!savedSnapshot) {
+        return;
+      }
+    }
+
+    if (hasUnsavedRuntimeSettings) {
+      const savedSnapshot = await onSaveRuntimeConfig(runtimeDraft);
       if (!savedSnapshot) {
         return;
       }
@@ -160,74 +225,104 @@ export default function TrainingTab({
   return (
     <div className="training-tab">
       <div className="training-grid">
-        <GlassPanel className="panel--wide">
-          <div className="panel-heading">
-            <div>
+        <GlassPanel className="panel--fit panel--settings">
+          <div className="panel-heading panel-heading--full">
+            <div className="panel-heading__copy">
               <Typography variant="h3">Настройки модели и обучения</Typography>
-              <Typography variant="body2" className="muted-text">
-                Здесь настраивается полноценный серверный контур: токенизация, языковая модель, retrieval, валидация, пауза с чекпоинтом и генерация ответа.
-              </Typography>
             </div>
-            <div className="panel-actions">
-              <Button
-                className="action-button"
-                variant="outlined"
-                startIcon={<CachedRoundedIcon />}
-                onClick={() => onCreateModel()}
-                disabled={busy || trainingLocked}
-              >
-                Новая модель
-              </Button>
-              <Button
-                className="action-button"
-                variant="contained"
-                startIcon={<PlayArrowRoundedIcon />}
-                onClick={handleTrainClick}
-                disabled={busy || trainingLocked || !canTrain}
-              >
-                {trainActionLabel}
-              </Button>
-              <Button
-                className="action-button"
-                variant="outlined"
-                startIcon={<PauseRoundedIcon />}
-                onClick={() => onPauseModel()}
-                disabled={busy || !isTraining}
-              >
-                Пауза
-              </Button>
-              <Button
-                className="action-button"
-                color="error"
-                variant="outlined"
-                startIcon={<DeleteForeverRoundedIcon />}
-                onClick={() => onResetModel()}
-                disabled={busy || !hasModel}
-              >
-                {deleteActionLabel}
-              </Button>
-            </div>
+          </div>
+
+          <div className="settings-actions-grid">
+            <Button
+              className="action-button"
+              variant="outlined"
+              startIcon={<CachedRoundedIcon />}
+              onClick={async () => {
+                const nextSnapshot = modelNameInput.trim()
+                  ? await onCreateNamedModel(modelNameInput.trim())
+                  : await onCreateModel();
+                if (nextSnapshot) {
+                  setModelNameInput('');
+                }
+              }}
+              disabled={busy || trainingLocked}
+            >
+              Новая модель
+            </Button>
+            <Button
+              className="action-button"
+              variant="contained"
+              startIcon={<PlayArrowRoundedIcon />}
+              onClick={handleTrainClick}
+              disabled={busy || trainingLocked || !canTrain}
+            >
+              {primaryTrainActionLabel}
+            </Button>
+            <Button
+              className="action-button"
+              variant="outlined"
+              startIcon={<PauseRoundedIcon />}
+              onClick={() => onPauseModel()}
+              disabled={busy || (!isTraining && !isQueueRunnerActive)}
+            >
+              Пауза
+            </Button>
+            <Button
+              className="action-button"
+              variant="outlined"
+              color="warning"
+              startIcon={<UndoRoundedIcon />}
+              onClick={() => onRollbackModel()}
+              disabled={busy || !canRollbackTraining}
+            >
+              {rollbackActionLabel}
+            </Button>
+            <Button
+              className="action-button"
+              color="error"
+              variant="outlined"
+              startIcon={<DeleteForeverRoundedIcon />}
+              onClick={() => onResetModel()}
+              disabled={busy || !hasModel}
+            >
+              {deleteActionLabel}
+            </Button>
           </div>
 
           {error ? <Alert severity="error">{error}</Alert> : null}
           {isPaused ? (
             <Alert severity="success">
-              Обучение поставлено на паузу. Можно продолжить с последнего чекпоинта или полностью удалить модель.
+              Обучение поставлено на паузу. Можно продолжить с последнего чекпоинта.
             </Alert>
           ) : null}
           {trainingLocked ? (
             <Alert severity="info">
-              Во время обучения редактирование корпуса и параметров заблокировано, чтобы чекпоинт не устарел прямо в процессе.
+              Во время обучения редактирование корпуса и параметров заблокировано.
             </Alert>
           ) : null}
           {hasUnsavedSettings ? (
             <Alert severity="warning">
-              Есть несохраненные изменения. Они не применятся к серверу, пока вы явно не сохраните настройки.
+              Есть несохраненные изменения настроек.
             </Alert>
           ) : null}
           {!canTrain ? (
             <Alert severity="info">
-              Добавьте хотя бы один `txt`-файл или URL, чтобы у модели появился корпус для обучения.
+              Добавьте хотя бы один `TXT`, `CSV`, `JSON`-файл или URL.
+            </Alert>
+          ) : null}
+          {hasQueuedTraining ? (
+            <Alert severity="info">
+              {`Готово очередей к автодообучению: ${pendingQueueItems.length}. Они будут применены по одной, каждая только после успешного сохранения чекпоинта предыдущей.`}
+            </Alert>
+          ) : null}
+          {hasQueuedTraining && snapshot.sources.length > 0 ? (
+            <Alert severity="warning">
+              Ручная очередь источников и автоочереди разделены. При запуске автоочереди текущие загруженные файлы из ручного списка не будут подмешаны в нее автоматически.
+            </Alert>
+          ) : null}
+          {queueRunnerAlertVisible ? (
+            <Alert severity={queueRunner.status === 'error' ? 'error' : 'info'}>
+              {`Автоочередь: ${queueRunner.status}. Выполнено ${queueRunner.completedQueueIds?.length || 0} из ${queueRunner.totalQueues || 0}.`}
             </Alert>
           ) : null}
           {snapshot.model.computeBackendWarning ? (
@@ -236,115 +331,287 @@ export default function TrainingTab({
             </Alert>
           ) : null}
 
-          {TOGGLE_CONTROLS.length ? (
-            <div className="toggle-row">
-              {TOGGLE_CONTROLS.map((control) => {
-                const value = settingsDraft?.[control.section]?.[control.key];
-                return (
-                  <div className="toggle-control" key={control.key}>
-                    <Typography variant="subtitle1">{control.label}</Typography>
-                    <Typography variant="body2" className="muted-text">
-                      {control.description}
-                    </Typography>
-                    <RadioGroup
-                      value={value}
-                      onChange={(event) => {
-                        const nextValue = event.target.value;
-                        setSettingsDraft((current) => ({
-                          ...current,
-                          [control.section]: {
-                            ...current[control.section],
-                            [control.key]: nextValue,
-                          },
-                        }));
-                      }}
-                    >
-                      {control.options.map((option) => (
-                        <FormControlLabel
-                          key={option.value}
-                          value={option.value}
-                          control={<Radio />}
-                          disabled={trainingLocked}
-                          label={(
-                            <div>
-                              <Typography variant="subtitle2">{option.label}</Typography>
-                              <Typography variant="caption" className="muted-text">
-                                {option.hint}
-                              </Typography>
-                            </div>
-                          )}
-                        />
-                      ))}
-                    </RadioGroup>
-                  </div>
-                );
-              })}
-            </div>
-          ) : null}
+          <div className="settings-scroll">
+            <div className="settings-group">
+              <Typography variant="subtitle1" className="settings-group__title">
+                Библиотека моделей
+              </Typography>
+              <Typography variant="body2" className="muted-text">
+                Здесь хранится список локальных моделей. При создании новой текущая модель сохраняется в библиотеке и ее можно выбрать обратно.
+              </Typography>
 
-          <div className="settings-groups">
-            {SETTING_GROUPS.map((group) => (
-              <div className="settings-group" key={group.title}>
-                <Typography variant="subtitle1" className="settings-group__title">
-                  {group.title}
-                </Typography>
-                <Typography variant="body2" className="muted-text">
-                  {group.description}
-                </Typography>
+              <div className="queue-builder">
+                <TextField
+                  className="text-input"
+                  label="Название новой модели"
+                  value={modelNameInput}
+                  disabled={trainingLocked}
+                  onChange={(event) => setModelNameInput(event.target.value)}
+                  placeholder="Например, Русская LLM v2"
+                />
+                <Button
+                  variant="outlined"
+                  className="action-button"
+                  onClick={async () => {
+                    const nextSnapshot = modelNameInput.trim()
+                      ? await onCreateNamedModel(modelNameInput.trim())
+                      : await onCreateModel();
+                    if (nextSnapshot) {
+                      setModelNameInput('');
+                    }
+                  }}
+                  disabled={busy || trainingLocked}
+                >
+                  Создать и переключить
+                </Button>
+              </div>
 
-                <div className="settings-control-list">
-                  {group.controls.map((control) => {
-                    const value = settingsDraft?.[control.section]?.[control.key];
-                    return (
-                      <div className="settings-control" key={control.key}>
-                        <div className="settings-control__header">
-                          <div className="settings-control__label-wrap">
-                            <Typography variant="subtitle2">{control.label}</Typography>
-                            <Tooltip title={control.hint}>
-                              <InfoOutlinedIcon className="info-icon" />
-                            </Tooltip>
-                          </div>
-                          <span className="settings-control__value">
-                            {formatSettingValue(control, value)}
-                          </span>
-                        </div>
-                        <Slider
-                          value={value}
-                          min={control.min}
-                          max={control.max}
-                          step={control.step}
-                          disabled={trainingLocked}
-                          valueLabelDisplay="auto"
-                          valueLabelFormat={(nextValue) => formatSettingValue(control, nextValue)}
-                          onChange={(_event, nextValue) =>
-                            setSettingsDraft((current) => ({
-                              ...current,
-                              [control.section]: {
-                                ...current[control.section],
-                                [control.key]: nextValue,
-                              },
-                            }))
-                          }
-                        />
-                        {control.key === 'batchSize' && snapshot.model.trainingItemCount > 0 ? (
-                          <Typography variant="caption" className="muted-text">
-                            {`При ${formatNumber(snapshot.model.trainingItemCount)} обучающих окнах это примерно ${formatNumber(
-                              Math.max(
-                                Math.ceil(
-                                  snapshot.model.trainingItemCount /
-                                    Math.max(1, Number(value) || 1)
-                                ),
-                                1
-                              )
-                            )} батч(ей) на эпоху.`}
-                          </Typography>
-                        ) : null}
+              <div className="model-library-list">
+                {modelRegistry.length ? modelRegistry.map((entry) => (
+                  <div
+                    key={entry.id}
+                    className={`model-library-card ${entry.id === activeModelId ? 'model-library-card--active' : ''}`}
+                  >
+                    <div className="model-library-card__head">
+                      <div>
+                        <Typography variant="subtitle2">{entry.name}</Typography>
+                        <Typography variant="caption" className="muted-text">
+                          {`${entry.summary?.backend || 'neural'} | ${formatNumber(entry.summary?.trainedEpochs || 0)} эпох | ${formatNumber(entry.summary?.parameterCount || 0)} параметров`}
+                        </Typography>
                       </div>
-                    );
-                  })}
+                      <div className="training-queue-card__actions">
+                        <StatusPill
+                          label={entry.id === activeModelId ? 'active' : (entry.summary?.lifecycle || 'idle')}
+                          active={entry.id === activeModelId}
+                          tone={entry.id === activeModelId ? 'accent' : 'neutral'}
+                        />
+                        <Button
+                          size="small"
+                          variant="outlined"
+                          className="action-button action-button--compact"
+                          onClick={() => onSelectModel(entry.id)}
+                          disabled={busy || trainingLocked || entry.id === activeModelId}
+                        >
+                          Выбрать
+                        </Button>
+                        <IconButton
+                          onClick={() => onDeleteLibraryModel(entry.id)}
+                          disabled={busy || trainingLocked || entry.id === activeModelId}
+                        >
+                          <DeleteOutlineRoundedIcon />
+                        </IconButton>
+                      </div>
+                    </div>
+                  </div>
+                )) : (
+                  <Typography variant="body2" className="muted-text">
+                    В библиотеке пока нет сохраненных моделей.
+                  </Typography>
+                )}
+              </div>
+            </div>
+
+            <div className="settings-group">
+              <Typography variant="subtitle1" className="settings-group__title">
+                Генератор и веб-поиск
+              </Typography>
+              <Typography variant="body2" className="muted-text">
+                Генерация идет только через вашу локальную обучаемую Transformer-модель. Здесь настраивается веб-поиск и системное поведение генератора.
+              </Typography>
+
+              <div className="toggle-row">
+                <div className="toggle-control">
+                  <Typography variant="subtitle1">Веб-поиск</Typography>
+                  <RadioGroup
+                    row
+                    value={runtimeDraft?.generation?.webSearchEnabled ? 'on' : 'off'}
+                    onChange={(event) => {
+                      const enabled = event.target.value === 'on';
+                      setRuntimeDraft((current) => ({
+                        ...current,
+                        generation: {
+                          ...current.generation,
+                          webSearchEnabled: enabled,
+                        },
+                      }));
+                    }}
+                  >
+                    <FormControlLabel value="off" control={<Radio />} disabled={trainingLocked} label="Выключен" />
+                    <FormControlLabel value="on" control={<Radio />} disabled={trainingLocked} label="Включен" />
+                  </RadioGroup>
                 </div>
               </div>
-            ))}
+
+              <div className="settings-control-list">
+                <div className="settings-control">
+                  <div className="settings-control__header">
+                    <Typography variant="subtitle2">Предпочтительные домены для веб-поиска</Typography>
+                  </div>
+                  <TextField
+                    className="text-input"
+                    value={runtimeDraft?.generation?.webSearchPreferredDomains || ''}
+                    disabled={trainingLocked}
+                    onChange={(event) => {
+                      const nextValue = event.target.value;
+                      setRuntimeDraft((current) => ({
+                        ...current,
+                        generation: {
+                          ...current.generation,
+                          webSearchPreferredDomains: nextValue,
+                        },
+                      }));
+                    }}
+                    placeholder="docs.python.org, wikipedia.org, developer.mozilla.org"
+                    helperText="Домены через запятую. Они будут подниматься выше в выдаче."
+                  />
+                </div>
+
+                <div className="settings-control">
+                  <div className="settings-control__header">
+                    <Typography variant="subtitle2">Системный промпт</Typography>
+                  </div>
+                  <TextField
+                    className="text-input"
+                    multiline
+                    minRows={4}
+                    value={runtimeDraft?.generation?.systemPrompt || ''}
+                    disabled={trainingLocked}
+                    onChange={(event) => {
+                      const nextValue = event.target.value;
+                      setRuntimeDraft((current) => ({
+                        ...current,
+                        generation: {
+                          ...current.generation,
+                          systemPrompt: nextValue,
+                        },
+                      }));
+                    }}
+                  />
+                </div>
+              </div>
+
+              <div className="settings-footer settings-footer--inline">
+                <Button
+                  variant="contained"
+                  className="action-button"
+                  onClick={() => onSaveRuntimeConfig(runtimeDraft)}
+                  disabled={busy || trainingLocked || !hasUnsavedRuntimeSettings}
+                >
+                  Сохранить runtime
+                </Button>
+              </div>
+            </div>
+
+            {TOGGLE_CONTROLS.length ? (
+              <div className="toggle-row">
+                {TOGGLE_CONTROLS.map((control) => {
+                  const value = settingsDraft?.[control.section]?.[control.key];
+                  return (
+                    <div className="toggle-control" key={control.key}>
+                      <Typography variant="subtitle1">{control.label}</Typography>
+                      <Typography variant="body2" className="muted-text">
+                        {control.description}
+                      </Typography>
+                      <RadioGroup
+                        value={value}
+                        onChange={(event) => {
+                          const nextValue = event.target.value;
+                          setSettingsDraft((current) => ({
+                            ...current,
+                            [control.section]: {
+                              ...current[control.section],
+                              [control.key]: nextValue,
+                            },
+                          }));
+                        }}
+                      >
+                        {control.options.map((option) => (
+                          <FormControlLabel
+                            key={option.value}
+                            value={option.value}
+                            control={<Radio />}
+                            disabled={trainingLocked}
+                            label={(
+                              <div>
+                                <Typography variant="subtitle2">{option.label}</Typography>
+                                <Typography variant="caption" className="muted-text">
+                                  {option.hint}
+                                </Typography>
+                              </div>
+                            )}
+                          />
+                        ))}
+                      </RadioGroup>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null}
+
+            <div className="settings-groups">
+              {SETTING_GROUPS.map((group) => (
+                <div className="settings-group" key={group.title}>
+                  <Typography variant="subtitle1" className="settings-group__title">
+                    {group.title}
+                  </Typography>
+                  <Typography variant="body2" className="muted-text">
+                    {group.description}
+                  </Typography>
+
+                  <div className="settings-control-list">
+                    {group.controls.map((control) => {
+                      const value = settingsDraft?.[control.section]?.[control.key];
+                      return (
+                        <div className="settings-control" key={control.key}>
+                          <div className="settings-control__header">
+                            <div className="settings-control__label-wrap">
+                              <Typography variant="subtitle2">{control.label}</Typography>
+                              <Tooltip title={control.hint}>
+                                <InfoOutlinedIcon className="info-icon" />
+                              </Tooltip>
+                            </div>
+                            <span className="settings-control__value">
+                              {formatSettingValue(control, value)}
+                            </span>
+                          </div>
+                          <Slider
+                            value={value}
+                            min={control.min}
+                            max={control.max}
+                            step={control.step}
+                            disabled={trainingLocked}
+                            valueLabelDisplay="auto"
+                            valueLabelFormat={(nextValue) => formatSettingValue(control, nextValue)}
+                            onChange={(_event, nextValue) =>
+                              setSettingsDraft((current) => ({
+                                ...current,
+                                [control.section]: {
+                                  ...current[control.section],
+                                  [control.key]: nextValue,
+                                },
+                              }))
+                            }
+                          />
+                          {control.key === 'batchSize' && snapshot.model.trainingItemCount > 0 ? (
+                            <Typography variant="caption" className="muted-text">
+                              {`При ${formatNumber(snapshot.model.trainingItemCount)} обучающих окнах это примерно ${formatNumber(
+                                Math.max(
+                                  Math.ceil(
+                                    snapshot.model.trainingItemCount /
+                                      Math.max(1, Number(value) || 1)
+                                  ),
+                                  1
+                                )
+                              )} батч(ей) на эпоху.`}
+                            </Typography>
+                          ) : null}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
           </div>
 
           <div className="settings-footer">
@@ -359,17 +626,26 @@ export default function TrainingTab({
           </div>
         </GlassPanel>
 
-        <GlassPanel>
-          <div className="panel-heading">
-            <div>
+        <GlassPanel className="panel--fit panel--sources">
+          <div className="panel-heading panel-heading--full">
+            <div className="panel-heading__copy">
               <Typography variant="h3">Источники для обучения</Typography>
               <Typography variant="body2" className="muted-text">
-                Тексты хранятся в SQLite, а чекпоинт модели, токенизатор и индекс знаний сохраняются отдельными файлами на диске.
+                Тексты хранятся в SQLite, артефакты модели на диске.
               </Typography>
             </div>
           </div>
 
           <div className="upload-actions">
+            <TextField
+              className="text-input"
+              label="URL страницы"
+              value={urlInput}
+              disabled={trainingLocked}
+              onChange={(event) => setUrlInput(event.target.value)}
+              placeholder="https://example.com/page"
+            />
+
             <Button
               variant="contained"
               component="label"
@@ -377,11 +653,11 @@ export default function TrainingTab({
               className="action-button"
               disabled={busy || trainingLocked}
             >
-              Загрузить txt
+              Загрузить файлы
               <input
                 hidden
                 type="file"
-                accept=".txt,text/plain"
+                accept=".txt,.csv,.json,text/plain,text/csv,application/json"
                 multiple
                 onChange={async (event) => {
                   const files = Array.from(event.target.files || []);
@@ -393,8 +669,25 @@ export default function TrainingTab({
               />
             </Button>
 
+            <Button
+              variant="outlined"
+              startIcon={<AddLinkRoundedIcon />}
+              className="action-button"
+              onClick={async () => {
+                if (!urlInput.trim()) {
+                  return;
+                }
+
+                await onAddUrlSource(urlInput.trim());
+                setUrlInput('');
+              }}
+              disabled={busy || trainingLocked || !urlInput.trim()}
+            >
+              Добавить URL
+            </Button>
+
             {isUploadingFiles ? (
-              <div style={{ width: '100%', marginTop: 8 }}>
+              <div className="upload-progress-wrap">
                 <Typography variant="caption" className="muted-text">
                   {isServerProcessing
                     ? `Обработка данных на сервере: ${uploadIndicatorPercent.toFixed(1)}%`
@@ -409,33 +702,6 @@ export default function TrainingTab({
                 />
               </div>
             ) : null}
-
-            <div className="url-add-form">
-              <TextField
-                className="text-input"
-                label="URL страницы"
-                value={urlInput}
-                disabled={trainingLocked}
-                onChange={(event) => setUrlInput(event.target.value)}
-                placeholder="https://example.com/page"
-              />
-              <Button
-                variant="outlined"
-                startIcon={<AddLinkRoundedIcon />}
-                className="action-button"
-                onClick={async () => {
-                  if (!urlInput.trim()) {
-                    return;
-                  }
-
-                  await onAddUrlSource(urlInput.trim());
-                  setUrlInput('');
-                }}
-                disabled={busy || trainingLocked || !urlInput.trim()}
-              >
-                Добавить URL
-              </Button>
-            </div>
           </div>
 
           <div className="source-list">
@@ -458,108 +724,288 @@ export default function TrainingTab({
               </div>
             ))}
           </div>
-        </GlassPanel>
 
-        <GlassPanel>
-          <div className="panel-heading">
-            <div>
-              <Typography variant="h3">Состояние модели</Typography>
-              <Typography variant="body2" className="muted-text">
-                Метрики ниже показывают реальный размер модели, прогресс обучения, качество по валидации и накопленную обратную связь.
+          <div className="training-queues-section">
+            <div className="source-section__head">
+              <Typography variant="subtitle2">Очереди автообучения</Typography>
+              <Typography variant="caption" className="muted-text">
+                {`${trainingQueues.length} очередей`}
               </Typography>
             </div>
-          </div>
 
-          <div className="metric-grid">
-            <MetricCard label="Параметры" value={formatNumber(snapshot.model.parameterCount)} hint="в модели" />
-            <MetricCard label="Словарь" value={formatNumber(snapshot.model.vocabularySize)} hint="токенов" />
-            <MetricCard label="Эпохи" value={formatNumber(snapshot.model.trainedEpochs)} hint="завершено" />
-            <MetricCard label="Loss" value={formatDecimal(snapshot.model.lastLoss, 4)} hint="последний батч" />
-            <MetricCard label="Val loss" value={formatDecimal(snapshot.model.validationLoss, 4)} hint="последняя проверка" />
-            <MetricCard label="Оценки" value={formatNumber(snapshot.runtime?.ratedMessages || 0)} hint="ответов" />
-          </div>
-
-          <div className="status-flow">
-            {STATUS_FLOW.map((status) => (
-              <StatusPill
-                key={status}
-                label={status}
-                active={snapshot.model.lifecycle === status || snapshot.training.status === status}
-                tone={snapshot.model.lifecycle === status ? 'accent' : 'default'}
+            <div className="queue-builder">
+              <TextField
+                className="text-input"
+                label="Название очереди"
+                value={queueNameInput}
+                disabled={trainingLocked}
+                onChange={(event) => setQueueNameInput(event.target.value)}
+                placeholder="Например, Диалоги недели 1"
               />
-            ))}
-          </div>
+              <Button
+                variant="outlined"
+                className="action-button"
+                onClick={async () => {
+                  await onCreateTrainingQueue(queueNameInput.trim());
+                  setQueueNameInput('');
+                }}
+                disabled={busy || trainingLocked}
+              >
+                Создать очередь
+              </Button>
+            </div>
 
-          <Alert severity={snapshot.model.lifecycle === 'error' ? 'error' : 'info'}>
-            {snapshot.training.message}
-          </Alert>
-
-          <div className="model-facts">
-            {factRows.map(([label, value]) => (
-              <div className="fact-row" key={label}>
-                <span className="fact-row__label">{label}</span>
-                <span className="fact-row__value">{value}</span>
+            {isUploadingQueueFiles ? (
+              <div className="upload-progress-wrap">
+                <Typography variant="caption" className="muted-text">
+                  {isServerProcessing
+                    ? `Обработка файлов очереди: ${uploadIndicatorPercent.toFixed(1)}%`
+                    : normalizedUploadProgress < 100
+                      ? `Загрузка файлов очереди: ${normalizedUploadProgress.toFixed(1)}%`
+                      : 'Файлы очереди загружены, запускается обработка...'}
+                </Typography>
+                <LinearProgress
+                  variant="determinate"
+                  value={uploadIndicatorPercent}
+                  sx={{ mt: 0.5, borderRadius: 99 }}
+                />
               </div>
-            ))}
+            ) : null}
+
+            <div className="training-queue-list">
+              {trainingQueues.length ? trainingQueues.map((queue, index) => (
+                <div className="training-queue-card" key={queue.id}>
+                  <div className="training-queue-card__head">
+                    <div>
+                      <Typography variant="subtitle2">{`${index + 1}. ${queue.name}`}</Typography>
+                      <Typography variant="caption" className="muted-text">
+                        {`${queue.sourceCount} файлов`}
+                      </Typography>
+                    </div>
+                    <div className="training-queue-card__actions">
+                      <StatusPill
+                        label={queue.status}
+                        active={queue.status === 'running'}
+                        tone={queue.status === 'completed' ? 'accent' : 'neutral'}
+                      />
+                      <IconButton
+                        onClick={() => onDeleteTrainingQueue(queue.id)}
+                        disabled={busy || trainingLocked}
+                      >
+                        <DeleteForeverRoundedIcon />
+                      </IconButton>
+                    </div>
+                  </div>
+
+                  {queue.lastError ? (
+                    <Typography variant="caption" className="muted-text training-queue-card__error">
+                      {queue.lastError}
+                    </Typography>
+                  ) : null}
+
+                  <div className="training-queue-card__controls">
+                    <Button
+                      variant="contained"
+                      component="label"
+                      startIcon={<UploadFileRoundedIcon />}
+                      className="action-button"
+                      disabled={busy || trainingLocked}
+                    >
+                      Добавить файлы
+                      <input
+                        hidden
+                        type="file"
+                        accept=".txt,.csv,.json,text/plain,text/csv,application/json"
+                        multiple
+                        onChange={async (event) => {
+                          const files = Array.from(event.target.files || []);
+                          event.target.value = '';
+                          if (files.length) {
+                            await onUploadQueueFiles(queue.id, files);
+                          }
+                        }}
+                      />
+                    </Button>
+                  </div>
+
+                  <div className="training-queue-source-list">
+                    {queue.sources.length ? queue.sources.map((source) => (
+                      <div className="training-queue-source" key={source.id}>
+                        <div>
+                          <Typography variant="body2">{source.label}</Typography>
+                          <Typography variant="caption" className="muted-text">
+                            {`${formatNumber(source.stats.tokenCount)} токенов`}
+                          </Typography>
+                        </div>
+                        <IconButton
+                          onClick={() => onRemoveTrainingQueueSource(queue.id, source.id)}
+                          disabled={busy || trainingLocked}
+                        >
+                          <DeleteOutlineRoundedIcon />
+                        </IconButton>
+                      </div>
+                    )) : (
+                      <Typography variant="body2" className="muted-text">
+                        В этой очереди пока нет файлов.
+                      </Typography>
+                    )}
+                  </div>
+                </div>
+              )) : (
+                <Typography variant="body2" className="muted-text">
+                  Очереди пока не созданы.
+                </Typography>
+              )}
+            </div>
+          </div>
+        </GlassPanel>
+
+        <GlassPanel className="panel--fit panel--state">
+          <div className="panel-heading panel-heading--full">
+            <div className="panel-heading__copy">
+              <Typography variant="h3">Состояние модели</Typography>
+            </div>
           </div>
 
-          {snapshot.model.artifactFiles?.length ? (
-            <div className="top-terms">
-              <Typography variant="subtitle2">Файлы модели и хранилища</Typography>
-              <div className="artifact-file-list">
-                {snapshot.model.artifactFiles.map((filePath) => (
-                  <Typography
-                    key={filePath}
-                    variant="caption"
-                    className="artifact-file-path"
-                    title={filePath}
-                  >
-                    {filePath}
+          <div className="state-scroll">
+
+            <Alert severity={snapshot.model.lifecycle === 'error' ? 'error' : 'info'}>
+              {snapshot.training.message}
+            </Alert>
+
+            {serverStatus ? (
+              <Alert severity="info">
+                {`Node uptime: ${formatNumber(serverStatus.uptimeSec || 0)}s | Event-loop p95: ${formatDecimal(serverStatus.resources?.eventLoopLagMs?.p95, 2)}ms | Heavy queue: ${formatNumber(serverStatus.channels?.overload?.queuedCount || 0)} | Python active: ${formatNumber(serverStatus.pythonBridge?.activeProcesses || 0)}`}
+              </Alert>
+            ) : null}
+
+            <div className="metric-grid">
+              <MetricCard label="Параметры" value={formatNumber(snapshot.model.parameterCount)} hint="в модели" />
+              <MetricCard label="Словарь" value={formatNumber(snapshot.model.vocabularySize)} hint="токенов" />
+              <MetricCard label="Эпохи" value={formatNumber(snapshot.model.trainedEpochs)} hint="завершено" />
+              <MetricCard label="Loss" value={formatDecimal(snapshot.model.lastLoss, 4)} hint="последний батч" />
+              <MetricCard label="Val loss" value={formatDecimal(snapshot.model.validationLoss, 4)} hint="последняя проверка" />
+              <MetricCard label="Оценки" value={formatNumber(snapshot.runtime?.ratedMessages || 0)} hint="ответов" />
+            </div>
+
+            <div className="status-flow">
+              {STATUS_FLOW.map((status) => (
+                <StatusPill
+                  key={status}
+                  label={status}
+                  active={snapshot.model.lifecycle === status || snapshot.training.status === status}
+                  tone={snapshot.model.lifecycle === status ? 'accent' : 'default'}
+                />
+              ))}
+            </div>
+
+            <div className="status-stream">
+              <div className="status-stream__head">
+                <Typography variant="subtitle2">Живые статусы</Typography>
+                <StatusPill
+                  label={realtimeConnected ? 'Realtime online' : 'Realtime offline'}
+                  active={realtimeConnected}
+                  tone={realtimeConnected ? 'accent' : 'neutral'}
+                />
+              </div>
+              <div className="status-stream__list">
+                {statusEntries.length ? (
+                  statusEntries.slice(0, 10).map((entry) => (
+                    <div className="status-stream__card" key={entry.id}>
+                      <div className="status-stream__card-head">
+                        <StatusPill label={entry.status} active tone="accent" />
+                        <Typography variant="caption" className="muted-text">
+                          {formatDateTime(entry.createdAt)}
+                        </Typography>
+                      </div>
+                      <Typography variant="subtitle2">{entry.phase}</Typography>
+                      <Typography variant="body2" className="muted-text">
+                        {entry.message}
+                      </Typography>
+                    </div>
+                  ))
+                ) : (
+                  <Typography variant="body2" className="muted-text">
+                    Статусы пока не поступали.
                   </Typography>
-                ))}
+                )}
               </div>
             </div>
-          ) : null}
+
+            <div className="model-facts">
+              {factRows.map(([label, value]) => (
+                <div className="fact-row" key={label}>
+                  <span className="fact-row__label">{label}</span>
+                  <span className="fact-row__value">{value}</span>
+                </div>
+              ))}
+            </div>
+
+            <div className="server-log-panel">
+              <div className="server-log-panel__head">
+                <Typography variant="subtitle2">Журнал backend</Typography>
+                <Typography variant="caption" className="muted-text">
+                  {serverLogs.length} записей
+                </Typography>
+              </div>
+              <div className="server-log-list">
+                {serverLogs.length ? (
+                  serverLogs.map((entry) => (
+                    <div className={`server-log-entry server-log-entry--${entry.level || 'info'}`} key={entry.id}>
+                      <div className="server-log-entry__head">
+                        <span className="server-log-entry__level">{entry.level || 'info'}</span>
+                        <Typography variant="caption" className="muted-text">
+                          {formatDateTime(entry.createdAt)}
+                        </Typography>
+                      </div>
+                      <Typography variant="body2">{entry.message}</Typography>
+                      {entry.details?.path ? (
+                        <Typography variant="caption" className="muted-text">
+                          {`${entry.details.method || 'GET'} ${entry.details.path}`}
+                        </Typography>
+                      ) : null}
+                    </div>
+                  ))
+                ) : (
+                  <Typography variant="body2" className="muted-text">
+                    Журнал сервера пока пуст.
+                  </Typography>
+                )}
+              </div>
+            </div>
+
+            {snapshot.model.artifactFiles?.length ? (
+              <div className="top-terms">
+                <Typography variant="subtitle2">Файлы модели и хранилища</Typography>
+                <div className="artifact-file-list">
+                  {snapshot.model.artifactFiles.map((filePath) => (
+                    <Typography
+                      key={filePath}
+                      variant="caption"
+                      className="artifact-file-path"
+                      title={filePath}
+                    >
+                      {filePath}
+                    </Typography>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+          </div>
         </GlassPanel>
       </div>
 
       <div className="training-bottom-grid">
-        <GlassPanel className="panel--wide">
-          <div className="panel-heading">
-            <div>
+        <GlassPanel className="panel--fit panel--chart">
+          <div className="panel-heading panel-heading--full">
+            <div className="panel-heading__copy">
               <Typography variant="h3">График обучения</Typography>
               <Typography variant="body2" className="muted-text">
-                Лента batch-loss обновляется во время реального server-side цикла обучения и помогает понять, стабилизируется ли модель.
+                Динамика `loss` по батчам.
               </Typography>
             </div>
           </div>
           <TrainingChart history={snapshot.training.history} />
-        </GlassPanel>
-
-        <GlassPanel>
-          <div className="panel-heading">
-            <div>
-              <Typography variant="h3">Лента статусов</Typography>
-              <Typography variant="body2" className="muted-text">
-                Здесь видно, на какой стадии находится модель: подготовка корпуса, обучение, сохранение чекпоинта, пауза или удаление модели.
-              </Typography>
-            </div>
-          </div>
-
-          <div className="timeline-list">
-            {snapshot.training.recentStatuses?.map((entry) => (
-              <div className="timeline-item" key={entry.id}>
-                <div className="timeline-item__head">
-                  <StatusPill label={entry.status} active tone="accent" />
-                  <span className="timeline-item__time">{formatDateTime(entry.createdAt)}</span>
-                </div>
-                <Typography variant="subtitle2">{entry.phase}</Typography>
-                <Typography variant="body2" className="muted-text">
-                  {entry.message}
-                </Typography>
-              </div>
-            ))}
-          </div>
         </GlassPanel>
       </div>
     </div>

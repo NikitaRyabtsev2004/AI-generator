@@ -3,16 +3,30 @@ import {
   addUrlSource,
   createChat,
   createModel,
+  createNamedModel,
+  createTrainingQueue,
   deleteChat,
+  deleteLibraryModel,
+  deleteTrainingQueue,
+  exportModelPackage,
   fetchDashboard,
+  fetchRecentLogs,
+  fetchServerStatus,
+  importModelPackage,
   pauseModel,
   rateMessage,
   removeSource,
+  removeTrainingQueueSource,
+  rollbackTrainingToCheckpoint,
   resetModel,
+  saveRuntimeConfig,
   saveSettings,
   sendChatMessage,
+  selectModel,
+  subscribeToServerEvents,
   trainModel,
   uploadFiles,
+  uploadQueueFiles,
 } from '../api/studioApi';
 
 const ACTIVE_POLL_STATUSES = new Set([
@@ -31,8 +45,28 @@ const ACTIVE_POLL_LIFECYCLES = new Set([
 const FAST_REFRESH_ACTIONS = new Set([
   'trainModel',
   'pauseModel',
+  'rollbackTraining',
+  'importModel',
   'resetModel',
 ]);
+
+const MAX_SERVER_LOGS = 160;
+
+function mergeLogEntries(currentLogs, incomingLogs) {
+  const nextLogs = [];
+  const seenIds = new Set();
+
+  [...incomingLogs, ...currentLogs].forEach((entry) => {
+    if (!entry?.id || seenIds.has(entry.id)) {
+      return;
+    }
+
+    seenIds.add(entry.id);
+    nextLogs.push(entry);
+  });
+
+  return nextLogs.slice(0, MAX_SERVER_LOGS);
+}
 
 export function useStudioApp() {
   const [snapshot, setSnapshot] = useState(null);
@@ -47,6 +81,9 @@ export function useStudioApp() {
   const [pendingRatings, setPendingRatings] = useState({});
   const [uploadProgress, setUploadProgress] = useState(null);
   const [processingProgress, setProcessingProgress] = useState(null);
+  const [serverLogs, setServerLogs] = useState([]);
+  const [serverStatus, setServerStatus] = useState(null);
+  const [realtimeConnected, setRealtimeConnected] = useState(false);
 
   const snapshotRef = useRef(null);
   const selectedChatIdRef = useRef(null);
@@ -62,6 +99,44 @@ export function useStudioApp() {
     selectedChatIdRef.current = selectedChatId;
   }, [selectedChatId]);
 
+  const mergeRealtimeSnapshot = useCallback((nextRealtimeSnapshot) => {
+    if (!nextRealtimeSnapshot) {
+      return;
+    }
+
+    setSnapshot((current) => {
+      if (!current) {
+        return {
+          ...nextRealtimeSnapshot,
+          activeChat: null,
+        };
+      }
+
+      return {
+        ...current,
+        ...nextRealtimeSnapshot,
+        activeChat: current.activeChat,
+      };
+    });
+
+    setSelectedChatId((currentSelectedChatId) => {
+      if (!Array.isArray(nextRealtimeSnapshot.chats) || !nextRealtimeSnapshot.chats.length) {
+        return currentSelectedChatId;
+      }
+
+      if (currentSelectedChatId && nextRealtimeSnapshot.chats.some((chat) => chat.id === currentSelectedChatId)) {
+        return currentSelectedChatId;
+      }
+
+      return nextRealtimeSnapshot.chats[0]?.id || null;
+    });
+
+    setRequestState((current) => ({
+      ...current,
+      loading: false,
+    }));
+  }, []);
+
   const loadDashboard = useCallback(async (chatId = selectedChatIdRef.current) => {
     const controller = new AbortController();
     const requestId = dashboardRequestIdRef.current + 1;
@@ -75,6 +150,7 @@ export function useStudioApp() {
     try {
       const nextSnapshot = await fetchDashboard(chatId, {
         signal: controller.signal,
+        timeoutMs: 15000,
       });
 
       if (dashboardRequestIdRef.current !== requestId) {
@@ -136,6 +212,90 @@ export function useStudioApp() {
   }, [loadDashboard, selectedChatId]);
 
   useEffect(() => {
+    let isDisposed = false;
+
+    fetchRecentLogs()
+      .then((logs) => {
+        if (!isDisposed) {
+          setServerLogs(logs);
+        }
+      })
+      .catch(() => {
+        // Ignore initial log bootstrap failures.
+      });
+
+    fetchServerStatus()
+      .then((status) => {
+        if (!isDisposed) {
+          setServerStatus(status);
+        }
+      })
+      .catch(() => {
+        // Ignore initial status bootstrap failures.
+      });
+
+    const unsubscribe = subscribeToServerEvents({
+      onOpen: () => {
+        if (!isDisposed) {
+          setRealtimeConnected(true);
+        }
+      },
+      onConnectionError: () => {
+        if (!isDisposed) {
+          setRealtimeConnected(false);
+        }
+      },
+      onSnapshot: ({ snapshot: nextRealtimeSnapshot }) => {
+        if (!isDisposed) {
+          mergeRealtimeSnapshot(nextRealtimeSnapshot);
+        }
+      },
+      onLog: ({ entry }) => {
+        if (!isDisposed && entry) {
+          setServerLogs((current) => mergeLogEntries(current, [entry]));
+        }
+      },
+      onLogs: ({ logs }) => {
+        if (!isDisposed && Array.isArray(logs)) {
+          setServerLogs(logs.slice(0, MAX_SERVER_LOGS));
+        }
+      },
+      onServerError: ({ message }) => {
+        if (!isDisposed && message) {
+          setRequestState((current) => ({
+            ...current,
+            error: message,
+          }));
+        }
+      },
+      onStatus: ({ status }) => {
+        if (!isDisposed && status) {
+          setServerStatus(status);
+        }
+      },
+    });
+
+    return () => {
+      isDisposed = true;
+      unsubscribe();
+    };
+  }, [mergeRealtimeSnapshot]);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      fetchServerStatus()
+        .then((status) => {
+          setServerStatus(status);
+        })
+        .catch(() => {
+          // Ignore intermittent status fetch failures.
+        });
+    }, realtimeConnected ? 14000 : 7000);
+
+    return () => clearInterval(interval);
+  }, [realtimeConnected]);
+
+  useEffect(() => {
     if (!snapshotRef.current) {
       return undefined;
     }
@@ -144,13 +304,16 @@ export function useStudioApp() {
       ACTIVE_POLL_STATUSES.has(snapshotRef.current?.training?.status) ||
       ACTIVE_POLL_LIFECYCLES.has(snapshotRef.current?.model?.lifecycle) ||
       FAST_REFRESH_ACTIONS.has(requestState.action);
+    const intervalMs = shouldUseFastPolling
+      ? (realtimeConnected ? 4000 : 1200)
+      : (realtimeConnected ? 12000 : 6000);
 
     const interval = setInterval(() => {
       loadDashboard(selectedChatIdRef.current);
-    }, shouldUseFastPolling ? 1200 : 6000);
+    }, intervalMs);
 
     return () => clearInterval(interval);
-  }, [loadDashboard, requestState.action, snapshot?.model?.lifecycle, snapshot?.training?.status]);
+  }, [loadDashboard, realtimeConnected, requestState.action, snapshot?.model?.lifecycle, snapshot?.training?.status]);
 
   const runAction = useCallback(async (action, options = {}) => {
     const {
@@ -170,8 +333,10 @@ export function useStudioApp() {
 
     try {
       const nextSnapshot = await action();
-      setSnapshot(nextSnapshot);
-      setSelectedChatId(nextSnapshot.activeChat?.id || nextSnapshot.chats?.[0]?.id || null);
+      if (nextSnapshot) {
+        setSnapshot(nextSnapshot);
+        setSelectedChatId(nextSnapshot.activeChat?.id || nextSnapshot.chats?.[0]?.id || null);
+      }
       await onSuccess?.(nextSnapshot);
       return nextSnapshot;
     } catch (error) {
@@ -193,6 +358,10 @@ export function useStudioApp() {
   const actions = useMemo(() => ({
     refresh: () => loadDashboard(selectedChatIdRef.current),
     saveSettings: (nextSettings) => runAction(() => saveSettings(nextSettings), { actionName: 'saveSettings' }),
+    saveRuntimeConfig: (nextRuntimeConfig) => runAction(
+      () => saveRuntimeConfig(nextRuntimeConfig),
+      { actionName: 'saveRuntimeConfig' }
+    ),
     uploadFiles: (files) => runAction(
       () => uploadFiles(files, {
         onUploadProgress: (percent) => setUploadProgress(percent),
@@ -210,13 +379,45 @@ export function useStudioApp() {
         },
       }
     ),
+    createTrainingQueue: (name) => runAction(
+      () => createTrainingQueue(name),
+      { actionName: 'createTrainingQueue' }
+    ),
+    uploadQueueFiles: (queueId, files) => runAction(
+      () => uploadQueueFiles(queueId, files, {
+        onUploadProgress: (percent) => setUploadProgress(percent),
+        onProcessingProgress: ({ percent }) => setProcessingProgress(percent),
+      }),
+      {
+        actionName: 'uploadQueueFiles',
+        onStart: () => {
+          setUploadProgress(0);
+          setProcessingProgress(0);
+        },
+        onFinish: () => {
+          setUploadProgress(null);
+          setProcessingProgress(null);
+        },
+      }
+    ),
+    removeTrainingQueueSource: (queueId, sourceId) => runAction(
+      () => removeTrainingQueueSource(queueId, sourceId),
+      { actionName: 'removeTrainingQueueSource' }
+    ),
+    deleteTrainingQueue: (queueId) => runAction(
+      () => deleteTrainingQueue(queueId),
+      { actionName: 'deleteTrainingQueue' }
+    ),
     addUrlSource: (url) => runAction(() => addUrlSource(url), { actionName: 'addUrlSource' }),
     removeSource: (sourceId) => runAction(() => removeSource(sourceId), { actionName: 'removeSource' }),
     createModel: () => runAction(() => createModel(), { actionName: 'createModel' }),
+    createNamedModel: (name) => runAction(() => createNamedModel(name), { actionName: 'createNamedModel' }),
+    selectModel: (modelId) => runAction(() => selectModel(modelId), { actionName: 'selectModel' }),
+    deleteLibraryModel: (modelId) => runAction(() => deleteLibraryModel(modelId), { actionName: 'deleteLibraryModel' }),
     trainModel: () => runAction(() => trainModel(), {
       actionName: 'trainModel',
       onSuccess: async (nextSnapshot) => {
-        const chatId = nextSnapshot.activeChat?.id || selectedChatIdRef.current;
+        const chatId = nextSnapshot?.activeChat?.id || selectedChatIdRef.current;
         await loadDashboard(chatId);
         scheduleDashboardRefresh([500, 1500, 3500], chatId);
       },
@@ -224,7 +425,7 @@ export function useStudioApp() {
     pauseModel: () => runAction(() => pauseModel(), {
       actionName: 'pauseModel',
       onSuccess: async (nextSnapshot) => {
-        const chatId = nextSnapshot.activeChat?.id || selectedChatIdRef.current;
+        const chatId = nextSnapshot?.activeChat?.id || selectedChatIdRef.current;
         await loadDashboard(chatId);
         scheduleDashboardRefresh([500, 1500], chatId);
       },
@@ -232,7 +433,52 @@ export function useStudioApp() {
     resetModel: () => runAction(() => resetModel(), {
       actionName: 'resetModel',
       onSuccess: async (nextSnapshot) => {
-        const chatId = nextSnapshot.activeChat?.id || selectedChatIdRef.current;
+        const chatId = nextSnapshot?.activeChat?.id || selectedChatIdRef.current;
+        await loadDashboard(chatId);
+      },
+    }),
+    rollbackTraining: () => runAction(() => rollbackTrainingToCheckpoint(), {
+      actionName: 'rollbackTraining',
+      onSuccess: async (nextSnapshot) => {
+        const chatId = nextSnapshot?.activeChat?.id || selectedChatIdRef.current;
+        await loadDashboard(chatId);
+      },
+    }),
+    exportModel: async () => {
+      setRequestState((current) => ({
+        ...current,
+        busy: true,
+        error: '',
+        action: 'exportModel',
+      }));
+
+      try {
+        const { blob, fileName } = await exportModelPackage();
+        const objectUrl = window.URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = objectUrl;
+        link.download = fileName;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        window.URL.revokeObjectURL(objectUrl);
+      } catch (error) {
+        setRequestState((current) => ({
+          ...current,
+          error: error.message,
+        }));
+      } finally {
+        setRequestState((current) => ({
+          ...current,
+          busy: false,
+          action: '',
+        }));
+      }
+    },
+    importModel: (file) => runAction(() => importModelPackage(file), {
+      actionName: 'importModel',
+      onSuccess: async (nextSnapshot) => {
+        const chatId = nextSnapshot?.activeChat?.id || selectedChatIdRef.current;
         await loadDashboard(chatId);
       },
     }),
@@ -287,6 +533,9 @@ export function useStudioApp() {
     processingProgress,
     pendingReply,
     pendingRatings,
+    realtimeConnected,
+    serverLogs,
+    serverStatus,
     actions,
   };
 }
