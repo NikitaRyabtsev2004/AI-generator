@@ -26,7 +26,9 @@ function createSourcesRoutes({
     response.setHeader('X-Accel-Buffering', 'no');
 
     try {
-      const preparedSources = await prepareUploadedSources(files, response);
+      const preparedSources = await prepareUploadedSources(files, response, {
+        mode: 'knowledge',
+      });
       const snapshot = await engine.addSources(preparedSources);
 
       writeNdjsonChunk(response, {

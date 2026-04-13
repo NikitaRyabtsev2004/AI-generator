@@ -1,28 +1,59 @@
-const multer = require('multer');
+const fs = require('fs');
+const fsPromises = require('fs/promises');
 const path = require('path');
-const { cleanText, decodeBufferToText } = require('../lib/text');
-const { readPositiveIntegerEnv } = require('../core/overloadGuard');
+const readline = require('readline');
+const crypto = require('crypto');
+const multer = require('multer');
+const { cleanText, computeStats, decodeBufferToText } = require('../lib/text');
 const { writeNdjsonChunk } = require('../core/apiResponse');
 
-const DEFAULT_MAX_UPLOAD_FILE_MB = 1;
-const DEFAULT_MAX_UPLOAD_FILES = 200;
-const DEFAULT_MAX_MODEL_PACKAGE_MB = 512;
-const DEFAULT_MAX_SOURCE_TEXT_CHARS = 180000;
+const UPLOADS_DIR = path.join(__dirname, '..', 'data', 'uploaded-datasets');
+const DEFAULT_MAX_UPLOAD_FILE_MB = 2048;
+const DEFAULT_MAX_UPLOAD_FILES = 5000;
+const DEFAULT_MAX_MODEL_PACKAGE_MB = 1024;
+const DEFAULT_MAX_SOURCE_TEXT_CHARS = 210000;
 const DEFAULT_MAX_STRUCTURED_RECORDS_PER_FILE = 500;
-const DEFAULT_UPLOAD_YIELD_EVERY_FILES = 8;
+const DEFAULT_UPLOAD_YIELD_EVERY_FILES = 4;
+const DEFAULT_HEAD_SAMPLE_BYTES = 6 * 1024 * 1024;
+const DEFAULT_DATASET_REFERENCE_MIN_MB = 8;
 
-const MAX_UPLOAD_FILE_MB = readPositiveIntegerEnv('MAX_UPLOAD_FILE_MB', DEFAULT_MAX_UPLOAD_FILE_MB);
-const MAX_UPLOAD_FILES = readPositiveIntegerEnv('MAX_UPLOAD_FILES', DEFAULT_MAX_UPLOAD_FILES);
-const MAX_MODEL_PACKAGE_MB = readPositiveIntegerEnv('MAX_MODEL_PACKAGE_MB', DEFAULT_MAX_MODEL_PACKAGE_MB);
-const MAX_SOURCE_TEXT_CHARS = readPositiveIntegerEnv('MAX_SOURCE_TEXT_CHARS', DEFAULT_MAX_SOURCE_TEXT_CHARS);
-const MAX_STRUCTURED_RECORDS_PER_FILE = readPositiveIntegerEnv(
+function readOptionalLimitEnv(name, fallback) {
+  const rawValue = process.env[name];
+  if (rawValue === undefined || rawValue === null || rawValue === '') {
+    return fallback;
+  }
+
+  const parsed = Number(rawValue);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return fallback;
+  }
+
+  return Math.floor(parsed);
+}
+
+const MAX_UPLOAD_FILE_MB = readOptionalLimitEnv('MAX_UPLOAD_FILE_MB', DEFAULT_MAX_UPLOAD_FILE_MB);
+const MAX_UPLOAD_FILES = readOptionalLimitEnv('MAX_UPLOAD_FILES', DEFAULT_MAX_UPLOAD_FILES);
+const MAX_MODEL_PACKAGE_MB = readOptionalLimitEnv('MAX_MODEL_PACKAGE_MB', DEFAULT_MAX_MODEL_PACKAGE_MB);
+const MAX_SOURCE_TEXT_CHARS = readOptionalLimitEnv('MAX_SOURCE_TEXT_CHARS', DEFAULT_MAX_SOURCE_TEXT_CHARS);
+const MAX_STRUCTURED_RECORDS_PER_FILE = readOptionalLimitEnv(
   'MAX_STRUCTURED_RECORDS_PER_FILE',
   DEFAULT_MAX_STRUCTURED_RECORDS_PER_FILE
 );
-const UPLOAD_YIELD_EVERY_FILES = readPositiveIntegerEnv(
+const UPLOAD_YIELD_EVERY_FILES = readOptionalLimitEnv(
   'UPLOAD_YIELD_EVERY_FILES',
   DEFAULT_UPLOAD_YIELD_EVERY_FILES
 );
+const HEAD_SAMPLE_BYTES = readOptionalLimitEnv('UPLOAD_HEAD_SAMPLE_BYTES', DEFAULT_HEAD_SAMPLE_BYTES);
+const DATASET_REFERENCE_MIN_MB = readOptionalLimitEnv(
+  'DATASET_REFERENCE_MIN_MB',
+  DEFAULT_DATASET_REFERENCE_MIN_MB
+);
+
+const DATASET_REFERENCE_MIN_BYTES = Math.max(1, DATASET_REFERENCE_MIN_MB) * 1024 * 1024;
+
+function ensureUploadsDir() {
+  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+}
 
 function yieldToEventLoop() {
   return new Promise((resolve) => setImmediate(resolve));
@@ -40,21 +71,40 @@ function trimSourceText(value) {
   return `${normalized.slice(0, MAX_SOURCE_TEXT_CHARS)}\n\n[TRUNCATED:${normalized.length - MAX_SOURCE_TEXT_CHARS}]`;
 }
 
+function buildMulterLimits(maxFileMb, maxFiles) {
+  const limits = {};
+  if (maxFileMb > 0) {
+    limits.fileSize = maxFileMb * 1024 * 1024;
+  }
+  if (maxFiles > 0) {
+    limits.files = maxFiles;
+  }
+  return limits;
+}
+
+function createSourceStorage() {
+  ensureUploadsDir();
+  return multer.diskStorage({
+    destination: (_request, _file, callback) => {
+      callback(null, UPLOADS_DIR);
+    },
+    filename: (_request, file, callback) => {
+      const extension = path.extname(file.originalname || '').slice(0, 16);
+      const uniquePart = `${Date.now()}-${crypto.randomUUID()}`;
+      callback(null, `${uniquePart}${extension}`);
+    },
+  });
+}
+
 function createUploadMiddlewares() {
   const sourceUpload = multer({
-    storage: multer.memoryStorage(),
-    limits: {
-      fileSize: MAX_UPLOAD_FILE_MB * 1024 * 1024,
-      files: MAX_UPLOAD_FILES,
-    },
+    storage: createSourceStorage(),
+    limits: buildMulterLimits(MAX_UPLOAD_FILE_MB, MAX_UPLOAD_FILES),
   });
 
   const modelPackageUpload = multer({
     storage: multer.memoryStorage(),
-    limits: {
-      fileSize: MAX_MODEL_PACKAGE_MB * 1024 * 1024,
-      files: 1,
-    },
+    limits: buildMulterLimits(MAX_MODEL_PACKAGE_MB, 1),
   });
 
   return {
@@ -66,6 +116,7 @@ function createUploadMiddlewares() {
       maxModelPackageMb: MAX_MODEL_PACKAGE_MB,
       maxSourceTextChars: MAX_SOURCE_TEXT_CHARS,
       maxStructuredRecordsPerFile: MAX_STRUCTURED_RECORDS_PER_FILE,
+      uploadMode: 'disk',
     },
   };
 }
@@ -74,6 +125,12 @@ function detectStructuredFileKind(file = {}) {
   const extension = path.extname(file.originalname || '').toLowerCase();
   const mimeType = String(file.mimetype || '').toLowerCase();
 
+  if (extension === '.parquet' || mimeType.includes('parquet')) {
+    return 'parquet';
+  }
+  if (extension === '.jsonl' || extension === '.ndjson') {
+    return 'jsonl';
+  }
   if (extension === '.json' || mimeType.includes('json')) {
     return 'json';
   }
@@ -152,11 +209,79 @@ function flattenStructuredValue(value, prefix = '') {
   return [prefix ? `${prefix}: ${normalized}` : normalized];
 }
 
-function buildSourcesFromJsonFile(file, rawText) {
-  const parsed = JSON.parse(rawText);
+async function readFileHeadBuffer(file, maxBytes = HEAD_SAMPLE_BYTES) {
+  if (file?.buffer && Buffer.isBuffer(file.buffer)) {
+    return file.buffer.slice(0, maxBytes);
+  }
+
+  const sourcePath = cleanText(file?.path || '');
+  if (!sourcePath) {
+    return Buffer.from('');
+  }
+
+  const handle = await fsPromises.open(sourcePath, 'r');
+  try {
+    const buffer = Buffer.alloc(Math.max(1, maxBytes));
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    return buffer.slice(0, bytesRead);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function decodeTextFromFileHead(file, maxBytes = HEAD_SAMPLE_BYTES) {
+  const headBuffer = await readFileHeadBuffer(file, maxBytes);
+  const text = decodeBufferToText(headBuffer);
+  const fileSize = Math.max(Number(file?.size) || headBuffer.length, headBuffer.length);
+  if (fileSize <= headBuffer.length) {
+    return cleanText(text);
+  }
+
+  return cleanText(`${text}\n\n[TRUNCATED_BYTES:${fileSize - headBuffer.length}]`);
+}
+
+async function readLimitedLines(filePath, maxLines) {
+  const lines = [];
+  const stream = fs.createReadStream(filePath, { encoding: 'utf8' });
+  const lineReader = readline.createInterface({
+    input: stream,
+    crlfDelay: Infinity,
+  });
+
+  try {
+    for await (const line of lineReader) {
+      if (lines.length >= maxLines) {
+        break;
+      }
+      const normalized = String(line || '');
+      if (normalized) {
+        lines.push(normalized);
+      }
+    }
+  } finally {
+    lineReader.close();
+    stream.destroy();
+  }
+
+  return lines;
+}
+
+async function buildSourcesFromJsonFile(file, mode = 'knowledge') {
+  const fileText = await decodeTextFromFileHead(file);
+  let parsed;
+  try {
+    parsed = JSON.parse(fileText);
+  } catch (_error) {
+    const content = trimSourceText(fileText);
+    return content ? [{
+      type: 'file',
+      label: file.originalname,
+      content,
+    }] : [];
+  }
+
   const entries = Array.isArray(parsed) ? parsed : [parsed];
   const limitedEntries = entries.slice(0, MAX_STRUCTURED_RECORDS_PER_FILE);
-
   return limitedEntries
     .map((entry, index) => {
       const lines = flattenStructuredValue(entry);
@@ -166,7 +291,7 @@ function buildSourcesFromJsonFile(file, rawText) {
       }
 
       return {
-        type: 'file',
+        type: mode === 'training_queue' ? 'file' : 'file',
         label: limitedEntries.length > 1 ? `${file.originalname} #${index + 1}` : file.originalname,
         content,
       };
@@ -174,26 +299,30 @@ function buildSourcesFromJsonFile(file, rawText) {
     .filter(Boolean);
 }
 
-function buildSourcesFromCsvFile(file, rawText) {
-  const lines = rawText
-    .split(/\r?\n/u)
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  if (!lines.length) {
+async function buildSourcesFromCsvFile(file) {
+  const filePath = cleanText(file.path || '');
+  if (!filePath) {
     return [];
   }
 
-  const delimiter = detectCsvDelimiter(lines[0]);
-  const headerCells = splitCsvRow(lines[0], delimiter);
-  const dataRows = lines.slice(1, MAX_STRUCTURED_RECORDS_PER_FILE + 1);
+  const lines = await readLimitedLines(filePath, MAX_STRUCTURED_RECORDS_PER_FILE + 1);
+  const nonEmptyLines = lines
+    .map((line) => line.trim())
+    .filter(Boolean);
 
+  if (!nonEmptyLines.length) {
+    return [];
+  }
+
+  const delimiter = detectCsvDelimiter(nonEmptyLines[0]);
+  const headerCells = splitCsvRow(nonEmptyLines[0], delimiter);
+  const dataRows = nonEmptyLines.slice(1, MAX_STRUCTURED_RECORDS_PER_FILE + 1);
   if (!dataRows.length) {
-    const headerOnlyContent = trimSourceText(headerCells.join(' '));
-    return headerOnlyContent ? [{
+    const headerOnly = trimSourceText(headerCells.join(' '));
+    return headerOnly ? [{
       type: 'file',
       label: file.originalname,
-      content: headerOnlyContent,
+      content: headerOnly,
     }] : [];
   }
 
@@ -218,21 +347,44 @@ function buildSourcesFromCsvFile(file, rawText) {
     .filter(Boolean);
 }
 
-function buildSourcesFromUploadedFile(file) {
-  const rawText = decodeBufferToText(file.buffer);
-  if (!rawText) {
+async function buildSourcesFromJsonlFile(file) {
+  const filePath = cleanText(file.path || '');
+  if (!filePath) {
     return [];
   }
 
-  const fileKind = detectStructuredFileKind(file);
-  if (fileKind === 'json') {
-    return buildSourcesFromJsonFile(file, rawText);
-  }
-  if (fileKind === 'csv') {
-    return buildSourcesFromCsvFile(file, rawText);
-  }
+  const lines = await readLimitedLines(filePath, MAX_STRUCTURED_RECORDS_PER_FILE);
+  return lines
+    .map((line, index) => {
+      const normalizedLine = cleanText(line);
+      if (!normalizedLine) {
+        return null;
+      }
 
-  const content = trimSourceText(rawText);
+      try {
+        const parsed = JSON.parse(normalizedLine);
+        const content = trimSourceText(flattenStructuredValue(parsed).join('\n'));
+        if (!content) {
+          return null;
+        }
+        return {
+          type: 'file',
+          label: `${file.originalname} #${index + 1}`,
+          content,
+        };
+      } catch (_error) {
+        return {
+          type: 'file',
+          label: `${file.originalname} #${index + 1}`,
+          content: trimSourceText(normalizedLine),
+        };
+      }
+    })
+    .filter(Boolean);
+}
+
+async function buildSourcesFromTxtFile(file) {
+  const content = trimSourceText(await decodeTextFromFileHead(file));
   return content ? [{
     type: 'file',
     label: file.originalname,
@@ -240,7 +392,68 @@ function buildSourcesFromUploadedFile(file) {
   }] : [];
 }
 
-async function prepareUploadedSources(files, response = null) {
+async function buildKnowledgeSourcesFromUploadedFile(file, fileKind) {
+  if (fileKind === 'json') {
+    return buildSourcesFromJsonFile(file, 'knowledge');
+  }
+  if (fileKind === 'csv') {
+    return buildSourcesFromCsvFile(file);
+  }
+  if (fileKind === 'jsonl') {
+    return buildSourcesFromJsonlFile(file);
+  }
+  if (fileKind === 'parquet') {
+    const metaText = trimSourceText(
+      `Файл ${file.originalname} (${Math.max(Number(file.size) || 0, 0)} bytes) в формате parquet загружен. ` +
+      'Для обучения добавляйте parquet в очередь обучения: сервер передаст его напрямую в Python-обработчик.'
+    );
+    return [{
+      type: 'file',
+      label: file.originalname,
+      content: metaText,
+    }];
+  }
+
+  return buildSourcesFromTxtFile(file);
+}
+
+function shouldUseDatasetFileReference(file, fileKind, mode = 'knowledge') {
+  if (mode !== 'training_queue') {
+    return false;
+  }
+
+  if (fileKind === 'parquet' || fileKind === 'jsonl') {
+    return true;
+  }
+
+  return Math.max(Number(file.size) || 0, 0) >= DATASET_REFERENCE_MIN_BYTES;
+}
+
+function createDatasetFileReference(file) {
+  const filePath = cleanText(file.path || '');
+  return {
+    type: 'dataset_file',
+    label: cleanText(file.originalname || '') || path.basename(filePath) || 'dataset_file',
+    datasetFilePath: filePath,
+    contentSize: Math.max(Number(file.size) || 0, 0),
+    stats: computeStats(''),
+  };
+}
+
+async function cleanupUploadedFile(file) {
+  const filePath = cleanText(file?.path || '');
+  if (!filePath) {
+    return;
+  }
+  try {
+    await fsPromises.rm(filePath, { force: true });
+  } catch (_error) {
+    // Ignore cleanup failures.
+  }
+}
+
+async function prepareUploadedSources(files, response = null, options = {}) {
+  const mode = options.mode === 'training_queue' ? 'training_queue' : 'knowledge';
   const totalFiles = files.length;
   const preparedSources = [];
 
@@ -255,7 +468,20 @@ async function prepareUploadedSources(files, response = null) {
 
   for (let index = 0; index < files.length; index += 1) {
     const file = files[index];
-    preparedSources.push(...buildSourcesFromUploadedFile(file));
+    const fileKind = detectStructuredFileKind(file);
+    const keepAsDatasetReference = shouldUseDatasetFileReference(file, fileKind, mode);
+
+    try {
+      if (keepAsDatasetReference) {
+        preparedSources.push(createDatasetFileReference(file));
+      } else {
+        preparedSources.push(...(await buildKnowledgeSourcesFromUploadedFile(file, fileKind)));
+      }
+    } finally {
+      if (!keepAsDatasetReference) {
+        await cleanupUploadedFile(file);
+      }
+    }
 
     if (response) {
       const processedFiles = index + 1;

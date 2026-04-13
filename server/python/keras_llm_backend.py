@@ -5,6 +5,7 @@ import argparse
 import json
 import math
 import os
+import platform
 import tempfile
 import time
 from dataclasses import asdict
@@ -153,6 +154,16 @@ def configure_tensorflow(training_settings: Dict[str, Any]) -> Dict[str, Any]:
     execution_mode = training_settings.get("executionMode", "native_preferred")
     gpus = tf.config.list_physical_devices("GPU")
     using_gpu = bool(gpus) and execution_mode != "compatibility"
+    backend_warning = ""
+
+    tf_version = str(getattr(tf, "__version__", "0"))
+    tf_major, tf_minor = 0, 0
+    parts = tf_version.split(".")
+    try:
+        tf_major = int(parts[0])
+        tf_minor = int(parts[1]) if len(parts) > 1 else 0
+    except Exception:
+        tf_major, tf_minor = 0, 0
 
     if using_gpu:
         for gpu in gpus:
@@ -171,6 +182,15 @@ def configure_tensorflow(training_settings: Dict[str, Any]) -> Dict[str, Any]:
     else:
         tf.keras.mixed_precision.set_global_policy("float32")
 
+    if execution_mode == "gpu_preferred" and not using_gpu:
+        if platform.system().lower() == "windows" and (tf_major > 2 or (tf_major == 2 and tf_minor >= 11)):
+            backend_warning = (
+                " TensorFlow не видит GPU на Windows для этой версии. "
+                "Используйте setup-venv2.ps1 (TensorFlow 2.10 + CUDA 11.2 + cuDNN 8.1) или WSL2."
+            )
+        else:
+            backend_warning = " GPU не обнаружен TensorFlow, поэтому используется CPU."
+
     label = "TensorFlow (GPU)" if using_gpu else "TensorFlow (CPU)"
     return {
         "tf": tf,
@@ -178,7 +198,7 @@ def configure_tensorflow(training_settings: Dict[str, Any]) -> Dict[str, Any]:
         "mixedPrecision": mixed_precision_enabled,
         "backendName": "tensorflow",
         "backendLabel": label,
-        "backendWarning": "",
+        "backendWarning": backend_warning,
     }
 
 
@@ -322,30 +342,46 @@ def stop_requested(stop_signal_path: str) -> bool:
     return bool(stop_signal_path and Path(stop_signal_path).exists())
 
 
-def read_training_texts(config: Dict[str, Any]) -> List[str]:
+def read_training_payload(config: Dict[str, Any]) -> Dict[str, Any]:
     payload_texts: List[str] = []
+    dataset_paths: List[str] = []
+    dataset_options: Dict[str, Any] = {}
+
     training_payload_path = str(config.get("trainingPayloadPath") or "").strip()
     if training_payload_path and Path(training_payload_path).exists():
         training_payload = read_json(training_payload_path)
         values = training_payload.get("trainingTexts")
         if isinstance(values, list):
             payload_texts.extend(str(item) for item in values if isinstance(item, str))
+        payload_dataset_files = training_payload.get("datasetFiles")
+        if isinstance(payload_dataset_files, list):
+            dataset_paths.extend(str(value) for value in payload_dataset_files)
+        payload_dataset_options = training_payload.get("datasetOptions")
+        if isinstance(payload_dataset_options, dict):
+            dataset_options = {**dataset_options, **payload_dataset_options}
 
     inline_values = config.get("trainingTexts")
     if isinstance(inline_values, list):
         payload_texts.extend(str(item) for item in inline_values if isinstance(item, str))
 
     dataset_files = config.get("datasetFiles")
-    dataset_paths = dataset_files if isinstance(dataset_files, list) else []
+    if isinstance(dataset_files, list):
+        dataset_paths.extend(str(value) for value in dataset_files)
+    config_dataset_options = config.get("datasetOptions")
+    if isinstance(config_dataset_options, dict):
+        dataset_options = {**dataset_options, **config_dataset_options}
 
-    from llm_data import collect_texts  # pylint: disable=import-outside-toplevel
+    return {
+        "trainingTexts": payload_texts,
+        "datasetFiles": dataset_paths,
+        "datasetOptions": dataset_options,
+    }
 
-    return collect_texts(
-        {
-            "trainingTexts": payload_texts,
-            "datasetFiles": [str(value) for value in dataset_paths],
-        }
-    )
+
+def create_training_text_iterator(payload: Dict[str, Any]):
+    from llm_data import clean_text_stream, iter_collected_texts  # pylint: disable=import-outside-toplevel
+
+    return clean_text_stream(iter_collected_texts(payload))
 
 
 def compute_masked_loss(tf, labels, logits, pad_id: int):
@@ -408,9 +444,18 @@ def command_train(config: Dict[str, Any]) -> int:
     tf_info = configure_tensorflow(training_settings)
     tf = tf_info["tf"]
 
-    texts = read_training_texts(config)
-    if not texts:
+    training_payload = read_training_payload(config)
+    probe_iterator = create_training_text_iterator(training_payload)
+    first_text = next(iter(probe_iterator), None)
+    if not first_text:
         raise RuntimeError("No training texts found after preprocessing.")
+
+    def tokenizer_text_stream():
+        yield first_text
+        yield from probe_iterator
+
+    def corpus_text_stream():
+        return create_training_text_iterator(training_payload)
 
     if stop_requested(stop_signal_path):
         return 0
@@ -424,7 +469,7 @@ def command_train(config: Dict[str, Any]) -> int:
         }
     )
     tokenizer = SimpleSubwordTokenizer.train(
-        texts,
+        tokenizer_text_stream(),
         TokenizerConfig(vocabulary_limit=training_settings["vocabularyLimit"]),
     )
 
@@ -458,7 +503,7 @@ def command_train(config: Dict[str, Any]) -> int:
 
     context_length = training_settings["sequenceLength"]
     tokenized_corpus = prepare_tokenized_corpus(
-        texts=texts,
+        texts=corpus_text_stream(),
         tokenizer=tokenizer,
         context_length=context_length,
         max_tokens_per_text=max(1024, context_length * 24),

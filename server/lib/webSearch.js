@@ -28,6 +28,17 @@ function filterPreferredDomains(results, preferredDomainsRaw) {
   const preferredDomains = String(preferredDomainsRaw || '')
     .split(',')
     .map((item) => item.trim().toLowerCase())
+    .map((item) => {
+      if (!item) {
+        return '';
+      }
+      try {
+        const host = new URL(item.includes('://') ? item : `https://${item}`).host.toLowerCase();
+        return host.replace(/^www\./u, '');
+      } catch (_error) {
+        return item.replace(/^https?:\/\//u, '').replace(/\/.*$/u, '').replace(/^www\./u, '');
+      }
+    })
     .filter(Boolean);
 
   if (!preferredDomains.length) {
@@ -38,7 +49,7 @@ function filterPreferredDomains(results, preferredDomainsRaw) {
   const other = [];
 
   results.forEach((result) => {
-    const host = String(result.host || '').toLowerCase();
+    const host = String(result.host || '').toLowerCase().replace(/^www\./u, '');
     if (preferredDomains.some((domain) => host === domain || host.endsWith(`.${domain}`))) {
       preferred.push(result);
     } else {

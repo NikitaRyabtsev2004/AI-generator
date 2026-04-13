@@ -83,29 +83,58 @@ class SimpleSubwordTokenizer:
         reserved = len(vocab)
         max_vocab = max(config.vocabulary_limit, reserved + 64)
 
+        def append_ranked_tokens(
+            counter: Counter[str],
+            *,
+            limit: int,
+            min_frequency: int | None,
+            budget: int | None = None,
+        ) -> int:
+            added = 0
+            for token, freq in counter.most_common():
+                if len(vocab) >= limit:
+                    break
+                if budget is not None and added >= budget:
+                    break
+                if min_frequency is not None and freq < min_frequency:
+                    continue
+                if token in SPECIAL_TOKENS or token in vocab:
+                    continue
+                vocab.append(token)
+                added += 1
+            return added
+
         max_word_tokens = max(32, min(config.max_word_tokens, max_vocab - reserved))
         word_budget = min(max_word_tokens, max_vocab - len(vocab))
-        for word, freq in word_counter.most_common():
-            if len(vocab) >= reserved + word_budget:
-                break
-            if freq < config.min_token_frequency:
-                break
-            if word in SPECIAL_TOKENS:
-                continue
-            vocab.append(word)
+        append_ranked_tokens(
+            word_counter,
+            limit=reserved + word_budget,
+            min_frequency=max(1, int(config.min_token_frequency)),
+        )
+        # If high-frequency words are insufficient, fill the remaining budget with rare words.
+        if len(vocab) < reserved + word_budget:
+            append_ranked_tokens(
+                word_counter,
+                limit=reserved + word_budget,
+                min_frequency=1,
+            )
 
         remaining = max_vocab - len(vocab)
         if remaining > 0:
             max_subword_tokens = max(64, min(config.max_subword_tokens, remaining))
-            for piece, freq in subword_counter.most_common():
-                if len(vocab) >= max_vocab or max_subword_tokens <= 0:
-                    break
-                if freq < config.min_token_frequency:
-                    break
-                if piece in SPECIAL_TOKENS or piece in vocab:
-                    continue
-                vocab.append(piece)
-                max_subword_tokens -= 1
+            added_subwords = append_ranked_tokens(
+                subword_counter,
+                limit=max_vocab,
+                min_frequency=max(1, int(config.min_token_frequency)),
+                budget=max_subword_tokens,
+            )
+            if added_subwords < max_subword_tokens and len(vocab) < max_vocab:
+                append_ranked_tokens(
+                    subword_counter,
+                    limit=max_vocab,
+                    min_frequency=1,
+                    budget=max_subword_tokens - added_subwords,
+                )
 
         for piece, _freq in char_counter.most_common():
             if len(vocab) >= max_vocab:

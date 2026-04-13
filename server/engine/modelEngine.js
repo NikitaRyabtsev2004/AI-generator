@@ -78,6 +78,19 @@ const SHORT_SOCIAL_MESSAGE_PATTERN = /^(привет|здравствуй|здр
 const MARKDOWN_LINK_PATTERN = /\[([^\]]{1,120})\]\((https?:\/\/[^\s)]+)\)/giu;
 const URL_PATTERN = /https?:\/\/[^\s)]+/giu;
 const NOISY_WEB_HOST_PATTERN = /(dictionary|translate|wiktionary|reverso|thesaurus)/iu;
+const COMMON_QUERY_STOPWORDS = new Set([
+  'и', 'а', 'но', 'или', 'если', 'то', 'же', 'ли', 'бы', 'в', 'во', 'на', 'по', 'к', 'ко',
+  'с', 'со', 'у', 'о', 'об', 'от', 'до', 'за', 'из', 'под', 'над', 'при', 'для', 'про',
+  'через', 'без', 'не', 'ни', 'я', 'ты', 'он', 'она', 'мы', 'вы', 'они', 'это', 'этот',
+  'эта', 'эти', 'тот', 'та', 'те', 'мне', 'тебе', 'ему', 'ей', 'нам', 'вам', 'их', 'мой',
+  'твой', 'его', 'ее', 'наш', 'ваш', 'их', 'как', 'что', 'кто', 'где', 'когда', 'почему',
+  'зачем', 'which', 'what', 'who', 'where', 'when', 'why', 'how', 'is', 'are', 'a', 'an',
+  'the', 'to', 'for', 'of', 'in', 'on', 'at', 'with', 'by', 'from', 'and', 'or', 'if',
+  'then', 'it', 'this', 'that', 'these', 'those'
+]);
+const MAX_DATASET_RECORDS_PER_FILE = Math.max(1000, Number(process.env.MAX_DATASET_RECORDS_PER_FILE) || 250000);
+const MAX_DATASET_CHARS_PER_RECORD = Math.max(128, Number(process.env.MAX_DATASET_CHARS_PER_RECORD) || 12000);
+const DATASET_PARQUET_BATCH_SIZE = Math.max(32, Number(process.env.DATASET_PARQUET_BATCH_SIZE) || 256);
 
 function nowIso() {
   return new Date().toISOString();
@@ -487,6 +500,37 @@ function addWeightedTokens(targetMap, tokens, weight = 1) {
   });
 }
 
+function isInformativeQueryToken(token) {
+  const normalized = String(token || '').toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  if (COMMON_QUERY_STOPWORDS.has(normalized)) {
+    return false;
+  }
+
+  if (normalized.length <= 1) {
+    return false;
+  }
+
+  if (/^\d+$/u.test(normalized)) {
+    return false;
+  }
+
+  return true;
+}
+
+function extractQueryTokens(text, { fallbackToAll = false } = {}) {
+  const allTokens = tokenizeWords(text || '');
+  const informativeTokens = allTokens.filter(isInformativeQueryToken);
+  if (informativeTokens.length || !fallbackToAll) {
+    return informativeTokens;
+  }
+
+  return allTokens;
+}
+
 function createTermMap(tokens, allowedTerms = null) {
   const map = {};
   tokens.forEach((token) => {
@@ -577,7 +621,7 @@ function startsWithSpeakerLabel(text) {
 
 function sanitizeReplyText(text) {
   return cleanText(text)
-    .replace(/^\s*[-вЂ“вЂ”]\s*/u, '')
+    .replace(/^\s*[-\u2013\u2014]\s*/u, '')
     .replace(/^\s*(пользователь|user|assistant|ассистент|бот|bot|client|клиент|human|ai|a|b|а|б)\s*:\s*/iu, '')
     .replace(/\b(пользователь|user|assistant|ассистент|бот|bot|client|клиент|human|ai|a|b|а|б)\s*:\s*/giu, '')
     .trim();
@@ -587,6 +631,118 @@ function shouldSkipWebSearchForMessage(userMessage) {
   const normalized = cleanText(userMessage || '').toLowerCase();
   const tokens = tokenizeWords(normalized);
   return tokens.length <= 4 && SHORT_SOCIAL_MESSAGE_PATTERN.test(normalized);
+}
+
+function shouldForceWebSearchForMessage(userMessage) {
+  const normalized = cleanText(userMessage || '').toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  if (normalized.includes('?')) {
+    return true;
+  }
+
+  const intentPattern =
+    /\b(как|что|кто|почему|зачем|где|когда|какой|какая|какие|how|what|why|when|where|which|guide|tutorial)\b/iu;
+  const techPattern =
+    /\b(javascript|js|typescript|react|node|python|sql|api|framework|library|алгоритм|программирован|код)\b/iu;
+
+  return intentPattern.test(normalized) || techPattern.test(normalized);
+}
+
+function isTechnicalOrMathQuery(userMessage) {
+  const normalized = cleanText(userMessage || '').toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  const technicalPattern =
+    /\b(javascript|js|typescript|react|node|nodejs|python|java|c\+\+|c#|golang|go|rust|php|sql|html|css|api|sdk|framework|library|regex|алгоритм|код|программир|разработк)\b/iu;
+  const mathPattern =
+    /\b(математ|алгебр|геометр|функци|производн|интеграл|логарифм|уравнен|вероятност|статистик|матриц|вектор|числ)\b|[=+\-*/^<>]{1,}/iu;
+
+  return technicalPattern.test(normalized) || mathPattern.test(normalized);
+}
+
+function containsCyrillic(text) {
+  return /[\u0400-\u04FF]/u.test(cleanText(text || ''));
+}
+
+function detectMessageLanguage(text) {
+  const normalized = cleanText(text || '');
+  if (!normalized) {
+    return 'auto';
+  }
+
+  const cyrillicMatches = normalized.match(/[\u0400-\u04FF]/gu) || [];
+  const latinMatches = normalized.match(/[A-Za-z]/g) || [];
+  const cyrillicRatio = cyrillicMatches.length / Math.max(normalized.length, 1);
+  const latinRatio = latinMatches.length / Math.max(normalized.length, 1);
+
+  if (cyrillicRatio >= 0.12 && cyrillicMatches.length >= latinMatches.length * 0.7) {
+    return 'ru';
+  }
+  if (latinRatio >= 0.12) {
+    return 'en';
+  }
+  return 'auto';
+}
+
+function languageMismatchPenalty(userLanguage, text) {
+  if (!text || userLanguage === 'auto') {
+    return 0;
+  }
+
+  const replyLanguage = detectMessageLanguage(text);
+  if (replyLanguage === 'auto' || replyLanguage === userLanguage) {
+    return 0;
+  }
+
+  return 0.16;
+}
+
+function parsePreferredDomainsList(preferredDomainsRaw) {
+  return String(preferredDomainsRaw || '')
+    .split(',')
+    .map((domain) => cleanText(domain).toLowerCase())
+    .filter(Boolean)
+    .map((domain) => domain.replace(/^https?:\/\//u, '').replace(/^www\./u, '').replace(/\/.*$/u, ''))
+    .filter(Boolean);
+}
+
+function isPreferredDomainUrl(url, preferredDomains = []) {
+  if (!url || !preferredDomains.length) {
+    return false;
+  }
+
+  try {
+    const host = new URL(url).host.toLowerCase().replace(/^www\./u, '');
+    return preferredDomains.some((domain) => host === domain || host.endsWith(`.${domain}`));
+  } catch (_error) {
+    return false;
+  }
+}
+
+function buildWebSearchQueries(userMessage, preferredDomainsRaw = '') {
+  const normalized = cleanText(userMessage || '');
+  if (!normalized) {
+    return [];
+  }
+
+  const baseQueries = [normalized];
+  if (containsCyrillic(normalized) && !/\b(на русском|русск)\b/iu.test(normalized)) {
+    baseQueries.unshift(`${normalized} на русском`);
+  }
+
+  const preferredDomains = parsePreferredDomainsList(preferredDomainsRaw).slice(0, 3);
+  const queries = [...baseQueries];
+  preferredDomains.forEach((domain) => {
+    baseQueries.forEach((query) => {
+      queries.push(`${query} site:${domain}`);
+    });
+  });
+
+  return Array.from(new Set(queries.map((query) => cleanText(query)).filter(Boolean)));
 }
 
 function collapseRepeatedWords(text) {
@@ -708,6 +864,33 @@ function isEchoReply(userText, replyText) {
   });
 
   return shared / Math.max(replyTokens.length, userTokens.size) >= 0.82;
+}
+
+function computePromptReplyRelevance(promptText, replyText) {
+  const promptTokens = extractQueryTokens(promptText || '', { fallbackToAll: true });
+  const replyTokens = extractQueryTokens(replyText || '', { fallbackToAll: true });
+  if (!promptTokens.length || !replyTokens.length) {
+    return 0;
+  }
+
+  const promptSet = new Set(promptTokens);
+  const replySet = new Set(replyTokens);
+  let shared = 0;
+  promptSet.forEach((token) => {
+    if (replySet.has(token)) {
+      shared += 1;
+    }
+  });
+
+  if (!shared) {
+    return 0;
+  }
+
+  const precision = shared / Math.max(replySet.size, 1);
+  const recall = shared / Math.max(promptSet.size, 1);
+  const harmonic = (2 * precision * recall) / Math.max(precision + recall, 1e-9);
+  const coverage = shared / Math.max(1, Math.min(promptSet.size, 4));
+  return Math.min(1, harmonic * 0.78 + coverage * 0.22);
 }
 
 function createChunksForDocument(documentEntry, chunkSize, chunkOverlap, allowedTerms) {
@@ -1016,13 +1199,7 @@ function buildHybridReply({
 }) {
   const selected = [];
 
-  if (bestReply?.responseText) {
-    appendUniqueSentences(
-      selected,
-      splitIntoSentences(bestReply.responseText).slice(0, 2),
-      maxSentences
-    );
-  }
+  appendUniqueSentences(selected, knowledgeSentences, maxSentences);
 
   if (neuralReply) {
     appendUniqueSentences(
@@ -1032,7 +1209,13 @@ function buildHybridReply({
     );
   }
 
-  appendUniqueSentences(selected, knowledgeSentences, maxSentences);
+  if ((bestReply?.score || 0) >= 0.32 && bestReply?.responseText) {
+    appendUniqueSentences(
+      selected,
+      splitIntoSentences(bestReply.responseText).slice(0, 2),
+      maxSentences
+    );
+  }
 
   return cleanText(selected.join(' '));
 }
@@ -1080,33 +1263,111 @@ async function fetchWebKnowledgeCandidates({
   userMessage,
   queryMap,
   runtimeConfig,
+  preferGroundedKnowledge = false,
 }) {
   if (!runtimeConfig.generation?.webSearchEnabled) {
     return [];
   }
 
-  const documents = await fetchSearchDocuments(userMessage, {
-    maxResults: Math.max(1, Number(runtimeConfig.generation.webSearchMaxResults) || 4),
-    fetchPages: Math.max(1, Number(runtimeConfig.generation.webSearchFetchPages) || 2),
-    timeoutMs: Math.max(2000, Number(runtimeConfig.generation.webSearchTimeoutMs) || 12000),
-    preferredDomains: runtimeConfig.generation.webSearchPreferredDomains || '',
-  });
+  const maxResults = Math.max(
+    1,
+    (Number(runtimeConfig.generation.webSearchMaxResults) || 4) + (preferGroundedKnowledge ? 2 : 0)
+  );
+  const fetchPages = Math.max(
+    1,
+    (Number(runtimeConfig.generation.webSearchFetchPages) || 2) + (preferGroundedKnowledge ? 1 : 0)
+  );
+  const timeoutMs = Math.max(2000, Number(runtimeConfig.generation.webSearchTimeoutMs) || 12000);
+  const preferredDomains = runtimeConfig.generation.webSearchPreferredDomains || '';
+  const searchMaxResults = preferredDomains ? Math.max(maxResults, 8) : maxResults;
+  const preferCyrillicSources = containsCyrillic(userMessage);
+  const preferredDomainList = parsePreferredDomainsList(preferredDomains);
+  const searchQueries = buildWebSearchQueries(userMessage, preferredDomains);
+  const documents = [];
+  const seenUrls = new Set();
+  const maxCollectedDocuments = Math.max(searchMaxResults, maxResults);
+  let hasPreferredDomainHit = false;
+
+  for (const query of searchQueries) {
+    if (
+      documents.length >= maxCollectedDocuments &&
+      (!preferredDomainList.length || hasPreferredDomainHit)
+    ) {
+      break;
+    }
+
+    const fetched = await fetchSearchDocuments(query, {
+      maxResults: searchMaxResults,
+      fetchPages,
+      timeoutMs,
+      preferredDomains,
+    });
+
+    fetched.forEach((entry) => {
+      if (!entry?.url || seenUrls.has(entry.url) || documents.length >= maxCollectedDocuments) {
+        return;
+      }
+      seenUrls.add(entry.url);
+      documents.push(entry);
+      if (isPreferredDomainUrl(entry.url, preferredDomainList)) {
+        hasPreferredDomainHit = true;
+      }
+    });
+  }
 
   if (!documents.length) {
     return [];
   }
 
-  const bm25 = buildBm25Index(documents.map(createExternalKnowledgeChunk));
-  return documents
+  const rankedDocuments = preferredDomainList.length
+    ? [...documents].sort((left, right) => {
+      const leftPreferred = isPreferredDomainUrl(left.url, preferredDomainList) ? 1 : 0;
+      const rightPreferred = isPreferredDomainUrl(right.url, preferredDomainList) ? 1 : 0;
+      return rightPreferred - leftPreferred;
+    })
+    : documents;
+
+  const mappedChunks = rankedDocuments
+    .slice(0, maxResults)
     .map(createExternalKnowledgeChunk)
     .filter((chunk) => !isNoisyWebChunk(chunk))
-    .map((chunk) => ({
-      ...chunk,
-      score: computeBm25Score(queryMap, chunk, bm25, runtimeConfig),
-    }))
+    .filter((chunk) => Boolean(chunk.text));
+  if (!mappedChunks.length) {
+    return [];
+  }
+
+  const bm25 = buildBm25Index(mappedChunks);
+  const scoredChunks = mappedChunks
+    .map((chunk) => {
+      const topicalRelevance = computePromptReplyRelevance(userMessage, chunk.text);
+      const languageBonus = preferCyrillicSources
+        ? (containsCyrillic(chunk.text) ? 0.25 : -0.18)
+        : 0;
+      return {
+        ...chunk,
+        topicalRelevance,
+        score:
+          computeBm25Score(queryMap, chunk, bm25, runtimeConfig) +
+          topicalRelevance * 0.55 +
+          languageBonus,
+      };
+    })
     .filter((chunk) => chunk.score > 0)
-    .sort((left, right) => right.score - left.score)
-    .slice(0, Math.max(1, Number(runtimeConfig.generation.webSearchFetchPages) || 2));
+    .sort((left, right) => right.score - left.score);
+  if (!scoredChunks.length) {
+    return [];
+  }
+
+  const languagePreferredChunks = preferCyrillicSources
+    ? scoredChunks.filter((chunk) => containsCyrillic(chunk.text))
+    : [];
+  const candidatePool = languagePreferredChunks.length ? languagePreferredChunks : scoredChunks;
+
+  const topicalGate = preferGroundedKnowledge ? 0.14 : 0.08;
+  const filteredChunks = candidatePool.filter((chunk) => chunk.topicalRelevance >= topicalGate);
+  const candidateChunks = filteredChunks.length ? filteredChunks : candidatePool.slice(0, 1);
+
+  return candidateChunks.slice(0, fetchPages);
 }
 
 function isPositiveMessageFeedback(metadata) {
@@ -1260,6 +1521,7 @@ function createTrainingCorpusSignature(state, artifacts, options = {}) {
   appendHash(hash, artifacts.sourceReplyMemories.length);
   appendHash(hash, artifacts.replayReplyMemories.length);
   appendHash(hash, artifacts.trainingTexts.length);
+  appendHash(hash, (artifacts.datasetFiles || []).length);
   appendHash(hash, artifacts.positiveFeedbackCount || 0);
   appendHash(hash, artifacts.negativeFeedbackCount || 0);
 
@@ -1283,6 +1545,13 @@ function createTrainingCorpusSignature(state, artifacts, options = {}) {
     appendHash(hash, pair.responseText);
   });
 
+  (artifacts.datasetFiles || []).forEach((fileDescriptor) => {
+    throwIfTrainingPreparationStopped(shouldStop);
+    appendHash(hash, fileDescriptor.path || fileDescriptor);
+    appendHash(hash, fileDescriptor.size || 0);
+    appendHash(hash, fileDescriptor.label || '');
+  });
+
   const settingsSnapshot = {
     ...buildTrainingSettingsSnapshot(state.settings.training),
     epochs: state.settings.training.epochs,
@@ -1302,6 +1571,23 @@ function resolveQueuedSources(state, options = {}) {
   return options.includeQueuedSources === false ? [] : state.sources;
 }
 
+function isDatasetFileSource(source = {}) {
+  return source?.type === 'dataset_file' && Boolean(cleanText(source?.contentPath || ''));
+}
+
+function collectDatasetFileDescriptors(sources = []) {
+  const descriptors = (Array.isArray(sources) ? sources : [])
+    .filter((source) => isDatasetFileSource(source))
+    .map((source) => ({
+      path: cleanText(source.contentPath || ''),
+      size: Math.max(Number(source.contentSize) || 0, 0),
+      label: cleanText(source.label || '') || 'dataset_file',
+    }))
+    .filter((entry) => entry.path);
+
+  return dedupeEntries(descriptors, (entry) => entry.path);
+}
+
 async function materializeTrainingSources(sources = [], options = {}) {
   const { shouldStop, onProgress } = options;
   const materialized = [];
@@ -1311,22 +1597,33 @@ async function materializeTrainingSources(sources = [], options = {}) {
   for (let index = 0; index < inputSources.length; index += 1) {
     throwIfTrainingPreparationStopped(shouldStop);
     const source = inputSources[index];
-    const content = source?.content
-      ? cleanText(source.content)
-      : await readTrainingQueueSourceContent(source);
-
-    if (content) {
+    if (isDatasetFileSource(source)) {
       materialized.push({
         ...source,
-        content,
+        content: '',
         stats: source.stats && typeof source.stats === 'object'
           ? source.stats
-          : computeStats(content),
-        contentSize: Math.max(
-          Number(source.contentSize) || 0,
-          Buffer.byteLength(content, 'utf8')
-        ),
+          : computeStats(''),
+        contentSize: Math.max(Number(source.contentSize) || 0, 0),
       });
+    } else {
+      const content = source?.content
+        ? cleanText(source.content)
+        : await readTrainingQueueSourceContent(source);
+
+      if (content) {
+        materialized.push({
+          ...source,
+          content,
+          stats: source.stats && typeof source.stats === 'object'
+            ? source.stats
+            : computeStats(content),
+          contentSize: Math.max(
+            Number(source.contentSize) || 0,
+            Buffer.byteLength(content, 'utf8')
+          ),
+        });
+      }
     }
 
     if (typeof onProgress === 'function') {
@@ -1356,18 +1653,20 @@ async function buildTrainingSessionArtifactsAsync(state, options = {}) {
     shouldStop,
     onProgress: progressCallback,
   });
+  const datasetFiles = collectDatasetFileDescriptors(materializedQueuedSources);
+  const textQueuedSources = materializedQueuedSources.filter((source) => !isDatasetFileSource(source));
   const sourceDocumentsRaw = [];
   const sourceReplyMemories = [];
-  for (let index = 0; index < materializedQueuedSources.length; index += 1) {
+  for (let index = 0; index < textQueuedSources.length; index += 1) {
     throwIfTrainingPreparationStopped(shouldStop);
-    const source = materializedQueuedSources[index];
+    const source = textQueuedSources[index];
     sourceDocumentsRaw.push(...buildSourceDocuments(source));
     sourceReplyMemories.push(...extractDialoguePairsFromSource(source));
     progressCallback?.({
       stage: 'extracting_dialogues',
       processedSources: index + 1,
-      totalSources: Math.max(materializedQueuedSources.length, 1),
-      percent: Number((((index + 1) / Math.max(materializedQueuedSources.length, 1)) * 100).toFixed(1)),
+      totalSources: Math.max(textQueuedSources.length, 1),
+      percent: Number((((index + 1) / Math.max(textQueuedSources.length, 1)) * 100).toFixed(1)),
       label: source.label || '',
     });
     await yieldToEventLoop();
@@ -1440,6 +1739,7 @@ async function buildTrainingSessionArtifactsAsync(state, options = {}) {
     sourceReplyMemories,
     replayReplyMemories,
     trainingTexts,
+    datasetFiles,
     positiveFeedbackCount,
     negativeFeedbackCount,
     trainingCorpusSignature: createTrainingCorpusSignature(state, {
@@ -1447,6 +1747,7 @@ async function buildTrainingSessionArtifactsAsync(state, options = {}) {
       sourceReplyMemories,
       replayReplyMemories,
       trainingTexts,
+      datasetFiles,
       positiveFeedbackCount,
       negativeFeedbackCount,
     }, {
@@ -1458,11 +1759,13 @@ async function buildTrainingSessionArtifactsAsync(state, options = {}) {
 function buildTrainingSessionArtifacts(state, options = {}) {
   const runtimeConfig = options.runtimeConfig || getRuntimeConfig();
   const queuedSources = resolveQueuedSources(state, options);
+  const datasetFiles = collectDatasetFileDescriptors(queuedSources);
+  const textQueuedSources = queuedSources.filter((source) => !isDatasetFileSource(source));
   const sourceDocuments = dedupeEntries(
-    queuedSources.flatMap((source) => buildSourceDocuments(source)),
+    textQueuedSources.flatMap((source) => buildSourceDocuments(source)),
     (entry) => `${entry.label}\u241f${entry.text}`
   );
-  const sourceReplyMemories = queuedSources.flatMap((source) => extractDialoguePairsFromSource(source));
+  const sourceReplyMemories = textQueuedSources.flatMap((source) => extractDialoguePairsFromSource(source));
   const storedReplyMemories = normalizeStoredReplyMemories(state.knowledge.replyMemories || []);
   const chatReplyMemories = state.chats.flatMap((chat) => extractDialoguePairsFromChat(chat));
   const blockedReplies = collectBlockedReplies(state);
@@ -1503,6 +1806,7 @@ function buildTrainingSessionArtifacts(state, options = {}) {
     sourceReplyMemories,
     replayReplyMemories,
     trainingTexts,
+    datasetFiles,
     positiveFeedbackCount,
     negativeFeedbackCount,
     trainingCorpusSignature: createTrainingCorpusSignature(state, {
@@ -1510,6 +1814,7 @@ function buildTrainingSessionArtifacts(state, options = {}) {
       sourceReplyMemories,
       replayReplyMemories,
       trainingTexts,
+      datasetFiles,
       positiveFeedbackCount,
       negativeFeedbackCount,
     }),
@@ -1530,8 +1835,21 @@ function buildKnowledgeArtifacts(state, options = {}) {
   const sourceDocuments = queuedSources.flatMap((source) => buildSourceDocuments(source));
   const uniqueSourceDocuments = dedupeEntries(sourceDocuments, (entry) => `${entry.label}\u241f${entry.text}`);
 
-  const sourceReplyMemories = queuedSources.flatMap((source) => extractDialoguePairsFromSource(source));
-  const chatReplyMemories = state.chats.flatMap((chat) => extractDialoguePairsFromChat(chat));
+  const dialogueMemoryConfig = runtimeConfig.dialogueMemory || {};
+  const useSourceDialogues = dialogueMemoryConfig.useSourceDialogues !== false;
+  const useChatDialogues = dialogueMemoryConfig.useChatDialogues === true;
+  const responseOnlyIndex = dialogueMemoryConfig.responseOnlyIndex !== false;
+  const minPairTopicalRelevance = Math.min(
+    0.95,
+    Math.max(0.02, Number(dialogueMemoryConfig.minPairTopicalRelevance) || 0.1)
+  );
+
+  const sourceReplyMemories = useSourceDialogues
+    ? queuedSources.flatMap((source) => extractDialoguePairsFromSource(source))
+    : [];
+  const chatReplyMemories = useChatDialogues
+    ? state.chats.flatMap((chat) => extractDialoguePairsFromChat(chat))
+    : [];
   const storedReplyMemories = normalizeStoredReplyMemories(state.knowledge.replyMemories || []);
   const blockedReplies = collectBlockedReplies(state);
 
@@ -1544,6 +1862,7 @@ function buildKnowledgeArtifacts(state, options = {}) {
       responseText: sanitizeReplyText(pair.responseText),
     }))
     .filter((pair) => pair.promptText && pair.responseText)
+    .filter((pair) => computePromptReplyRelevance(pair.promptText, pair.responseText) >= minPairTopicalRelevance)
     .filter((pair) => !blockedReplies.has(pair.responseText.toLowerCase()))
     .filter((pair) => !isEchoReply(pair.promptText, pair.responseText));
 
@@ -1579,6 +1898,7 @@ function buildKnowledgeArtifacts(state, options = {}) {
       responseText: sanitizeReplyText(pair.responseText),
     }))
     .filter((pair) => pair.promptText && pair.responseText)
+    .filter((pair) => computePromptReplyRelevance(pair.promptText, pair.responseText) >= minPairTopicalRelevance)
     .filter((pair) => !blockedReplies.has(pair.responseText.toLowerCase()))
     .filter((pair) => !isEchoReply(pair.promptText, pair.responseText));
 
@@ -1655,11 +1975,13 @@ function buildKnowledgeArtifacts(state, options = {}) {
       (entry) => `${entry.label}\u241f${entry.text}`
     );
     const indexedReplyMemories = replyMemories.map((memory) => {
-      const promptTokens = tokenizeWords(memory.promptText);
+      const indexedTokens = responseOnlyIndex
+        ? tokenizeWords(memory.responseText)
+        : [...tokenizeWords(memory.promptText), ...tokenizeWords(memory.responseText)];
       return {
         ...memory,
-        termMap: createTermMap(promptTokens, allowedTerms),
-        documentLength: promptTokens.length,
+        termMap: createTermMap(indexedTokens, allowedTerms),
+        documentLength: indexedTokens.length,
       };
     });
 
@@ -1707,8 +2029,10 @@ function buildKnowledgeArtifacts(state, options = {}) {
 }
 
 function selectContextMessages(chat, userMessage, runtimeConfig) {
+  const includeAssistantMessages = runtimeConfig.context?.includeAssistantMessages !== false;
   const messages = chat.messages
     .filter((message) => message.metadata?.type !== 'system')
+    .filter((message) => includeAssistantMessages || message.role !== 'assistant')
     .filter((message) => cleanText(message.content))
     .map((message, index) => ({
       ...message,
@@ -1716,11 +2040,11 @@ function selectContextMessages(chat, userMessage, runtimeConfig) {
     }));
 
   const recentMessages = messages.slice(-12);
-  const queryTokens = new Set(tokenizeWords(userMessage));
+  const queryTokens = new Set(extractQueryTokens(userMessage, { fallbackToAll: true }));
   const scored = messages
     .filter((message) => message.content !== userMessage)
     .map((message) => {
-      const tokens = tokenizeWords(message.content);
+      const tokens = extractQueryTokens(message.content, { fallbackToAll: false });
       let lexicalScore = 0;
       tokens.forEach((token) => {
         if (queryTokens.has(token)) {
@@ -1737,7 +2061,7 @@ function selectContextMessages(chat, userMessage, runtimeConfig) {
         score:
           lexicalScore * 1.15 +
           recencyWeight * 1.6 +
-          (message.role === 'assistant' ? 0.12 : 0.28),
+          (message.role === 'assistant' ? 0.08 : 0.28),
       };
     })
     .sort((left, right) => right.score - left.score)
@@ -1772,7 +2096,11 @@ function selectContextMessages(chat, userMessage, runtimeConfig) {
 
 function buildWeightedQueryMap(userMessage, chat, runtimeConfig) {
   const queryMap = {};
-  addWeightedTokens(queryMap, tokenizeWords(userMessage), 3);
+  addWeightedTokens(
+    queryMap,
+    extractQueryTokens(userMessage, { fallbackToAll: true }),
+    3
+  );
 
   const contextMessages = selectContextMessages(chat, userMessage, runtimeConfig);
   const reversedContext = [...contextMessages].reverse();
@@ -1780,8 +2108,19 @@ function buildWeightedQueryMap(userMessage, chat, runtimeConfig) {
     const roleWeight = message.role === 'assistant'
       ? runtimeConfig.context.assistantWeight
       : runtimeConfig.context.userWeight;
-    const weight = roleWeight * Math.pow(runtimeConfig.context.decay, index);
-    addWeightedTokens(queryMap, tokenizeWords(message.content), weight);
+    const topicalAlignment = computePromptReplyRelevance(userMessage, message.content);
+    const relevanceWeight = topicalAlignment > 0
+      ? 0.35 + Math.min(topicalAlignment * 1.35, 1)
+      : 0;
+    if (relevanceWeight <= 0) {
+      return;
+    }
+    const weight = roleWeight * Math.pow(runtimeConfig.context.decay, index) * relevanceWeight;
+    addWeightedTokens(
+      queryMap,
+      extractQueryTokens(message.content, { fallbackToAll: true }),
+      weight
+    );
   });
 
   return {
@@ -1790,8 +2129,22 @@ function buildWeightedQueryMap(userMessage, chat, runtimeConfig) {
   };
 }
 
-function buildPromptForGeneration(userMessage, contextMessages, chunkCandidates, replyCandidates) {
+function buildPromptForGeneration(userMessage, contextMessages, chunkCandidates, replyCandidates, userLanguage = 'auto') {
   const promptParts = ['__bos__', '__ctx__'];
+  const runtimeConfig = getRuntimeConfig();
+  const normalizedSystemPrompt = cleanText(runtimeConfig.generation?.systemPrompt || '');
+
+  if (normalizedSystemPrompt) {
+    promptParts.push(`Системная инструкция: ${normalizedSystemPrompt.slice(0, 900)}`);
+    promptParts.push('__sep__');
+  }
+  if (userLanguage === 'ru') {
+    promptParts.push('Язык ответа: русский. Термины в коде можно оставлять на английском.');
+    promptParts.push('__sep__');
+  } else if (userLanguage === 'en') {
+    promptParts.push('Response language: English.');
+    promptParts.push('__sep__');
+  }
 
   chunkCandidates.slice(0, 4).forEach((chunk) => {
     promptParts.push(chunk.text);
@@ -1905,11 +2258,11 @@ function computeSelfScore({
 
   const groundedTexts = [
     ...chunkCandidates.map((chunk) => chunk.text),
-    ...replyCandidates.map((pair) => pair.responseText),
-    ...contextMessages.map((message) => message.content),
+    ...replyCandidates.slice(0, 3).map((pair) => pair.responseText),
   ];
 
   const groundedOverlap = computeGroundedOverlap(replyTokens, groundedTexts);
+  const topicalAlignment = computePromptReplyRelevance(userMessage, cleanReply);
   const lengthScore = Math.min(replyTokens.length / 18, 1);
   const echoPenalty = isEchoReply(userMessage, cleanReply) ? 0.55 : 0;
   const loopPenalty = hasLoopingPattern(replyTokens) ? 0.4 : 0;
@@ -1920,43 +2273,64 @@ function computeSelfScore({
     0,
     Math.min(
       1,
-      0.28 + groundedOverlap * 0.5 + lengthScore * 0.22
+      0.16 + groundedOverlap * 0.46 + topicalAlignment * 0.3 + lengthScore * 0.14
       - echoPenalty - loopPenalty - questionPenalty - repeatPenalty
     )
   );
 }
 
+function computeLowTopicalPenalty(relevanceScore) {
+  if (relevanceScore < 0.12) {
+    return 0.34;
+  }
+  if (relevanceScore < 0.2) {
+    return 0.16;
+  }
+  return 0;
+}
+
 function chooseBestReplyCandidate({
   userMessage,
+  userLanguage = 'auto',
   neuralReply,
   bestReply,
   knowledgeText,
   knowledgeSentences,
   maxSentences,
   chunkCandidates,
+  webChunkCandidates = [],
   replyCandidates,
   contextMessages,
   recentAssistantReplies = [],
+  preferGroundedKnowledge = false,
 }) {
   const candidates = [];
 
   if (bestReply) {
     const content = sanitizeReplyText(bestReply.responseText);
-    candidates.push({
-      mode: 'reply_memory',
-      content,
-      score: computeSelfScore({
-        userMessage,
-        replyText: content,
-        chunkCandidates,
-        replyCandidates,
-        contextMessages,
-        recentAssistantReplies,
-      }) + bestReply.score * 0.08,
-    });
+    const promptSideRelevance = computePromptReplyRelevance(userMessage, bestReply.promptText);
+    const responseSideRelevance = computePromptReplyRelevance(userMessage, content);
+    const topicalRelevance = responseSideRelevance * 0.78 + promptSideRelevance * 0.22;
+    const memoryPenalty = computeLowTopicalPenalty(topicalRelevance);
+    if (responseSideRelevance >= 0.08) {
+      candidates.push({
+        mode: 'reply_memory',
+        content,
+        score: computeSelfScore({
+          userMessage,
+          replyText: content,
+          chunkCandidates,
+          replyCandidates,
+          contextMessages,
+          recentAssistantReplies,
+        }) + bestReply.score * 0.03 + topicalRelevance * 0.46 - memoryPenalty - (preferGroundedKnowledge ? 0.2 : 0)
+          - languageMismatchPenalty(userLanguage, content),
+      });
+    }
   }
 
   if (knowledgeText) {
+    const topicalRelevance = computePromptReplyRelevance(userMessage, knowledgeText);
     candidates.push({
       mode: 'knowledge',
       content: cleanText(knowledgeText),
@@ -1967,7 +2341,8 @@ function chooseBestReplyCandidate({
         replyCandidates,
         contextMessages,
         recentAssistantReplies,
-      }),
+      }) + topicalRelevance * 0.34 - computeLowTopicalPenalty(topicalRelevance) + (preferGroundedKnowledge ? 0.1 : 0)
+        - languageMismatchPenalty(userLanguage, knowledgeText),
     });
   }
 
@@ -1979,6 +2354,7 @@ function chooseBestReplyCandidate({
   });
 
   if (hybridReply) {
+    const topicalRelevance = computePromptReplyRelevance(userMessage, hybridReply);
     candidates.push({
       mode: 'hybrid',
       content: hybridReply,
@@ -1989,11 +2365,13 @@ function chooseBestReplyCandidate({
         replyCandidates,
         contextMessages,
         recentAssistantReplies,
-      }) + (bestReply ? 0.06 : 0),
+      }) + (bestReply ? 0.02 : 0) + topicalRelevance * 0.34 - computeLowTopicalPenalty(topicalRelevance) - (preferGroundedKnowledge ? 0.14 : 0)
+        - languageMismatchPenalty(userLanguage, hybridReply),
     });
   }
 
   if (neuralReply) {
+    const topicalRelevance = computePromptReplyRelevance(userMessage, neuralReply);
     candidates.push({
       mode: 'neural',
       content: neuralReply,
@@ -2004,12 +2382,35 @@ function chooseBestReplyCandidate({
         replyCandidates,
         contextMessages,
         recentAssistantReplies,
-      }) + 0.04,
+      }) + 0.02 + topicalRelevance * 0.28 - computeLowTopicalPenalty(topicalRelevance) - (preferGroundedKnowledge ? 0.24 : 0)
+        - languageMismatchPenalty(userLanguage, neuralReply),
     });
   }
 
+  if (webChunkCandidates.length) {
+    const webGrounded = buildGroundedFallback(webChunkCandidates, maxSentences);
+    if (webGrounded) {
+      const topicalRelevance = computePromptReplyRelevance(userMessage, webGrounded);
+      candidates.push({
+        mode: 'web_grounded',
+        content: webGrounded,
+        score: computeSelfScore({
+          userMessage,
+          replyText: webGrounded,
+          chunkCandidates,
+          replyCandidates,
+          contextMessages,
+          recentAssistantReplies,
+        }) + 0.14 + topicalRelevance * 0.52 - (topicalRelevance < 0.12 ? 0.08 : 0) + (preferGroundedKnowledge ? 0.22 : 0)
+          - languageMismatchPenalty(userLanguage, webGrounded),
+      });
+    }
+  }
+
+  const minimumRelevance = preferGroundedKnowledge ? 0.16 : 0.1;
   const filtered = candidates
     .filter((candidate) => candidate.content)
+    .filter((candidate) => computePromptReplyRelevance(userMessage, candidate.content) >= minimumRelevance)
     .filter((candidate) => !isEchoReply(userMessage, candidate.content))
     .filter((candidate) => computeRecentReplyPenalty(candidate.content, recentAssistantReplies) < 0.42)
     .sort((left, right) => right.score - left.score);
@@ -3284,13 +3685,15 @@ function markQueueAsRunning(state, queueId) {
       }
 
       const trainingTexts = initialTrainingArtifacts.trainingTexts;
+      const datasetFiles = initialTrainingArtifacts.datasetFiles || [];
 
-      if (!trainingTexts.length) {
+      if (!trainingTexts.length && !datasetFiles.length) {
         throw new Error('Для обучения не хватает данных. Добавьте источники или диалоговые пары.');
       }
 
       log('info', 'Training corpus prepared for worker startup.', {
         trainingTextCount: trainingTexts.length,
+        datasetFileCount: datasetFiles.length,
         sourceDocumentCount: initialTrainingArtifacts.sourceDocuments.length,
         replayPairCount: initialTrainingArtifacts.replayReplyMemories.length,
       });
@@ -3337,6 +3740,12 @@ function markQueueAsRunning(state, queueId) {
       const manifest = buildTrainingManifest(initialState, initialTrainingArtifacts);
       trainingPayloadPath = await createTrainingJobPayloadFile({
         trainingTexts,
+        datasetFiles: datasetFiles.map((entry) => entry.path || entry).filter(Boolean),
+        datasetOptions: {
+          maxRecordsPerFile: MAX_DATASET_RECORDS_PER_FILE,
+          maxCharsPerRecord: MAX_DATASET_CHARS_PER_RECORD,
+          parquetBatchSize: DATASET_PARQUET_BATCH_SIZE,
+        },
       });
       trainingPayloadPathForCleanup = trainingPayloadPath;
 
@@ -3837,23 +4246,52 @@ function markQueueAsRunning(state, queueId) {
 
   async function renderReply({ state, chat, userMessage }) {
     const runtimeConfig = getRuntimeConfig();
+    const userLanguage = detectMessageLanguage(userMessage);
     const { queryMap, contextMessages } = buildWeightedQueryMap(userMessage, chat, runtimeConfig);
-    const recentAssistantReplies = contextMessages
+    const recentAssistantReplies = (chat.messages || [])
       .filter((message) => message.role === 'assistant')
+      .filter((message) => message.metadata?.type !== 'system')
       .slice(-4)
       .map((message) => sanitizeReplyText(message.content))
       .filter(Boolean);
     const blockedReplies = new Set((state.knowledge.blockedReplies || []).map((value) => value.toLowerCase()));
+    const minSimilarity = Math.max(Number(state.settings.training.minSimilarity) || 0, 0);
+    const dialogueMemoryConfig = runtimeConfig.dialogueMemory || {};
+    const strongMatchThreshold = Math.max(
+      minSimilarity,
+      Number(dialogueMemoryConfig.strongMatchThreshold) || 1.08
+    );
+    const softMatchThreshold = Math.max(
+      minSimilarity,
+      Number(dialogueMemoryConfig.softMatchThreshold) || 0.62
+    );
+    const preferGroundedKnowledge = isTechnicalOrMathQuery(userMessage);
+    const topicalGate = Math.max(0.08, minSimilarity * 0.75, preferGroundedKnowledge ? 0.14 : 0);
 
     const replyCandidates = (state.knowledge.replyMemories || [])
-      .map((memory) => ({
-        ...memory,
-        score:
-          computeBm25Score(queryMap, memory, state.knowledge.bm25.reply, runtimeConfig) *
-          runtimeConfig.retrieval.assistantReplyBoost *
-          (1 + (memory.score || 0) * 0.15),
-      }))
-      .filter((memory) => memory.score >= state.settings.training.minSimilarity)
+      .map((memory) => {
+        const promptSideRelevance = computePromptReplyRelevance(userMessage, memory.promptText);
+        const responseSideRelevance = computePromptReplyRelevance(userMessage, memory.responseText);
+        const topicalRelevance = responseSideRelevance * 0.78 + promptSideRelevance * 0.22;
+
+        return {
+          ...memory,
+          promptSideRelevance,
+          responseSideRelevance,
+          topicalRelevance,
+          sourcePenalty: memory.origin === 'source' ? 0.16 : 0,
+          score:
+            computeBm25Score(queryMap, memory, state.knowledge.bm25.reply, runtimeConfig) *
+            runtimeConfig.retrieval.assistantReplyBoost *
+            (1 + (memory.score || 0) * 0.15) +
+            topicalRelevance * 0.72 +
+            responseSideRelevance * 0.2 -
+            (memory.origin === 'source' ? 0.16 : 0),
+        };
+      })
+      .filter((memory) => memory.score >= softMatchThreshold)
+      .filter((memory) => memory.topicalRelevance >= topicalGate)
+      .filter((memory) => memory.responseSideRelevance >= (preferGroundedKnowledge ? 0.12 : 0.06))
       .filter((memory) => !blockedReplies.has(memory.responseText.toLowerCase()))
       .filter((memory) => !isEchoReply(userMessage, memory.responseText))
       .filter((memory) => computeRecentReplyPenalty(memory.responseText, recentAssistantReplies) < 0.42)
@@ -3861,33 +4299,69 @@ function markQueueAsRunning(state, queueId) {
       .slice(0, runtimeConfig.retrieval.topReplyPairs);
 
     const localChunkCandidates = (state.knowledge.chunks || [])
-      .map((chunk) => ({
-        ...chunk,
-        score:
-          computeBm25Score(queryMap, chunk, state.knowledge.bm25.knowledge, runtimeConfig) *
-          runtimeConfig.retrieval.knowledgeChunkBoost,
-      }))
+      .map((chunk) => {
+        const topicalRelevance = computePromptReplyRelevance(userMessage, chunk.text);
+        return {
+          ...chunk,
+          topicalRelevance,
+          score:
+            computeBm25Score(queryMap, chunk, state.knowledge.bm25.knowledge, runtimeConfig) *
+            runtimeConfig.retrieval.knowledgeChunkBoost +
+            topicalRelevance * 0.45,
+        };
+      })
       .filter((chunk) => chunk.score > 0)
+      .filter((chunk) => chunk.topicalRelevance >= topicalGate)
       .sort((left, right) => right.score - left.score)
       .slice(0, state.settings.training.topKChunks);
 
-    const bestReply = replyCandidates[0] || null;
+    const bestReply = replyCandidates.find((memory) => memory.score >= strongMatchThreshold) || null;
+    const topLocalChunkScore = Number(localChunkCandidates[0]?.score || 0);
+    const localTopicalRelevance = Math.max(
+      Number(bestReply?.topicalRelevance || 0),
+      Number(localChunkCandidates[0]?.topicalRelevance || 0)
+    );
+    const localEvidenceScore = Math.max(Number(bestReply?.score || 0), topLocalChunkScore);
+    const weakLocalEvidence =
+      localEvidenceScore < Math.max(0.24, minSimilarity * 1.35) ||
+      localTopicalRelevance < Math.max(0.14, topicalGate);
     let webChunkCandidates = [];
 
-    if (
-      runtimeConfig.generation?.webSearchEnabled &&
-      !shouldSkipWebSearchForMessage(userMessage) &&
-      (!bestReply || localChunkCandidates.length < 2)
-    ) {
-      try {
-        webChunkCandidates = await fetchWebKnowledgeCandidates({
-          userMessage,
-          queryMap,
-          runtimeConfig,
-        });
-      } catch (_error) {
+    if (runtimeConfig.generation?.webSearchEnabled && !shouldSkipWebSearchForMessage(userMessage)) {
+      const forceWebSearch = shouldForceWebSearchForMessage(userMessage);
+      const shouldUseWebSearch =
+        forceWebSearch || preferGroundedKnowledge || weakLocalEvidence || !bestReply || localChunkCandidates.length < 2;
+      if (!shouldUseWebSearch) {
         webChunkCandidates = [];
+      } else {
+        try {
+          webChunkCandidates = await fetchWebKnowledgeCandidates({
+            userMessage,
+            queryMap,
+            runtimeConfig,
+            preferGroundedKnowledge,
+          });
+        } catch (error) {
+          log('warn', 'Web search failed, continuing with local evidence.', {
+            scope: 'generation',
+            reason: cleanText(error?.message || ''),
+            promptPreview: previewText(userMessage, 72),
+          });
+          webChunkCandidates = [];
+        }
       }
+    }
+
+    if (webChunkCandidates.length && preferGroundedKnowledge) {
+      webChunkCandidates = webChunkCandidates.map((chunk) => ({
+        ...chunk,
+        score: chunk.score * 1.42,
+      }));
+    } else if (webChunkCandidates.length && weakLocalEvidence) {
+      webChunkCandidates = webChunkCandidates.map((chunk) => ({
+        ...chunk,
+        score: chunk.score * 1.28,
+      }));
     }
 
     const chunkCandidates = [...localChunkCandidates, ...webChunkCandidates]
@@ -3902,8 +4376,11 @@ function markQueueAsRunning(state, queueId) {
     const knowledgeText = knowledgeSentences.join(' ');
 
     let neuralReply = '';
+    const allowNeuralGeneration =
+      shouldUseNeuralGeneration({ bestReply, knowledgeSentences, state }) &&
+      !(preferGroundedKnowledge && chunkCandidates.length > 0);
 
-    if (shouldUseNeuralGeneration({ bestReply, knowledgeSentences, state })) {
+    if (allowNeuralGeneration) {
       try {
         await ensureRuntimeLoaded(state);
         if (neuralRuntime?.model) {
@@ -3911,7 +4388,8 @@ function markQueueAsRunning(state, queueId) {
             userMessage,
             contextMessages,
             chunkCandidates,
-            replyCandidates
+            replyCandidates,
+            userLanguage
           );
           const runtimeAlignedSettings = neuralRuntime.manifest?.modelSettings
             ? {
@@ -3934,18 +4412,42 @@ function markQueueAsRunning(state, queueId) {
       }
     }
 
-    const candidate = chooseBestReplyCandidate({
+    let candidate = chooseBestReplyCandidate({
       userMessage,
+      userLanguage,
       neuralReply,
       bestReply,
       knowledgeText,
       knowledgeSentences,
       maxSentences: state.settings.generation.maxReplySentences,
       chunkCandidates,
+      webChunkCandidates,
       replyCandidates,
       contextMessages,
       recentAssistantReplies,
+      preferGroundedKnowledge,
     });
+
+    if (
+      candidate &&
+      preferGroundedKnowledge &&
+      ['neural', 'reply_memory', 'hybrid'].includes(candidate.mode)
+    ) {
+      const groundedCandidateText = buildGroundedFallback(
+        chunkCandidates,
+        state.settings.generation.maxReplySentences
+      );
+      if (groundedCandidateText) {
+        const groundedRelevance = computePromptReplyRelevance(userMessage, groundedCandidateText);
+        const candidateRelevance = computePromptReplyRelevance(userMessage, candidate.content);
+        if (groundedRelevance >= candidateRelevance + 0.06) {
+          candidate = {
+            mode: webChunkCandidates.length ? 'web_grounded' : 'knowledge',
+            content: groundedCandidateText,
+          };
+        }
+      }
+    }
 
     if (!candidate) {
       const groundedFallback = buildGroundedFallback(
@@ -3981,8 +4483,12 @@ function markQueueAsRunning(state, queueId) {
         };
       }
 
+      const fallbackMessage = runtimeConfig.generation?.webSearchEnabled
+        ? 'Надежный ответ не найден ни в локальной базе, ни в веб-источниках. Уточните вопрос (например, версию языка, фреймворк или конкретную задачу).'
+        : 'Пока в базе знаний не нашлось достаточно надежного ответа. Включите веб-поиск или добавьте профильные источники и переобучите модель.';
+
       return {
-        content: 'Пока в базе знаний не нашлось достаточно сильного ответа по этому запросу. Добавьте больше данных, оцените хорошие ответы и повторите обучение.',
+        content: fallbackMessage,
         metadata: {
           mode: 'fallback',
           usedContextMessages: contextMessages.length,
@@ -4268,6 +4774,23 @@ function markQueueAsRunning(state, queueId) {
     async addSourcesToTrainingQueue(queueId, sources) {
       const preparedSources = [];
       for (const source of sources) {
+        const datasetPath = cleanText(source.datasetFilePath || '');
+        if (datasetPath) {
+          preparedSources.push({
+            id: createId('queued_source'),
+            type: 'dataset_file',
+            label: cleanText(source.label || '') || path.basename(datasetPath),
+            url: source.url || null,
+            stats: source.stats && typeof source.stats === 'object'
+              ? source.stats
+              : computeStats(''),
+            addedAt: nowIso(),
+            contentPath: datasetPath,
+            contentSize: Math.max(Number(source.contentSize) || 0, 0),
+          });
+          continue;
+        }
+
         const text = cleanText(source.content);
         if (!text) {
           continue;

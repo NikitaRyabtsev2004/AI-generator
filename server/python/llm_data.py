@@ -11,6 +11,11 @@ import tensorflow as tf
 from llm_tokenizer import SimpleSubwordTokenizer, normalize_text
 
 
+DEFAULT_MAX_DATASET_RECORDS_PER_FILE = 250_000
+DEFAULT_MAX_CHARS_PER_RECORD = 12_000
+DEFAULT_PARQUET_BATCH_SIZE = 256
+
+
 @dataclass
 class TokenizedDocument:
     token_ids: List[int]
@@ -30,6 +35,27 @@ class DatasetBundle:
     training_sample_count: int
     validation_sample_count: int
     batches_per_epoch: int
+
+
+def _safe_int(value, fallback: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    if parsed <= 0:
+        return fallback
+    return parsed
+
+
+def resolve_dataset_options(options: Dict[str, object] | None = None) -> Dict[str, object]:
+    payload = options if isinstance(options, dict) else {}
+    parquet_columns = payload.get("parquetColumns")
+    return {
+        "maxRecordsPerFile": _safe_int(payload.get("maxRecordsPerFile"), DEFAULT_MAX_DATASET_RECORDS_PER_FILE),
+        "maxCharsPerRecord": _safe_int(payload.get("maxCharsPerRecord"), DEFAULT_MAX_CHARS_PER_RECORD),
+        "parquetBatchSize": _safe_int(payload.get("parquetBatchSize"), DEFAULT_PARQUET_BATCH_SIZE),
+        "parquetColumns": [str(value) for value in parquet_columns] if isinstance(parquet_columns, list) else None,
+    }
 
 
 def flatten_json_value(value, prefix: str = "") -> List[str]:
@@ -54,20 +80,59 @@ def flatten_json_value(value, prefix: str = "") -> List[str]:
     return [f"{prefix}: {text}" if prefix else text]
 
 
-def iter_texts_from_json(path: Path) -> Iterator[str]:
+def _compose_flattened_text(entry: object, max_chars_per_record: int) -> str:
+    lines = flatten_json_value(entry)
+    text = normalize_text("\n".join(lines))
+    if not text:
+        return ""
+    return text[: max(64, max_chars_per_record)]
+
+
+def iter_texts_from_json(path: Path, options: Dict[str, object]) -> Iterator[str]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     entries = payload if isinstance(payload, list) else [payload]
+    max_records = int(options["maxRecordsPerFile"])
+    max_chars = int(options["maxCharsPerRecord"])
+    yielded = 0
     for entry in entries:
-        text = "\n".join(flatten_json_value(entry))
-        normalized = normalize_text(text)
-        if normalized:
-            yield normalized
+        if yielded >= max_records:
+            break
+        text = _compose_flattened_text(entry, max_chars)
+        if text:
+            yielded += 1
+            yield text
 
 
-def iter_texts_from_csv(path: Path) -> Iterator[str]:
-    with path.open("r", encoding="utf-8", newline="") as handle:
+def iter_texts_from_jsonl(path: Path, options: Dict[str, object]) -> Iterator[str]:
+    max_records = int(options["maxRecordsPerFile"])
+    max_chars = int(options["maxCharsPerRecord"])
+    yielded = 0
+    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for raw_line in handle:
+            if yielded >= max_records:
+                break
+            line = normalize_text(raw_line)
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+                text = _compose_flattened_text(payload, max_chars)
+            except Exception:
+                text = line[: max(64, max_chars)]
+            if text:
+                yielded += 1
+                yield text
+
+
+def iter_texts_from_csv(path: Path, options: Dict[str, object]) -> Iterator[str]:
+    max_records = int(options["maxRecordsPerFile"])
+    max_chars = int(options["maxCharsPerRecord"])
+    yielded = 0
+    with path.open("r", encoding="utf-8", newline="", errors="ignore") as handle:
         reader = csv.DictReader(handle)
         for row in reader:
+            if yielded >= max_records:
+                break
             lines = []
             for key, value in row.items():
                 key_text = normalize_text(str(key))
@@ -76,19 +141,49 @@ def iter_texts_from_csv(path: Path) -> Iterator[str]:
                     lines.append(f"{key_text}: {value_text}" if key_text else value_text)
             text = normalize_text("\n".join(lines))
             if text:
+                yielded += 1
+                yield text[: max(64, max_chars)]
+
+
+def iter_texts_from_parquet(path: Path, options: Dict[str, object]) -> Iterator[str]:
+    max_records = int(options["maxRecordsPerFile"])
+    max_chars = int(options["maxCharsPerRecord"])
+    batch_size = int(options["parquetBatchSize"])
+    columns = options.get("parquetColumns")
+    yielded = 0
+
+    try:
+        import pyarrow.parquet as pq  # pylint: disable=import-outside-toplevel
+    except Exception:
+        return iter(())
+
+    parquet_file = pq.ParquetFile(path)
+    for batch in parquet_file.iter_batches(batch_size=batch_size, columns=columns):
+        for row in batch.to_pylist():
+            if yielded >= max_records:
+                return
+            text = _compose_flattened_text(row, max_chars)
+            if text:
+                yielded += 1
                 yield text
 
 
-def iter_texts_from_txt(path: Path) -> Iterator[str]:
+def iter_texts_from_txt(path: Path, options: Dict[str, object]) -> Iterator[str]:
+    max_records = int(options["maxRecordsPerFile"])
+    max_chars = int(options["maxCharsPerRecord"])
+    yielded = 0
     with path.open("r", encoding="utf-8", errors="ignore") as handle:
         for line in handle:
+            if yielded >= max_records:
+                break
             text = normalize_text(line)
             if text:
-                yield text
+                yielded += 1
+                yield text[: max(64, max_chars)]
 
 
-def load_texts_from_dataset_files(paths: Sequence[str]) -> List[str]:
-    result: List[str] = []
+def iter_texts_from_dataset_files(paths: Sequence[str], options: Dict[str, object] | None = None) -> Iterator[str]:
+    resolved_options = resolve_dataset_options(options)
     for raw in paths:
         source_path = Path(raw)
         if not source_path.exists() or not source_path.is_file():
@@ -97,14 +192,21 @@ def load_texts_from_dataset_files(paths: Sequence[str]) -> List[str]:
         suffix = source_path.suffix.lower()
         try:
             if suffix == ".json":
-                result.extend(iter_texts_from_json(source_path))
+                yield from iter_texts_from_json(source_path, resolved_options)
+            elif suffix == ".jsonl" or suffix == ".ndjson":
+                yield from iter_texts_from_jsonl(source_path, resolved_options)
             elif suffix == ".csv":
-                result.extend(iter_texts_from_csv(source_path))
+                yield from iter_texts_from_csv(source_path, resolved_options)
+            elif suffix == ".parquet":
+                yield from iter_texts_from_parquet(source_path, resolved_options)
             else:
-                result.extend(iter_texts_from_txt(source_path))
+                yield from iter_texts_from_txt(source_path, resolved_options)
         except Exception:
             continue
-    return result
+
+
+def load_texts_from_dataset_files(paths: Sequence[str], options: Dict[str, object] | None = None) -> List[str]:
+    return list(iter_texts_from_dataset_files(paths, options))
 
 
 def clean_text_stream(texts: Iterable[str], min_chars: int = 8, max_chars: int = 12000) -> Iterator[str]:
@@ -135,7 +237,7 @@ def build_windows(token_ids: Sequence[int], context_length: int, stride: int) ->
 
 
 def prepare_tokenized_corpus(
-    texts: Sequence[str],
+    texts: Iterable[str],
     tokenizer: SimpleSubwordTokenizer,
     context_length: int,
     max_tokens_per_text: int = 4096,
@@ -236,13 +338,20 @@ def create_datasets(
     )
 
 
-def collect_texts(payload: Dict[str, object]) -> List[str]:
+def iter_collected_texts(payload: Dict[str, object]) -> Iterator[str]:
     inline = payload.get("trainingTexts")
     inline_texts = inline if isinstance(inline, list) else []
     dataset_files = payload.get("datasetFiles")
     dataset_paths = dataset_files if isinstance(dataset_files, list) else []
+    dataset_options = payload.get("datasetOptions")
+    options = dataset_options if isinstance(dataset_options, dict) else {}
 
-    all_texts = []
-    all_texts.extend(str(item) for item in inline_texts if isinstance(item, str))
-    all_texts.extend(load_texts_from_dataset_files([str(path) for path in dataset_paths]))
-    return list(clean_text_stream(all_texts))
+    for item in inline_texts:
+        if isinstance(item, str):
+            yield item
+
+    yield from iter_texts_from_dataset_files([str(path) for path in dataset_paths], options)
+
+
+def collect_texts(payload: Dict[str, object]) -> List[str]:
+    return list(clean_text_stream(iter_collected_texts(payload)))

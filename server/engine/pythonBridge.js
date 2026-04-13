@@ -7,7 +7,9 @@ const { log, logError } = require('../lib/logger');
 
 const PYTHON_DIR = path.join(__dirname, '..', 'python');
 const VENV_DIR = path.join(PYTHON_DIR, '.venv');
+const GPU_VENV_DIR = path.join(PYTHON_DIR, '.venv2');
 const REQUIREMENTS_PATH = path.join(PYTHON_DIR, 'requirements.txt');
+const GPU_REQUIREMENTS_PATH = path.join(PYTHON_DIR, 'requirements.windows-gpu.txt');
 const BACKEND_SCRIPT_PATH = path.join(PYTHON_DIR, 'keras_llm_backend.py');
 const DEFAULT_TIMEOUT_MS = 120000;
 const TENSORFLOW_PROBE_TIMEOUT_MS = 180000;
@@ -90,12 +92,15 @@ async function getBundledVenvPythonCandidates() {
   const out = [];
 
   if (process.platform === 'win32') {
-    const exe = path.join(pythonDir, '.venv', 'Scripts', 'python.exe');
-    try {
-      await fs.access(exe);
-      out.push({ command: exe, argsPrefix: [] });
-    } catch (_error) {
-      // No project venv yet.
+    const preferredVenvDirs = ['.venv2', '.venv'];
+    for (const venvDir of preferredVenvDirs) {
+      const exe = path.join(pythonDir, venvDir, 'Scripts', 'python.exe');
+      try {
+        await fs.access(exe);
+        out.push({ command: exe, argsPrefix: [] });
+      } catch (_error) {
+        // Try next venv.
+      }
     }
     return out;
   }
@@ -313,8 +318,16 @@ function runSpawnCapture(command, args, options = {}) {
 
 async function getBundledVenvPythonExecutable() {
   if (process.platform === 'win32') {
-    const exe = path.join(VENV_DIR, 'Scripts', 'python.exe');
-    return (await pathExists(exe)) ? exe : null;
+    const candidates = [
+      path.join(GPU_VENV_DIR, 'Scripts', 'python.exe'),
+      path.join(VENV_DIR, 'Scripts', 'python.exe'),
+    ];
+    for (const exe of candidates) {
+      if (await pathExists(exe)) {
+        return exe;
+      }
+    }
+    return null;
   }
 
   for (const name of ['python3', 'python']) {
@@ -327,53 +340,74 @@ async function getBundledVenvPythonExecutable() {
   return null;
 }
 
-async function removeVenvDirIfPresent() {
+async function getVenvPythonExecutableByName(venvName) {
+  if (process.platform === 'win32') {
+    const exe = path.join(PYTHON_DIR, venvName, 'Scripts', 'python.exe');
+    return (await pathExists(exe)) ? exe : null;
+  }
+
+  for (const name of ['python3', 'python']) {
+    const binPath = path.join(PYTHON_DIR, venvName, 'bin', name);
+    if (await pathExists(binPath)) {
+      return binPath;
+    }
+  }
+
+  return null;
+}
+
+async function removeVenvDirIfPresent(venvName = '.venv') {
+  const targetDir = path.join(PYTHON_DIR, venvName);
   try {
-    await fs.rm(VENV_DIR, { recursive: true, force: true });
+    await fs.rm(targetDir, { recursive: true, force: true });
   } catch (_error) {
     // Ignore.
   }
 }
 
-async function createBundledVenvBestEffort() {
+async function createBundledVenvBestEffort(options = {}) {
+  const {
+    venvName = '.venv',
+    windowsPythonTags = ['3.12', '3.11', '3.10', '3.9'],
+  } = options;
+
   if (process.platform === 'win32') {
-    const tags = ['3.12', '3.11', '3.10', '3.9'];
-    for (const tag of tags) {
-      await removeVenvDirIfPresent();
-      const result = await runSpawnCapture('py', [`-${tag}`, '-m', 'venv', '.venv'], {
+    for (const tag of windowsPythonTags) {
+      await removeVenvDirIfPresent(venvName);
+      const result = await runSpawnCapture('py', [`-${tag}`, '-m', 'venv', venvName], {
         cwd: PYTHON_DIR,
         timeoutMs: VENV_CREATE_TIMEOUT_MS,
       });
-      if (result.code === 0 && (await getBundledVenvPythonExecutable())) {
+      if (result.code === 0 && (await getVenvPythonExecutableByName(venvName))) {
         return true;
       }
     }
 
-    await removeVenvDirIfPresent();
-    let result = await runSpawnCapture('py', ['-3', '-m', 'venv', '.venv'], {
+    await removeVenvDirIfPresent(venvName);
+    let result = await runSpawnCapture('py', ['-3', '-m', 'venv', venvName], {
       cwd: PYTHON_DIR,
       timeoutMs: VENV_CREATE_TIMEOUT_MS,
     });
-    if (result.code === 0 && (await getBundledVenvPythonExecutable())) {
+    if (result.code === 0 && (await getVenvPythonExecutableByName(venvName))) {
       return true;
     }
 
-    await removeVenvDirIfPresent();
-    result = await runSpawnCapture('python', ['-m', 'venv', '.venv'], {
+    await removeVenvDirIfPresent(venvName);
+    result = await runSpawnCapture('python', ['-m', 'venv', venvName], {
       cwd: PYTHON_DIR,
       timeoutMs: VENV_CREATE_TIMEOUT_MS,
     });
-    return result.code === 0 && Boolean(await getBundledVenvPythonExecutable());
+    return result.code === 0 && Boolean(await getVenvPythonExecutableByName(venvName));
   }
 
   const attempts = [['python3'], ['python']];
   for (const argsPrefix of attempts) {
-    await removeVenvDirIfPresent();
-    const result = await runSpawnCapture(argsPrefix[0], ['-m', 'venv', '.venv'], {
+    await removeVenvDirIfPresent(venvName);
+    const result = await runSpawnCapture(argsPrefix[0], ['-m', 'venv', venvName], {
       cwd: PYTHON_DIR,
       timeoutMs: VENV_CREATE_TIMEOUT_MS,
     });
-    if (result.code === 0 && (await getBundledVenvPythonExecutable())) {
+    if (result.code === 0 && (await getVenvPythonExecutableByName(venvName))) {
       return true;
     }
   }
@@ -381,7 +415,7 @@ async function createBundledVenvBestEffort() {
   return false;
 }
 
-async function pipInstallRequirements(venvPython) {
+async function pipInstallRequirements(venvPython, requirementsPath = REQUIREMENTS_PATH) {
   const upgrade = await runSpawnCapture(
     venvPython,
     ['-m', 'pip', 'install', '--upgrade', 'pip'],
@@ -398,7 +432,7 @@ async function pipInstallRequirements(venvPython) {
 
   const install = await runSpawnCapture(
     venvPython,
-    ['-m', 'pip', 'install', '-r', REQUIREMENTS_PATH],
+    ['-m', 'pip', 'install', '-r', requirementsPath],
     {
       cwd: PYTHON_DIR,
       timeoutMs: PIP_INSTALL_TIMEOUT_MS,
@@ -413,18 +447,24 @@ async function pipInstallRequirements(venvPython) {
 }
 
 async function ensureBundledVenvHasTensorflow() {
-  let venvPython = await getBundledVenvPythonExecutable();
+  const isWindows = process.platform === 'win32';
+  const preferredVenvName = isWindows ? '.venv2' : '.venv';
+  const requirementsPath = isWindows ? GPU_REQUIREMENTS_PATH : REQUIREMENTS_PATH;
+  let venvPython = await getVenvPythonExecutableByName(preferredVenvName);
 
   if (!venvPython) {
     log(
       'info',
-      'Создаётся локальное окружение Python (server/python/.venv) для TensorFlow — первый запуск может занять несколько минут.'
+      `Создаётся локальное окружение Python (server/python/${preferredVenvName}) для TensorFlow — первый запуск может занять несколько минут.`
     );
-    const created = await createBundledVenvBestEffort();
+    const created = await createBundledVenvBestEffort({
+      venvName: preferredVenvName,
+      windowsPythonTags: isWindows && preferredVenvName === '.venv2' ? ['3.10'] : undefined,
+    });
     if (!created) {
       return false;
     }
-    venvPython = await getBundledVenvPythonExecutable();
+    venvPython = await getVenvPythonExecutableByName(preferredVenvName);
     if (!venvPython) {
       return false;
     }
@@ -438,11 +478,11 @@ async function ensureBundledVenvHasTensorflow() {
 
   log(
     'info',
-    'Устанавливаются зависимости Python (TensorFlow и др.) в server/python/.venv — это может занять несколько минут.'
+    `Устанавливаются зависимости Python (TensorFlow и др.) в server/python/${preferredVenvName} — это может занять несколько минут.`
   );
 
   try {
-    await pipInstallRequirements(venvPython);
+    await pipInstallRequirements(venvPython, requirementsPath);
   } catch (error) {
     logError('Автоустановка pip-зависимостей не удалась.', error);
     return false;
@@ -453,7 +493,7 @@ async function ensureBundledVenvHasTensorflow() {
 }
 
 const TF_SETUP_HINT =
-  'Установите зависимости Python: в каталоге server/python выполните setup-venv.ps1 (Windows) или: python -m venv .venv && .venv\\Scripts\\pip install -r requirements.txt. Либо укажите переменную окружения AI_GENERATOR_PYTHON на python с установленным пакетом tensorflow.';
+  'Установите зависимости Python: в каталоге server/python выполните setup-venv2.ps1 (Windows GPU, рекомендуется) или setup-venv.ps1 (обычный режим). Либо укажите переменную окружения AI_GENERATOR_PYTHON на python с установленным пакетом tensorflow.';
 
 async function resolvePythonRuntime() {
   if (resolvedPythonRuntime) {
@@ -463,6 +503,16 @@ async function resolvePythonRuntime() {
   if (!resolvingPythonRuntimePromise) {
     resolvingPythonRuntimePromise = (async () => {
       try {
+        const skipAuto = String(process.env.AI_GENERATOR_PYTHON_SKIP_AUTO_VENV || '').trim() === '1';
+        const hasExplicitRuntime = Boolean(parseCommandString(process.env.AI_GENERATOR_PYTHON || ''));
+
+        if (process.platform === 'win32' && !skipAuto && !hasExplicitRuntime) {
+          const gpuVenvPython = path.join(GPU_VENV_DIR, 'Scripts', 'python.exe');
+          if (!(await pathExists(gpuVenvPython))) {
+            await ensureBundledVenvHasTensorflow();
+          }
+        }
+
         const maxPasses = 2;
         for (let pass = 0; pass < maxPasses; pass += 1) {
           const candidates = await buildPythonCandidates();
@@ -489,8 +539,6 @@ async function resolvePythonRuntime() {
             );
           }
 
-          const skipAuto =
-            String(process.env.AI_GENERATOR_PYTHON_SKIP_AUTO_VENV || '').trim() === '1';
           if (pass === 0 && !skipAuto) {
             const ok = await ensureBundledVenvHasTensorflow();
             if (!ok) {

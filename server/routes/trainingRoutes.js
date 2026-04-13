@@ -34,7 +34,9 @@ function createTrainingRoutes({
     response.setHeader('X-Accel-Buffering', 'no');
 
     try {
-      const preparedSources = await prepareUploadedSources(files, response);
+      const preparedSources = await prepareUploadedSources(files, response, {
+        mode: 'training_queue',
+      });
       const snapshot = await engine.addSourcesToTrainingQueue(request.params.queueId, preparedSources);
 
       writeNdjsonChunk(response, {

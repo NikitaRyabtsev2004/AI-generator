@@ -15,11 +15,12 @@ const DEFAULT_RUNTIME_CONFIG = {
     decay: 0.92,
   },
   dialogueMemory: {
-    useSourceDialogues: true,
+    useSourceDialogues: false,
     useChatDialogues: false,
     strongMatchThreshold: 1.08,
     softMatchThreshold: 0.62,
     responseOnlyIndex: true,
+    minPairTopicalRelevance: 0.1,
   },
   retrieval: {
     assistantReplyBoost: 1.3,

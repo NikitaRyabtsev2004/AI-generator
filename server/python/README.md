@@ -48,6 +48,12 @@
   - устанавливает зависимости,
   - подготавливает backend к запуску из Node.
 
+### `server/python/setup-venv2.ps1`
+- Альтернативный Windows-скрипт для GPU-режима TensorFlow:
+  - создает `.venv2` на Python 3.10,
+  - ставит стек `tensorflow==2.10.1` из `requirements.windows-gpu.txt`,
+  - подсказывает команду для `AI_GENERATOR_PYTHON`.
+
 ## Локальное окружение
 
 ### `server/python/.venv/`

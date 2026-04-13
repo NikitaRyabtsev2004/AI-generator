@@ -79,6 +79,10 @@ async function writeTrainingQueueSourceContent(queueId, sourceId, content) {
 }
 
 async function readTrainingQueueSourceContent(source = {}) {
+  if (source.type === 'dataset_file') {
+    return '';
+  }
+
   if (source.contentPath) {
     try {
       const raw = await fs.readFile(source.contentPath, 'utf8');

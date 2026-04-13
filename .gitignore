@@ -14,7 +14,8 @@
 /server/artifacts
 /server/data/studio.db
 /server/data/runtime-config.json
-/server/python/.venv/
+/server/python/.venv
+/server/python/.venv2
 .venv
 /server/data/model-library
 /server/data/training-jobs

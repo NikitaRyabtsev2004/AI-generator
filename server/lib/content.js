@@ -12,10 +12,23 @@ function normalizeUrl(input) {
 
 function extractTextFromHtml(html) {
   const $ = cheerio.load(html);
-  $('script, style, noscript, iframe, svg, canvas, form').remove();
+  $('script, style, noscript, iframe, svg, canvas, form, nav, header, footer, aside, menu').remove();
 
   const title = cleanText($('title').first().text());
-  const body = cleanText($('body').text() || $.root().text());
+  const primarySelectors = [
+    'main',
+    'article',
+    '[role="main"]',
+    '.content',
+    '.article',
+    '.post-content',
+    '.entry-content',
+  ];
+  const candidateBodies = primarySelectors
+    .map((selector) => cleanText($(selector).first().text()))
+    .filter(Boolean);
+  const body = candidateBodies.sort((left, right) => right.length - left.length)[0]
+    || cleanText($('body').text() || $.root().text());
 
   return cleanText([title, body].filter(Boolean).join('\n\n'));
 }
