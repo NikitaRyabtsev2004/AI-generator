@@ -19,7 +19,7 @@ export default function TrainingChart({ history }) {
         <ResponsiveContainer width="100%" height="100%">
         <AreaChart
           data={history}
-          margin={{ top: 12, right: 14, left: 2, bottom: 6 }}
+          margin={{ top: 8, right: 10, left: 0, bottom: 2 }}
         >
           <defs>
             <linearGradient id="lossChartGradient" x1="0" y1="0" x2="0" y2="1">
@@ -30,12 +30,12 @@ export default function TrainingChart({ history }) {
           <CartesianGrid stroke="rgba(255,255,255,0.08)" vertical={false} />
           <XAxis
             dataKey="step"
-            tick={{ fill: 'rgba(255,255,255,0.72)', fontSize: 12 }}
+            tick={{ fill: 'rgba(255,255,255,0.72)', fontSize: 11 }}
             axisLine={{ stroke: 'rgba(255,255,255,0.08)' }}
             tickLine={false}
           />
           <YAxis
-            tick={{ fill: 'rgba(255,255,255,0.72)', fontSize: 12 }}
+            tick={{ fill: 'rgba(255,255,255,0.72)', fontSize: 11 }}
             axisLine={{ stroke: 'rgba(255,255,255,0.08)' }}
             tickLine={false}
             domain={[
@@ -48,7 +48,7 @@ export default function TrainingChart({ history }) {
                 return max + (Math.abs(max) * 0.08 + 0.04);
               },
             ]}
-            width={60}
+            width={52}
           />
           <Tooltip
             contentStyle={{

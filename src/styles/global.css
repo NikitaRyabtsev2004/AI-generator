@@ -44,6 +44,7 @@ body {
   background: linear-gradient(180deg, var(--page-bg) 0%, var(--page-bg-alt) 100%);
   color: #f6fbff;
   font-family: 'Manrope', 'Segoe UI', sans-serif;
+  font-size: 15px;
 }
 
 button,
@@ -57,7 +58,7 @@ textarea {
 }
 
 .action-button {
-  min-height: 42px;
+  min-height: 38px;
 }
 
 .text-input {
@@ -84,7 +85,7 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  padding: 16px;
+  padding: 13px;
   border-radius: 20px;
   background: rgba(255, 255, 255, 0.05);
   border: 1px solid var(--panel-border);
@@ -96,7 +97,7 @@ textarea {
 }
 
 .metric-card__value {
-  font-size: 1.28rem !important;
+  font-size: 1.05rem !important;
 }
 
 .metric-card__hint {

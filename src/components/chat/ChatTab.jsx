@@ -406,6 +406,7 @@ export default function ChatTab({
   pendingReply,
   pendingRatings,
   error,
+  onNoticesChange,
   onCreateChat,
   onDeleteChat,
   onSendMessage,
@@ -704,6 +705,50 @@ export default function ChatTab({
       snapshot.runtime?.ratedMessages,
     ]
   );
+
+  const floatingNotices = useMemo(() => {
+    const notices = [];
+
+    if (error) {
+      notices.push({ id: 'chat-error', severity: 'error', message: error });
+    }
+    if (trainingLocked) {
+      notices.push({ id: 'chat-locked', severity: 'info', message: 'Чат в режиме просмотра: пока идёт обучение.' });
+    }
+    if (replyPending) {
+      notices.push({ id: 'chat-reply-pending', severity: 'info', message: 'Сервер формирует ответ...' });
+    }
+    if (activeChat?.truncated) {
+      notices.push({
+        id: 'chat-truncated',
+        severity: 'info',
+        message: `Показаны последние ${formatNumber(activeChat.returnedMessageCount || 0)} сообщений из ${formatNumber(activeChat.totalMessageCount || 0)}.`,
+      });
+    }
+    if (!canChat) {
+      notices.push({ id: 'chat-not-trained', severity: 'warning', message: 'Сначала обучите модель, затем чат станет доступен.' });
+    }
+
+    const priority = { error: 0, warning: 1, success: 2, info: 3 };
+    return notices
+      .sort((left, right) => (priority[left.severity] ?? 10) - (priority[right.severity] ?? 10))
+      .slice(0, 5);
+  }, [
+    activeChat?.returnedMessageCount,
+    activeChat?.totalMessageCount,
+    activeChat?.truncated,
+    canChat,
+    error,
+    replyPending,
+    trainingLocked,
+  ]);
+
+  useEffect(() => {
+    onNoticesChange?.(floatingNotices);
+    return () => {
+      onNoticesChange?.([]);
+    };
+  }, [floatingNotices, onNoticesChange]);
 
   const handleCreateChat = useCallback(async () => {
     await onCreateChat();

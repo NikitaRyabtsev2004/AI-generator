@@ -1,10 +1,11 @@
 .training-tab {
   display: grid;
-  grid-template-columns: 1.16fr 1fr 1fr;
-  grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 25px;
+  grid-template-columns: 1.22fr 1fr 1fr;
+  grid-template-rows: minmax(0, 1fr) minmax(220px, 0.74fr);
+  gap: 14px;
   height: 100%;
   min-height: 0;
+  font-size: 0.93rem;
 }
 
 .training-grid,
@@ -45,7 +46,7 @@
 }
 
 .panel--sources .glass-panel__inner {
-  overflow-y: auto;
+  overflow-y: scroll;
 }
 
 .panel-heading--full {
@@ -120,8 +121,8 @@
 .settings-group {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 40px;
+  gap: 5px;
+  padding: 35px;
   border-radius: 18px;
   background: rgba(255, 255, 255, 0.035);
   border: 1px solid var(--panel-border);
@@ -130,13 +131,12 @@
 .settings-control-list {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 25px;
 }
 
 .settings-control {
   display: flex;
   flex-direction: column;
-  gap: 8px;
 }
 
 .settings-control__header {
@@ -155,7 +155,7 @@
 .settings-control__tools {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 6px;
   margin-left: auto;
 }
 
@@ -165,15 +165,25 @@
 }
 
 .settings-control__input {
-  width: 128px;
+  width: 96px;
 }
 
 .settings-control__input .MuiOutlinedInput-root {
   background: rgba(255, 255, 255, 0.04);
 }
 
+.settings-control .MuiFormHelperText-root {
+  display: none;
+}
+
+.settings-control .MuiSlider-root {
+  margin-top: 2px;
+  margin-bottom: 0;
+}
+
 .settings-control__range-hint {
   margin-top: -2px;
+  font-size: 0.7rem !important;
 }
 
 .settings-number-grid {
@@ -273,9 +283,9 @@
   display: flex;
   flex-direction: column;
   gap: 10px;
-  flex: none;
-  min-height: 0;
-  max-height: min(42vh, 420px);
+  flex: 1;
+  min-height: 150px;
+  max-height: 250px;
   overflow-y: auto;
   padding-right: 6px;
 }
@@ -360,7 +370,7 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
-  max-height: min(34vh, 280px);
+  max-height: none;
   overflow-y: auto;
   padding-right: 4px;
 }
@@ -431,7 +441,7 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
-  max-height: min(35vh, 360px);
+  max-height: none;
   overflow-y: auto;
   padding-right: 4px;
 }
@@ -508,7 +518,7 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
-  max-height: min(32vh, 260px);
+  max-height: none;
   overflow-y: auto;
   padding-right: 4px;
 }
@@ -525,7 +535,7 @@
 }
 
 .chart-empty {
-  min-height: 140px;
+  min-height: 106px;
   display: grid;
   place-items: center;
   border-radius: 16px;
@@ -543,11 +553,12 @@
 .training-chart__canvas {
   width: 100%;
   height: 100%;
-  min-height: 140px;
+  min-height: 106px;
 }
 
 .panel--chart .glass-panel__inner {
   gap: 8px;
+  padding-bottom: 10px;
 }
 
 .info-icon {

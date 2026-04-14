@@ -56,6 +56,54 @@ function resolveStatusTheme(snapshot) {
   return 'trained';
 }
 
+function buildProcessBanner(snapshot) {
+  if (!snapshot) {
+    return null;
+  }
+
+  const trainingStatus = String(snapshot.training?.status || '').toLowerCase();
+  const lifecycle = String(snapshot.model?.lifecycle || '').toLowerCase();
+  const message = snapshot.training?.message || '';
+
+  if (trainingStatus === 'training' || lifecycle === 'training') {
+    return {
+      id: 'process-training',
+      tone: 'training',
+      title: 'Идет обучение модели',
+      message: message || 'Процесс обучения запущен в воркере.',
+    };
+  }
+
+  if (lifecycle === 'generating_reply') {
+    return {
+      id: 'process-generating-reply',
+      tone: 'generating_reply',
+      title: 'Генерация ответа',
+      message: message || 'Сервер формирует ответ по текущему контексту.',
+    };
+  }
+
+  if (lifecycle === 'syncing_knowledge') {
+    return {
+      id: 'process-syncing',
+      tone: 'syncing_knowledge',
+      title: 'Синхронизация знаний',
+      message: message || 'Индекс и артефакты знаний обновляются.',
+    };
+  }
+
+  if (lifecycle === 'learning_from_feedback') {
+    return {
+      id: 'process-feedback',
+      tone: 'learning_from_feedback',
+      title: 'Анализ обратной связи',
+      message: message || 'Система обновляет внутренние сигналы качества.',
+    };
+  }
+
+  return null;
+}
+
 function LoadingState() {
   return (
     <div className="loading-state">
@@ -71,6 +119,8 @@ function App() {
   const [baseStatusTheme, setBaseStatusTheme] = useState('not_created');
   const [overlayStatusTheme, setOverlayStatusTheme] = useState('not_created');
   const [overlayActive, setOverlayActive] = useState(false);
+  const [trainingNotices, setTrainingNotices] = useState([]);
+  const [chatNotices, setChatNotices] = useState([]);
   const importInputRef = useRef(null);
   const studio = useStudioApp();
   const resolvedStatusTheme = useMemo(
@@ -116,6 +166,46 @@ function App() {
     ];
   }, [studio.snapshot]);
 
+  const processBanner = useMemo(
+    () => buildProcessBanner(studio.snapshot),
+    [studio.snapshot]
+  );
+
+  const toastNotices = useMemo(() => {
+    const scopedNotices = tab === 0 ? trainingNotices : chatNotices;
+    const notices = [];
+
+    if (studio.error) {
+      notices.push({
+        id: 'global-error',
+        severity: 'error',
+        message: studio.error,
+      });
+    }
+
+    scopedNotices.forEach((notice) => {
+      if (!notice?.id || !notice?.message) {
+        return;
+      }
+      notices.push(notice);
+    });
+
+    const deduped = [];
+    const seen = new Set();
+    notices.forEach((notice) => {
+      if (seen.has(notice.id)) {
+        return;
+      }
+      seen.add(notice.id);
+      deduped.push(notice);
+    });
+
+    const priority = { error: 0, warning: 1, success: 2, info: 3 };
+    return deduped
+      .sort((left, right) => (priority[left.severity] ?? 10) - (priority[right.severity] ?? 10))
+      .slice(0, 5);
+  }, [chatNotices, studio.error, tab, trainingNotices]);
+
   const backgroundImg = 'b-1.gif'
 
   if (studio.loading || !studio.snapshot) {
@@ -159,7 +249,25 @@ function App() {
         aria-hidden="true"
         className={`app-shell__status-layer app-shell__status-layer--overlay app-shell__status-layer--${overlayStatusTheme} ${overlayActive ? 'app-shell__status-layer--active' : ''}`.trim()}
       />
-      <Container maxWidth='all' className="app-shell__container">
+      {processBanner ? (
+        <div className={`app-process-banner app-process-banner--${processBanner.tone}`}>
+          <span className="app-process-banner__title">{processBanner.title}</span>
+          <span className="app-process-banner__message">{processBanner.message}</span>
+        </div>
+      ) : null}
+      <div className="app-toast-layer" aria-live="polite" role="status">
+        {toastNotices.map((notice) => (
+          <Alert
+            key={notice.id}
+            severity={notice.severity || 'info'}
+            className="app-toast"
+            variant="filled"
+          >
+            {notice.message}
+          </Alert>
+        ))}
+      </div>
+      <Container maxWidth={false} className="app-shell__container">
         <GlassPanel className="hero-panel">
           <div className="hero-panel__topline">
             <div className="hero-panel__title-wrap">
@@ -237,18 +345,13 @@ function App() {
           </div>
         </GlassPanel>
 
-        {studio.error ? (
-          <Alert severity="error" className="top-alert">
-            {studio.error}
-          </Alert>
-        ) : null}
-
         <div className={`app-shell__content ${tab === 0 ? 'app-shell__content--training' : 'app-shell__content--chat'}`}>
           {tab === 0 ? (
             <TrainingTab
               snapshot={studio.snapshot}
               busy={studio.busy}
               error={studio.error}
+              onNoticesChange={setTrainingNotices}
               pendingAction={studio.pendingAction}
               realtimeConnected={studio.realtimeConnected}
               serverLogs={studio.serverLogs}
@@ -283,6 +386,7 @@ function App() {
               pendingReply={studio.pendingReply}
               pendingRatings={studio.pendingRatings}
               error={studio.error}
+              onNoticesChange={setChatNotices}
               onCreateChat={studio.actions.createChat}
               onDeleteChat={studio.actions.deleteChat}
               onSendMessage={studio.actions.sendMessage}

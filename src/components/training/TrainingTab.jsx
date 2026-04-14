@@ -347,6 +347,27 @@ function formatRangeValue(control, value) {
   return formatNumber(value);
 }
 
+function normalizeComparable(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeComparable(item));
+  }
+
+  if (value && typeof value === 'object') {
+    return Object.keys(value)
+      .sort()
+      .reduce((accumulator, key) => {
+        accumulator[key] = normalizeComparable(value[key]);
+        return accumulator;
+      }, {});
+  }
+
+  return value;
+}
+
+function stableStringify(value) {
+  return JSON.stringify(normalizeComparable(value));
+}
+
 function modelFactRows(snapshot) {
   const { model, runtime, knowledge } = snapshot;
 
@@ -454,6 +475,7 @@ export default function TrainingTab({
   snapshot,
   busy,
   error,
+  onNoticesChange,
   pendingAction,
   realtimeConnected,
   serverLogs,
@@ -478,27 +500,34 @@ export default function TrainingTab({
   onRollbackModel,
   onResetModel,
 }) {
-  const snapshotSettingsKey = useMemo(() => JSON.stringify(snapshot.settings), [snapshot.settings]);
+  const snapshotConstrainedSettings = useMemo(
+    () => applyModelConstraints(structuredClone(snapshot.settings)).settings,
+    [snapshot.settings]
+  );
+  const snapshotSettingsKey = useMemo(
+    () => stableStringify(snapshotConstrainedSettings),
+    [snapshotConstrainedSettings]
+  );
   const runtimeConfig = useMemo(() => snapshot.runtime?.config || {}, [snapshot.runtime?.config]);
-  const runtimeSnapshotKey = useMemo(() => JSON.stringify(runtimeConfig), [runtimeConfig]);
+  const runtimeSnapshotKey = useMemo(() => stableStringify(runtimeConfig), [runtimeConfig]);
   const [settingsDraft, setSettingsDraft] = useState(
-    () => applyModelConstraints(structuredClone(snapshot.settings)).settings
+    () => snapshotConstrainedSettings
   );
   const [runtimeDraft, setRuntimeDraft] = useState(() => structuredClone(runtimeConfig));
   const [urlInput, setUrlInput] = useState('');
   const [queueNameInput, setQueueNameInput] = useState('');
   const [modelNameInput, setModelNameInput] = useState('');
   const lastSnapshotKeyRef = useRef(snapshotSettingsKey);
-  const currentDraftKeyRef = useRef(JSON.stringify(snapshot.settings));
+  const currentDraftKeyRef = useRef(stableStringify(snapshotConstrainedSettings));
   const lastRuntimeSnapshotKeyRef = useRef(runtimeSnapshotKey);
-  const currentRuntimeDraftKeyRef = useRef(JSON.stringify(runtimeConfig));
+  const currentRuntimeDraftKeyRef = useRef(stableStringify(runtimeConfig));
 
   useEffect(() => {
-    currentDraftKeyRef.current = JSON.stringify(settingsDraft);
+    currentDraftKeyRef.current = stableStringify(settingsDraft);
   }, [settingsDraft]);
 
   useEffect(() => {
-    currentRuntimeDraftKeyRef.current = JSON.stringify(runtimeDraft);
+    currentRuntimeDraftKeyRef.current = stableStringify(runtimeDraft);
   }, [runtimeDraft]);
 
   useEffect(() => {
@@ -506,12 +535,12 @@ export default function TrainingTab({
     const currentDraftKey = currentDraftKeyRef.current;
 
     if (currentDraftKey === previousSnapshotKey || currentDraftKey === snapshotSettingsKey) {
-      setSettingsDraft(applyModelConstraints(structuredClone(snapshot.settings)).settings);
+      setSettingsDraft(snapshotConstrainedSettings);
       currentDraftKeyRef.current = snapshotSettingsKey;
     }
 
     lastSnapshotKeyRef.current = snapshotSettingsKey;
-  }, [snapshot.settings, snapshotSettingsKey]);
+  }, [snapshotConstrainedSettings, snapshotSettingsKey]);
 
   useEffect(() => {
     const previousSnapshotKey = lastRuntimeSnapshotKeyRef.current;
@@ -532,7 +561,7 @@ export default function TrainingTab({
     [settingsDraft]
   );
   const hasUnsavedSettings = useMemo(
-    () => JSON.stringify(settingsDraft) !== snapshotSettingsKey,
+    () => stableStringify(settingsDraft) !== snapshotSettingsKey,
     [settingsDraft, snapshotSettingsKey]
   );
   const estimatedParameterCount = modelConstraintReport.diagnostics.parameterCount;
@@ -540,7 +569,7 @@ export default function TrainingTab({
   const parameterDeltaSign = parameterDelta >= 0 ? '+' : '-';
   const parameterDeltaAbs = Math.abs(parameterDelta);
   const hasUnsavedRuntimeSettings = useMemo(
-    () => JSON.stringify(runtimeDraft) !== runtimeSnapshotKey,
+    () => stableStringify(runtimeDraft) !== runtimeSnapshotKey,
     [runtimeDraft, runtimeSnapshotKey]
   );
   const trainingQueues = snapshot.trainingQueues?.items || [];
@@ -590,21 +619,54 @@ export default function TrainingTab({
     });
   };
 
+  const syncDraftsFromSnapshot = (nextSnapshot) => {
+    if (!nextSnapshot) {
+      return;
+    }
+
+    const nextSettings = applyModelConstraints(structuredClone(nextSnapshot.settings || {})).settings;
+    const nextRuntimeConfig = structuredClone(nextSnapshot.runtime?.config || {});
+    setSettingsDraft(nextSettings);
+    setRuntimeDraft(nextRuntimeConfig);
+    const nextSettingsKey = stableStringify(nextSettings);
+    const nextRuntimeKey = stableStringify(nextRuntimeConfig);
+    lastSnapshotKeyRef.current = nextSettingsKey;
+    currentDraftKeyRef.current = nextSettingsKey;
+    lastRuntimeSnapshotKeyRef.current = nextRuntimeKey;
+    currentRuntimeDraftKeyRef.current = nextRuntimeKey;
+  };
+
+  const handleSaveSettingsClick = async () => {
+    const constrainedDraft = modelConstraintReport.settings;
+    if (stableStringify(constrainedDraft) !== stableStringify(settingsDraft)) {
+      setSettingsDraft(constrainedDraft);
+    }
+    const nextSnapshot = await onSaveSettings(constrainedDraft);
+    syncDraftsFromSnapshot(nextSnapshot);
+    return nextSnapshot;
+  };
+
+  const handleSaveRuntimeClick = async () => {
+    const nextSnapshot = await onSaveRuntimeConfig(runtimeDraft);
+    syncDraftsFromSnapshot(nextSnapshot);
+    return nextSnapshot;
+  };
+
   const handleTrainClick = async () => {
     const constrainedDraft = modelConstraintReport.settings;
-    if (JSON.stringify(constrainedDraft) !== JSON.stringify(settingsDraft)) {
+    if (stableStringify(constrainedDraft) !== stableStringify(settingsDraft)) {
       setSettingsDraft(constrainedDraft);
     }
 
     if (hasUnsavedSettings) {
-      const savedSnapshot = await onSaveSettings(constrainedDraft);
+      const savedSnapshot = await handleSaveSettingsClick();
       if (!savedSnapshot) {
         return;
       }
     }
 
     if (hasUnsavedRuntimeSettings) {
-      const savedSnapshot = await onSaveRuntimeConfig(runtimeDraft);
+      const savedSnapshot = await handleSaveRuntimeClick();
       if (!savedSnapshot) {
         return;
       }
@@ -612,6 +674,71 @@ export default function TrainingTab({
 
     await onTrainModel();
   };
+
+  const floatingNotices = useMemo(() => {
+    const notices = [];
+
+    if (error) {
+      notices.push({ id: 'training-error', severity: 'error', message: error });
+    }
+    if (isPaused) {
+      notices.push({ id: 'training-paused', severity: 'success', message: 'Обучение на паузе. Можно продолжить с чекпоинта.' });
+    }
+    if (hasUnsavedSettings || hasUnsavedRuntimeSettings) {
+      notices.push({ id: 'training-unsaved', severity: 'warning', message: 'Есть несохранённые изменения настроек.' });
+    }
+    if (modelConstraintReport.adjustments.length) {
+      notices.push({ id: 'training-adjustments', severity: 'info', message: 'Параметры авто-скорректированы под ограничения модели и памяти.' });
+    }
+    if (modelConstraintReport.diagnostics.highOomRisk) {
+      notices.push({ id: 'training-oom-risk', severity: 'warning', message: `Высокий риск OOM: attention ~${formatBytes(modelConstraintReport.diagnostics.attentionTensorBytes)}, FFN ~${formatBytes(modelConstraintReport.diagnostics.ffnTensorBytes)}.` });
+    }
+    if (!canTrain) {
+      notices.push({ id: 'training-no-data', severity: 'info', message: 'Добавьте хотя бы один источник (TXT/CSV/JSON/JSONL/PARQUET или URL).' });
+    }
+    if (hasQueuedTraining) {
+      notices.push({ id: 'training-queue-ready', severity: 'info', message: `В очереди обучения: ${pendingQueueItems.length}.` });
+    }
+    if (queueRunnerAlertVisible) {
+      notices.push({
+        id: 'training-queue-runner',
+        severity: queueRunner?.status === 'error' ? 'error' : 'info',
+        message: `Автоочередь: ${queueRunner?.status || 'idle'}. Выполнено ${queueRunner?.completedQueueIds?.length || 0} из ${queueRunner?.totalQueues || 0}.`,
+      });
+    }
+    if (snapshot.model.computeBackendWarning) {
+      notices.push({ id: 'training-backend-warning', severity: 'warning', message: snapshot.model.computeBackendWarning });
+    }
+
+    const priority = { error: 0, warning: 1, success: 2, info: 3 };
+    return notices
+      .sort((left, right) => (priority[left.severity] ?? 10) - (priority[right.severity] ?? 10))
+      .slice(0, 6);
+  }, [
+    canTrain,
+    error,
+    hasQueuedTraining,
+    hasUnsavedRuntimeSettings,
+    hasUnsavedSettings,
+    isPaused,
+    modelConstraintReport.adjustments.length,
+    modelConstraintReport.diagnostics.attentionTensorBytes,
+    modelConstraintReport.diagnostics.ffnTensorBytes,
+    modelConstraintReport.diagnostics.highOomRisk,
+    pendingQueueItems.length,
+    queueRunner?.completedQueueIds?.length,
+    queueRunner?.status,
+    queueRunner?.totalQueues,
+    queueRunnerAlertVisible,
+    snapshot.model.computeBackendWarning,
+  ]);
+
+  useEffect(() => {
+    onNoticesChange?.(floatingNotices);
+    return () => {
+      onNoticesChange?.([]);
+    };
+  }, [floatingNotices, onNoticesChange]);
 
   return (
     <div className="training-tab">
@@ -680,7 +807,6 @@ export default function TrainingTab({
             </Button>
           </div>
 
-          {error ? <Alert severity="error">{error}</Alert> : null}
           {isPaused ? (
             <Alert severity="success">
               Обучение поставлено на паузу. Можно продолжить с последнего чекпоинта.
@@ -989,7 +1115,7 @@ export default function TrainingTab({
                 <Button
                   variant="contained"
                   className="action-button"
-                  onClick={() => onSaveRuntimeConfig(runtimeDraft)}
+                  onClick={handleSaveRuntimeClick}
                   disabled={busy || trainingLocked || !hasUnsavedRuntimeSettings}
                 >
                   Сохранить runtime
@@ -1086,7 +1212,6 @@ export default function TrainingTab({
                         ? [
                             { value: control.min, label: `${formatRangeValue(control, control.min)}` },
                             { value: dynamicMax, label: `лимит ${formatRangeValue(control, dynamicMax)}` },
-                            { value: control.max, label: `${formatRangeValue(control, control.max)}` },
                           ]
                         : [
                             { value: control.min, label: `${formatRangeValue(control, control.min)}` },
@@ -1113,8 +1238,8 @@ export default function TrainingTab({
                                 value={value}
                                 disabled={trainingLocked}
                                 inputProps={{
-                                  min: control.min,
-                                  max: control.max,
+                                  min: dynamicMin,
+                                  max: dynamicMax,
                                   step: control.step,
                                 }}
                                 error={isOutsideDynamic}
@@ -1142,9 +1267,9 @@ export default function TrainingTab({
                             </div>
                           </div>
                           <Slider
-                            value={value}
-                            min={control.min}
-                            max={control.max}
+                            value={clampControlValue({ ...control, min: dynamicMin, max: dynamicMax }, value)}
+                            min={dynamicMin}
+                            max={dynamicMax}
                             step={control.step}
                             disabled={trainingLocked}
                             marks={sliderMarks}
@@ -1164,7 +1289,7 @@ export default function TrainingTab({
                             }
                           />
                           {hasDynamicRange ? (
-                            <Typography variant="caption" className="muted-text settings-control__range-hint">
+                            <Typography style={{marginLeft: '30px'}} variant="caption" className="muted-text settings-control__range-hint">
                               {`Полный диапазон: ${formatRangeValue(control, control.min)}-${formatRangeValue(control, control.max)}. Активный лимит сейчас: ${formatRangeValue(control, dynamicMin)}-${formatRangeValue(control, dynamicMax)}.`}
                             </Typography>
                           ) : null}
@@ -1182,7 +1307,7 @@ export default function TrainingTab({
                             </Typography>
                           ) : null}
                           {control.key === 'batchSize' ? (
-                            <Typography variant="caption" className="muted-text">
+                            <Typography style={{marginLeft: '30px'}} variant="caption" className="muted-text">
                               {`Динамический лимит batch size для текущей архитектуры: ${formatNumber(modelConstraintReport.dynamicLimits.batchSizeMax)}.`}
                             </Typography>
                           ) : null}
@@ -1204,7 +1329,7 @@ export default function TrainingTab({
             <Button
               variant="contained"
               className="action-button"
-              onClick={() => onSaveSettings(modelConstraintReport.settings)}
+              onClick={handleSaveSettingsClick}
               disabled={busy || trainingLocked || !hasUnsavedSettings}
             >
               Сохранить настройки сервера

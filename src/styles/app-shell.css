@@ -5,6 +5,7 @@
   position: relative;
   isolation: isolate;
   z-index: 0;
+  font-size: 14px;
   background: var(--app-bg-image);
   background-position: center center;
   background-repeat: no-repeat;
@@ -300,14 +301,14 @@
   display: flex;
   flex-direction: column;
   transition: 500ms all ease-in-out;
-  padding-top: 12px;
-  padding-bottom: 12px;
+  padding-top: 8px;
+  padding-bottom: 8px;
 }
 
 .hero-panel {
   flex: 0 0 auto;
   margin-bottom: 10px;
-  height: 140px !important;
+  height: 130px !important;
 }
 
 .hero-panel .glass-panel__inner {
@@ -371,7 +372,7 @@
 }
 
 .hero-panel__brand {
-  font-size: clamp(2.3rem, 3.6vw, 2.92rem);
+  font-size: clamp(1.7rem, 2.8vw, 2.2rem);
   line-height: 1;
 }
 
@@ -501,6 +502,85 @@
   margin-bottom: 10px;
 }
 
+.app-process-banner {
+  position: fixed;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 12;
+  display: inline-flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: min(620px, calc(100vw - 28px));
+  max-width: min(820px, calc(100vw - 28px));
+  padding: 10px 14px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(7, 14, 26, 0.78);
+  box-shadow: 0 16px 34px rgba(0, 0, 0, 0.36);
+  backdrop-filter: blur(8px);
+  pointer-events: none;
+}
+
+.app-process-banner__title {
+  font-size: 0.86rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
+.app-process-banner__message {
+  font-size: 0.78rem;
+  color: rgba(241, 248, 255, 0.84);
+}
+
+.app-process-banner--training {
+  border-color: rgba(219, 117, 255, 0.54);
+  background: linear-gradient(130deg, rgba(114, 34, 120, 0.78), rgba(31, 16, 44, 0.78));
+}
+
+.app-process-banner--generating_reply {
+  border-color: rgba(255, 191, 151, 0.58);
+  background: linear-gradient(130deg, rgba(116, 67, 37, 0.78), rgba(29, 43, 73, 0.78));
+}
+
+.app-process-banner--syncing_knowledge {
+  border-color: rgba(246, 166, 233, 0.6);
+  background: linear-gradient(130deg, rgba(116, 47, 95, 0.78), rgba(24, 43, 76, 0.78));
+}
+
+.app-process-banner--learning_from_feedback {
+  border-color: rgba(255, 231, 136, 0.62);
+  background: linear-gradient(130deg, rgba(123, 98, 37, 0.78), rgba(26, 49, 77, 0.78));
+}
+
+.app-toast-layer {
+  position: fixed;
+  top: 88px;
+  right: 12px;
+  z-index: 11;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(360px, calc(100vw - 22px));
+  pointer-events: none;
+}
+
+.app-toast {
+  margin: 0 !important;
+  min-height: 0 !important;
+  padding: 5px 10px !important;
+  border-radius: 11px !important;
+  font-size: 0.74rem !important;
+  line-height: 1.35 !important;
+  box-shadow: 0 10px 22px -16px rgba(0, 0, 0, 0.62) !important;
+  pointer-events: auto;
+}
+
+.panel--settings .glass-panel__inner > .MuiAlert-root,
+.chat-main-panel__inner > .MuiAlert-root {
+  display: none;
+}
+
 .app-shell__content {
   flex: 1;
   min-height: 0;
@@ -536,6 +616,19 @@
 }
 
 @media (max-width: 1080px) {
+  .app-process-banner {
+    top: 8px;
+    min-width: calc(100vw - 16px);
+    max-width: calc(100vw - 16px);
+    padding: 8px 10px;
+  }
+
+  .app-toast-layer {
+    top: 80px;
+    right: 8px;
+    width: min(340px, calc(100vw - 16px));
+  }
+
   .hero-panel__topline {
     min-height: auto;
     display: flex;
