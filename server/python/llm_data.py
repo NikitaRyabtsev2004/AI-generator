@@ -320,8 +320,10 @@ def iter_texts_from_parquet(path: Path, options: Dict[str, object]) -> Iterator[
 
     try:
         import pyarrow.parquet as pq  # pylint: disable=import-outside-toplevel
-    except Exception:
-        return
+    except Exception as error:
+        raise RuntimeError(
+            "Parquet reader is unavailable: module 'pyarrow' is not installed."
+        ) from error
 
     parquet_file = pq.ParquetFile(path)
     for batch in parquet_file.iter_batches(batch_size=batch_size, columns=columns):
@@ -366,6 +368,8 @@ def iter_texts_from_dataset_files(paths: Sequence[str], options: Dict[str, objec
             else:
                 yield from iter_texts_from_txt(source_path, resolved_options)
         except Exception:
+            if suffix == ".parquet":
+                raise
             continue
 
 
@@ -405,11 +409,12 @@ def prepare_tokenized_corpus(
     tokenizer: SimpleSubwordTokenizer,
     context_length: int,
     max_tokens_per_text: int = 4096,
+    stride: int | None = None,
 ) -> TokenizedCorpus:
     documents: List[TokenizedDocument] = []
     token_count = 0
     sample_count = 0
-    stride = max(1, context_length // 2)
+    effective_stride = max(1, int(stride) if stride else context_length)
 
     for text in texts:
         token_ids = tokenizer.encode(
@@ -425,7 +430,7 @@ def prepare_tokenized_corpus(
         doc = TokenizedDocument(token_ids=token_ids)
         documents.append(doc)
         token_count += len(token_ids)
-        for _window in build_windows(token_ids, context_length=context_length, stride=stride):
+        for _window in build_windows(token_ids, context_length=context_length, stride=effective_stride):
             sample_count += 1
 
     return TokenizedCorpus(documents=documents, token_count=token_count, sample_count=sample_count)
@@ -437,60 +442,61 @@ def create_datasets(
     batch_size: int,
     validation_split: float = 0.1,
     shuffle_buffer: int = 4096,
+    stride: int | None = None,
 ) -> DatasetBundle:
     if tf is None:
         raise RuntimeError("TensorFlow is required to build tf.data datasets.")
+    import numpy as np  # pylint: disable=import-outside-toplevel
 
     validation_split = min(0.4, max(0.0, float(validation_split)))
     validation_period = max(2, int(round(1.0 / validation_split))) if validation_split > 0 else 0
-    stride = max(1, context_length // 2)
+    effective_stride = max(1, int(stride) if stride else context_length)
 
     train_count = 0
     validation_count = 0
     global_index = 0
+    train_windows: List[List[int]] = []
+    validation_windows: List[List[int]] = []
+
     for document in corpus.documents:
-        for _window in build_windows(document.token_ids, context_length=context_length, stride=stride):
+        for window in build_windows(document.token_ids, context_length=context_length, stride=effective_stride):
             is_validation = validation_period > 0 and global_index % validation_period == 0
             if is_validation:
                 validation_count += 1
+                validation_windows.append(window)
             else:
                 train_count += 1
+                train_windows.append(window)
             global_index += 1
 
     if train_count <= 0:
-        train_count = max(1, corpus.sample_count)
+        if validation_windows:
+            train_windows = validation_windows
+            validation_windows = []
+            train_count = len(train_windows)
+            validation_count = 0
+        else:
+            train_count = max(1, corpus.sample_count)
+            fallback_window = [0] * (context_length + 1)
+            train_windows = [fallback_window]
         validation_count = 0
         validation_period = 0
 
-    def sample_generator(split: str) -> Generator[tuple[list[int], list[int]], None, None]:
-        sample_index = 0
-        for document in corpus.documents:
-            for window in build_windows(document.token_ids, context_length=context_length, stride=stride):
-                is_validation = validation_period > 0 and sample_index % validation_period == 0
-                sample_index += 1
-                if split == "validation" and not is_validation:
-                    continue
-                if split == "train" and is_validation:
-                    continue
-                x = window[:-1]
-                y = window[1:]
-                yield x, y
-
-    signature = (
-        tf.TensorSpec(shape=(context_length,), dtype=tf.int32),
-        tf.TensorSpec(shape=(context_length,), dtype=tf.int32),
+    train_array = np.asarray(train_windows, dtype=np.int32)
+    validation_array = np.asarray(validation_windows, dtype=np.int32) if validation_windows else np.zeros(
+        (0, context_length + 1),
+        dtype=np.int32,
     )
-    train_dataset = tf.data.Dataset.from_generator(
-        lambda: sample_generator("train"),
-        output_signature=signature,
+
+    train_dataset = tf.data.Dataset.from_tensor_slices(
+        (train_array[:, :-1], train_array[:, 1:])
     )
     train_dataset = train_dataset.shuffle(min(max(train_count, 64), shuffle_buffer))
     train_dataset = train_dataset.batch(max(1, int(batch_size)), drop_remainder=False)
     train_dataset = train_dataset.prefetch(tf.data.AUTOTUNE)
 
-    validation_dataset = tf.data.Dataset.from_generator(
-        lambda: sample_generator("validation"),
-        output_signature=signature,
+    validation_dataset = tf.data.Dataset.from_tensor_slices(
+        (validation_array[:, :-1], validation_array[:, 1:])
     )
     validation_dataset = validation_dataset.batch(max(1, int(batch_size)), drop_remainder=False)
     validation_dataset = validation_dataset.prefetch(tf.data.AUTOTUNE)

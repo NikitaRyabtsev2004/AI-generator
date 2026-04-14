@@ -25,9 +25,9 @@ const DEFAULT_SETTINGS = {
   },
   generation: {
     responseTemperature: 0.4,
-    maxReplySentences: 4,
-    maxReplyCharacters: 1400,
-    maxGeneratedTokens: 96,
+    maxReplySentences: 8,
+    maxReplyCharacters: 6000,
+    maxGeneratedTokens: 320,
     topKSampling: 16,
     repetitionPenalty: 1.22,
   },

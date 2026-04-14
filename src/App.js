@@ -116,7 +116,7 @@ function App() {
     ];
   }, [studio.snapshot]);
 
-  const backgroundImg = 'b-4.gif'
+  const backgroundImg = 'b-1.gif'
 
   if (studio.loading || !studio.snapshot) {
     return (
@@ -159,70 +159,72 @@ function App() {
         aria-hidden="true"
         className={`app-shell__status-layer app-shell__status-layer--overlay app-shell__status-layer--${overlayStatusTheme} ${overlayActive ? 'app-shell__status-layer--active' : ''}`.trim()}
       />
-      <Container maxWidth="xl" className="app-shell__container">
+      <Container maxWidth='all' className="app-shell__container">
         <GlassPanel className="hero-panel">
           <div className="hero-panel__topline">
             <div className="hero-panel__title-wrap">
               <div className="hero-panel__badge">
                 <AutoAwesomeIcon fontSize="medium" />
                 <span className="hero-panel__badge-text">
-                  <span>
                     <strong className="hero-panel__brand">AI Generator</strong>
-                  </span>
                   <strong className="hero-panel__brand-accent">Studio</strong>
                 </span>
               </div>
             </div>
 
             <div className="hero-panel__status-wrap">
-              <Button
-                variant="contained"
-                className="hero-model-button"
-                startIcon={isExportingModel ? <CircularProgress size={16} color="inherit" /> : <FileDownloadRoundedIcon fontSize="small" />}
-                onClick={() => studio.actions.exportModel()}
-                disabled={modelActionLocked}
-              >
-                Экспорт модели
-              </Button>
-              <Button
-                variant="contained"
-                className="hero-model-button hero-model-button--import"
-                startIcon={isImportingModel ? <CircularProgress size={16} color="inherit" /> : <FileUploadRoundedIcon fontSize="small" />}
-                onClick={() => importInputRef.current?.click()}
-                disabled={modelActionLocked}
-              >
-                Импорт модели
-              </Button>
-              <input
-                ref={importInputRef}
-                type="file"
-                accept=".json,.aistudio,.aistudio.json,application/json"
-                style={{ display: 'none' }}
-                onChange={(event) => {
-                  const selectedFile = event.target.files?.[0] || null;
-                  if (selectedFile) {
-                    studio.actions.importModel(selectedFile);
-                  }
-                  event.target.value = '';
-                }}
-              />
-              <Tooltip title={`Статусы обучения: ${statusCount}`}>
-                <IconButton
-                  className="hero-status-button"
-                  onClick={() => setStatusDialogOpen(true)}
-                  size="small"
+              <div style={{display: 'flex', flexDirection: 'row', gap: '0.5em'}}>
+                <Button
+                    variant="contained"
+                    className="hero-model-button"
+                    startIcon={isExportingModel ? <CircularProgress size={16} color="inherit" /> : <FileDownloadRoundedIcon fontSize="small" />}
+                    onClick={() => studio.actions.exportModel()}
+                    disabled={modelActionLocked}
                 >
-                  <Badge badgeContent={statusCount} color="default" max={999}>
-                    <HistoryRoundedIcon fontSize="small" />
-                  </Badge>
-                </IconButton>
-              </Tooltip>
-              <StatusPill label={studio.realtimeConnected ? 'Realtime online' : 'Realtime reconnecting'} tone="neutral" />
-              <StatusPill label={studio.snapshot.model.engine} active tone="accent" />
-              <StatusPill label={`Статус: ${studio.snapshot.model.lifecycle}`} tone="neutral" />
-              {summaryItems.map((item) => (
-                <StatusPill key={item} label={item} tone="neutral" />
-              ))}
+                  Экспорт модели
+                </Button>
+                <Button
+                    variant="contained"
+                    className="hero-model-button hero-model-button--import"
+                    startIcon={isImportingModel ? <CircularProgress size={16} color="inherit" /> : <FileUploadRoundedIcon fontSize="small" />}
+                    onClick={() => importInputRef.current?.click()}
+                    disabled={modelActionLocked}
+                >
+                  Импорт модели
+                </Button>
+                <input
+                    ref={importInputRef}
+                    type="file"
+                    accept=".json,.aistudio,.aistudio.json,application/json"
+                    style={{ display: 'none' }}
+                    onChange={(event) => {
+                      const selectedFile = event.target.files?.[0] || null;
+                      if (selectedFile) {
+                        studio.actions.importModel(selectedFile);
+                      }
+                      event.target.value = '';
+                    }}
+                />
+                <Tooltip title={`Статусы обучения: ${statusCount}`}>
+                  <IconButton
+                      className="hero-status-button"
+                      onClick={() => setStatusDialogOpen(true)}
+                      size="small"
+                  >
+                    <Badge badgeContent={statusCount} color="default" max={999}>
+                      <HistoryRoundedIcon fontSize="small" />
+                    </Badge>
+                  </IconButton>
+                </Tooltip>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: '0.5em' }}>
+                <StatusPill label={studio.realtimeConnected ? 'Realtime online' : 'Realtime reconnecting'} tone="neutral" />
+                <StatusPill label={studio.snapshot.model.engine} active tone="accent" />
+                <StatusPill label={`Статус: ${studio.snapshot.model.lifecycle}`} tone="neutral" />
+                {summaryItems.map((item) => (
+                    <StatusPill key={item} label={item} tone="neutral" />
+                ))}
+              </div>
             </div>
           </div>
 

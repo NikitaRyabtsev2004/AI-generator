@@ -59,23 +59,64 @@ def safe_int(value: Any, fallback: int) -> int:
     return parsed
 
 
+def safe_bool(value: Any, fallback: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return fallback
+    normalized = str(value).strip().lower()
+    if normalized in ("1", "true", "yes", "y", "on"):
+        return True
+    if normalized in ("0", "false", "no", "n", "off"):
+        return False
+    return fallback
+
+
 def resolve_training_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
     training = settings.get("training") if isinstance(settings.get("training"), dict) else settings
+    sequence_length = max(16, safe_int(training.get("sequenceLength"), 128))
     embedding_size = max(32, safe_int(training.get("embeddingSize"), 128))
     attention_heads = max(1, safe_int(training.get("attentionHeads"), 4))
     while attention_heads > 1 and embedding_size % attention_heads != 0:
         attention_heads -= 1
 
+    stride_ratio = min(1.0, max(0.1, safe_float(training.get("windowStrideRatio"), 1.0)))
+    requested_stride = safe_int(training.get("windowStride"), 0)
+    if requested_stride <= 0:
+        requested_stride = max(1, int(round(sequence_length * stride_ratio)))
+    window_stride = min(sequence_length, max(1, requested_stride))
+
+    transformer_layers = max(1, safe_int(training.get("transformerLayers"), 4))
+    batch_size = max(1, safe_int(training.get("batchSize"), 8))
+    feed_forward_requested = max(
+        embedding_size,
+        safe_int(training.get("feedForwardSize"), embedding_size * 4),
+    )
+    feed_forward_ratio_cap = max(embedding_size, embedding_size * 8)
+    # Keep FFN activations under a conservative budget to reduce OOM risk.
+    activation_budget_bytes = 96 * 1024 * 1024
+    denominator = max(1, batch_size * sequence_length * 4)
+    feed_forward_activation_cap = max(
+        embedding_size,
+        int((activation_budget_bytes / denominator) / max(1.0, math.sqrt(transformer_layers / 12.0))),
+    )
+    feed_forward_size = max(
+        embedding_size,
+        min(feed_forward_requested, feed_forward_ratio_cap, feed_forward_activation_cap),
+    )
+
     return {
         "executionMode": str(training.get("executionMode") or "native_preferred"),
-        "sequenceLength": max(16, safe_int(training.get("sequenceLength"), 128)),
+        "sequenceLength": sequence_length,
+        "windowStride": window_stride,
+        "enableXla": safe_bool(training.get("enableXla"), True),
         "embeddingSize": embedding_size,
         "attentionHeads": attention_heads,
-        "transformerLayers": max(1, safe_int(training.get("transformerLayers"), 4)),
-        "feedForwardSize": max(embedding_size, safe_int(training.get("feedForwardSize"), embedding_size * 4)),
+        "transformerLayers": transformer_layers,
+        "feedForwardSize": feed_forward_size,
         "dropout": min(0.6, max(0.0, safe_float(training.get("dropout"), 0.1))),
         "learningRate": max(1e-6, safe_float(training.get("learningRate"), 0.001)),
-        "batchSize": max(1, safe_int(training.get("batchSize"), 8)),
+        "batchSize": batch_size,
         "epochs": max(1, safe_int(training.get("epochs"), 1)),
         "vocabularyLimit": max(512, safe_int(training.get("vocabularyLimit"), 12000)),
         "validationSplit": min(0.4, max(0.0, safe_float(training.get("validationSplit"), 0.1))),
@@ -172,6 +213,10 @@ def configure_tensorflow(training_settings: Dict[str, Any]) -> Dict[str, Any]:
                 tf.config.experimental.set_memory_growth(gpu, True)
             except Exception:
                 pass
+        try:
+            tf.config.experimental.enable_tensor_float_32_execution(True)
+        except Exception:
+            pass
 
     mixed_precision_enabled = False
     if using_gpu:
@@ -398,22 +443,26 @@ def command_inspect_dataset(config: Dict[str, Any]) -> int:
         sample_char_count = 0
         sample_token_count = 0
         preview_items: List[str] = []
+        inspection_error = ""
 
-        for text in iter_texts_from_dataset_files([str(source_path)], dataset_options):
-            normalized = clean_message(text)
-            if not normalized:
-                continue
+        try:
+            for text in iter_texts_from_dataset_files([str(source_path)], dataset_options):
+                normalized = clean_message(text)
+                if not normalized:
+                    continue
 
-            if len(preview_items) < preview_records:
-                preview_items.append(normalized[:preview_chars])
+                if len(preview_items) < preview_records:
+                    preview_items.append(normalized[:preview_chars])
 
-            if sample_record_count < estimate_sample_records:
-                sample_record_count += 1
-                sample_char_count += len(normalized)
-                sample_token_count += approximate_token_count(normalized)
+                if sample_record_count < estimate_sample_records:
+                    sample_record_count += 1
+                    sample_char_count += len(normalized)
+                    sample_token_count += approximate_token_count(normalized)
 
-            if len(preview_items) >= preview_records and sample_record_count >= estimate_sample_records:
-                break
+                if len(preview_items) >= preview_records and sample_record_count >= estimate_sample_records:
+                    break
+        except Exception as error:
+            inspection_error = clean_message(str(error))
 
         row_count = safe_int(file_payload.get("rowCount"), 0)
         if row_count > sample_record_count > 0:
@@ -433,6 +482,8 @@ def command_inspect_dataset(config: Dict[str, Any]) -> int:
                 "estimatedCharCount": max(0, estimated_char_count),
             }
         )
+        if inspection_error:
+            file_payload["error"] = inspection_error
         files_payload.append(file_payload)
 
     emit(
@@ -516,13 +567,43 @@ def train_batch(tf, model, optimizer, x_batch, y_batch, clip_norm: float, pad_id
     return float(loss.numpy())
 
 
-def evaluate_validation(tf, model, validation_dataset, pad_id: int) -> Optional[float]:
+def build_train_step(tf, model, optimizer, clip_norm: float, pad_id: int, use_loss_scale: bool, use_xla: bool):
+    @tf.function(reduce_retracing=True, jit_compile=use_xla)
+    def train_step(x_batch, y_batch):
+        with tf.GradientTape() as tape:
+            logits = model(x_batch, training=True)
+            loss = compute_masked_loss(tf, y_batch, logits, pad_id=pad_id)
+            scaled_loss = optimizer.get_scaled_loss(loss) if use_loss_scale and hasattr(optimizer, "get_scaled_loss") else loss
+
+        gradients = tape.gradient(scaled_loss, model.trainable_variables)
+        if use_loss_scale and hasattr(optimizer, "get_unscaled_gradients"):
+            gradients = optimizer.get_unscaled_gradients(gradients)
+
+        sanitized_gradients = []
+        for gradient, variable in zip(gradients, model.trainable_variables):
+            sanitized_gradients.append(gradient if gradient is not None else tf.zeros_like(variable))
+        clipped_gradients, _ = tf.clip_by_global_norm(sanitized_gradients, clip_norm)
+        optimizer.apply_gradients(zip(clipped_gradients, model.trainable_variables))
+        return tf.cast(loss, tf.float32)
+
+    return train_step
+
+
+def build_validation_step(tf, model, pad_id: int, use_xla: bool):
+    @tf.function(reduce_retracing=True, jit_compile=use_xla)
+    def validation_step(x_batch, y_batch):
+        logits = model(x_batch, training=False)
+        loss = compute_masked_loss(tf, y_batch, logits, pad_id=pad_id)
+        return tf.cast(loss, tf.float32)
+
+    return validation_step
+
+
+def evaluate_validation(validation_dataset, validation_step) -> Optional[float]:
     total_loss = 0.0
     batches = 0
     for x_batch, y_batch in validation_dataset:
-        logits = model(x_batch, training=False)
-        batch_loss = compute_masked_loss(tf, y_batch, logits, pad_id=pad_id)
-        total_loss += float(batch_loss.numpy())
+        total_loss += float(validation_step(x_batch, y_batch).numpy())
         batches += 1
     if batches == 0:
         return None
@@ -551,9 +632,29 @@ def command_train(config: Dict[str, Any]) -> int:
     tf = tf_info["tf"]
 
     training_payload = read_training_payload(config)
+    parquet_dataset_files = [
+        str(raw_path)
+        for raw_path in (training_payload.get("datasetFiles") or [])
+        if str(raw_path).strip().lower().endswith(".parquet")
+    ]
+    if parquet_dataset_files:
+        try:
+            import pyarrow.parquet as _pq  # pylint: disable=import-outside-toplevel,unused-import
+        except Exception as error:
+            raise RuntimeError(
+                "Parquet-файлы не могут быть обработаны: отсутствует пакет pyarrow в Python-окружении. "
+                "Установите зависимости из server/python/requirements*.txt и повторите запуск."
+            ) from error
+
     probe_iterator = create_training_text_iterator(training_payload)
     first_text = next(iter(probe_iterator), None)
     if not first_text:
+        if parquet_dataset_files:
+            raise RuntimeError(
+                "Из parquet не удалось извлечь текст после предобработки. "
+                "Проверьте, что в файле есть текстовые колонки (например: text/content/prompt/response) "
+                "или данные строкового типа."
+            )
         raise RuntimeError("No training texts found after preprocessing.")
 
     def tokenizer_text_stream():
@@ -613,6 +714,7 @@ def command_train(config: Dict[str, Any]) -> int:
         tokenizer=tokenizer,
         context_length=context_length,
         max_tokens_per_text=max(1024, context_length * 24),
+        stride=training_settings["windowStride"],
     )
     if tokenized_corpus.sample_count <= 0:
         raise RuntimeError("Not enough tokenized samples for training.")
@@ -622,6 +724,7 @@ def command_train(config: Dict[str, Any]) -> int:
         context_length=context_length,
         batch_size=training_settings["batchSize"],
         validation_split=training_settings["validationSplit"],
+        stride=training_settings["windowStride"],
     )
 
     if stop_requested(stop_signal_path):
@@ -669,6 +772,7 @@ def command_train(config: Dict[str, Any]) -> int:
             "backendWarning": tf_info["backendWarning"],
             "requestedBatchSize": training_settings["batchSize"],
             "effectiveBatchSize": training_settings["batchSize"],
+            "windowStride": training_settings["windowStride"],
             "batchSizeAdjusted": False,
             "minimumBatchesPerEpoch": 1,
             "resumedFromCheckpoint": resumed_from_checkpoint,
@@ -691,6 +795,24 @@ def command_train(config: Dict[str, Any]) -> int:
             optimizer = base_optimizer
             use_loss_scale = False
 
+    xla_requested = bool(training_settings.get("enableXla")) and bool(tf_info.get("usingGpu"))
+    xla_enabled = xla_requested
+    train_step = build_train_step(
+        tf=tf,
+        model=model,
+        optimizer=optimizer,
+        clip_norm=1.0,
+        pad_id=tokenizer.pad_id,
+        use_loss_scale=use_loss_scale,
+        use_xla=xla_enabled,
+    )
+    validation_step = build_validation_step(
+        tf=tf,
+        model=model,
+        pad_id=tokenizer.pad_id,
+        use_xla=xla_enabled,
+    )
+
     history: List[Dict[str, Any]] = []
     processed_batches = 0
     completed_epochs = effective_resume_epoch_offset
@@ -712,16 +834,39 @@ def command_train(config: Dict[str, Any]) -> int:
                 break
 
             batch_index += 1
-            loss_value = train_batch(
-                tf=tf,
-                model=model,
-                optimizer=optimizer,
-                x_batch=x_batch,
-                y_batch=y_batch,
-                clip_norm=1.0,
-                pad_id=tokenizer.pad_id,
-                use_loss_scale=use_loss_scale,
-            )
+            try:
+                loss_value = float(train_step(x_batch, y_batch).numpy())
+            except Exception as error:
+                error_message = clean_message(error)
+                can_disable_xla = xla_enabled and ("xla" in error_message.lower() or "jit" in error_message.lower())
+                if not can_disable_xla:
+                    raise
+
+                xla_enabled = False
+                train_step = build_train_step(
+                    tf=tf,
+                    model=model,
+                    optimizer=optimizer,
+                    clip_norm=1.0,
+                    pad_id=tokenizer.pad_id,
+                    use_loss_scale=use_loss_scale,
+                    use_xla=False,
+                )
+                validation_step = build_validation_step(
+                    tf=tf,
+                    model=model,
+                    pad_id=tokenizer.pad_id,
+                    use_xla=False,
+                )
+                emit(
+                    {
+                        "type": "warning",
+                        "stage": "xla_disabled",
+                        "message": "XLA JIT отключен из-за ошибки рантайма, продолжаем обучение без JIT.",
+                        "details": error_message[:240],
+                    }
+                )
+                loss_value = float(train_step(x_batch, y_batch).numpy())
             processed_batches += 1
             total_loss += loss_value
             last_loss = loss_value
@@ -774,12 +919,7 @@ def command_train(config: Dict[str, Any]) -> int:
         if was_stopped:
             break
 
-        last_validation_loss = evaluate_validation(
-            tf=tf,
-            model=model,
-            validation_dataset=dataset_bundle.validation_dataset,
-            pad_id=tokenizer.pad_id,
-        )
+        last_validation_loss = evaluate_validation(dataset_bundle.validation_dataset, validation_step)
         if last_validation_loss is not None and (
             best_validation_loss is None or last_validation_loss < best_validation_loss
         ):

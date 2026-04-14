@@ -45,6 +45,21 @@ let lastTrainingQueueMetaSignature = '';
 let lastTrainingQueueSourcesSignature = '';
 let lastTrainingQueueRunnerSignature = '';
 
+function safeStateSignature(value) {
+  try {
+    return JSON.stringify(value);
+  } catch (_error) {
+    return JSON.stringify({
+      meta: value?.meta?.updatedAt || null,
+      sourceCount: Array.isArray(value?.sources) ? value.sources.length : 0,
+      chatCount: Array.isArray(value?.chats) ? value.chats.length : 0,
+      queueCount: Array.isArray(value?.trainingQueues?.items) ? value.trainingQueues.items.length : 0,
+      modelLifecycle: value?.model?.lifecycle || '',
+      trainedEpochs: Number(value?.model?.trainedEpochs || 0),
+    });
+  }
+}
+
 function getArtifactPaths() {
   return {
     databasePath: DB_FILE,
@@ -167,7 +182,7 @@ function normalizeTrainingQueueSource(source = {}) {
 
   return {
     ...source,
-    label: cleanText(source.label || '') || source.label || 'РСЃС‚РѕС‡РЅРёРє',
+    label: cleanText(source.label || '') || source.label || 'Источник',
     url: source.url || null,
     stats: source.stats && typeof source.stats === 'object'
       ? source.stats
@@ -947,7 +962,7 @@ async function initializeStore() {
   await importLegacyStateIfNeeded();
   const legacyTrainingQueuesSnapshot = getSnapshotRow('trainingQueues');
   const loadedState = readStateFromDatabase();
-  const currentSnapshot = JSON.stringify(loadedState);
+  const currentSnapshot = safeStateSignature(loadedState);
   state = normalizePersistedState(loadedState);
   const externalizedTrainingQueues = await externalizeTrainingQueueSources(state.trainingQueues);
   await cleanupTrainingQueueStorage(state.trainingQueues);
@@ -961,7 +976,7 @@ async function initializeStore() {
     Array.isArray(legacyTrainingQueuesSnapshot?.items) &&
     legacyTrainingQueuesSnapshot.items.length > 0;
   const hasTrainingQueueTableRows = getTableRowCount('training_queues') > 0;
-  if (JSON.stringify(state) !== currentSnapshot || externalizedTrainingQueues) {
+  if (safeStateSignature(state) !== currentSnapshot || externalizedTrainingQueues) {
     writeStateToDatabase(state);
   } else if (hasLegacyTrainingQueues && !hasTrainingQueueTableRows) {
     writeStateToDatabase(state);

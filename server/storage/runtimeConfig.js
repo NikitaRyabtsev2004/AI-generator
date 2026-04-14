@@ -35,8 +35,8 @@ const DEFAULT_RUNTIME_CONFIG = {
     systemPrompt:
       'Ты полезный ассистент. Отвечай на языке пользователя, не выдумывай факты и явно говори, если данных недостаточно. Используй предоставленные знания, контекст чата и найденные источники.',
     webSearchEnabled: false,
-    webSearchMaxResults: 4,
-    webSearchFetchPages: 2,
+    webSearchMaxResults: 6,
+    webSearchFetchPages: 3,
     webSearchTimeoutMs: 12000,
     webSearchPreferredDomains: '',
   },

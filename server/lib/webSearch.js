@@ -2,6 +2,8 @@ const cheerio = require('cheerio');
 const { fetchPageContent } = require('./content');
 const { cleanText } = require('./text');
 
+const WORD_PATTERN = /[\p{L}\p{N}]+/gu;
+
 function decodeSearchResultUrl(rawUrl) {
   const value = String(rawUrl || '').trim();
   if (!value) {
@@ -58,6 +60,57 @@ function filterPreferredDomains(results, preferredDomainsRaw) {
   });
 
   return [...preferred, ...other];
+}
+
+function tokenizeSearchText(value = '') {
+  return cleanText(value)
+    .toLowerCase()
+    .match(WORD_PATTERN) || [];
+}
+
+function scoreSearchResult(queryTokens, result, preferredDomainsRaw = '') {
+  const titleTokens = tokenizeSearchText(result.title || '');
+  const snippetTokens = tokenizeSearchText(result.snippet || '');
+  const hostTokens = tokenizeSearchText(result.host || '');
+  const allTokens = [...titleTokens, ...snippetTokens, ...hostTokens];
+  if (!allTokens.length) {
+    return 0;
+  }
+
+  const uniqueQueryTokens = Array.from(new Set(queryTokens));
+  const tokenPool = new Set(allTokens);
+  let score = 0;
+
+  uniqueQueryTokens.forEach((token) => {
+    if (titleTokens.includes(token)) {
+      score += 2.4;
+      return;
+    }
+
+    if (snippetTokens.includes(token)) {
+      score += 1.35;
+      return;
+    }
+
+    if (tokenPool.has(token)) {
+      score += 0.6;
+    }
+  });
+
+  const normalizedPreferredDomains = String(preferredDomainsRaw || '')
+    .split(',')
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+  const host = String(result.host || '').toLowerCase();
+  if (normalizedPreferredDomains.some((domain) => host === domain || host.endsWith(`.${domain}`))) {
+    score += 2.2;
+  }
+
+  if (titleTokens.length > 0) {
+    score += Math.min(titleTokens.length / 24, 0.4);
+  }
+
+  return score;
 }
 
 async function searchWeb(query, options = {}) {
@@ -120,32 +173,40 @@ async function searchWeb(query, options = {}) {
 
 async function fetchSearchDocuments(query, options = {}) {
   const searchResults = await searchWeb(query, options);
+  const queryTokens = tokenizeSearchText(query);
+  const rankedSearchResults = [...searchResults]
+    .map((result, index) => ({
+      ...result,
+      searchScore: scoreSearchResult(queryTokens, result, options.preferredDomains) + Math.max(0, (searchResults.length - index) * 0.02),
+    }))
+    .sort((left, right) => right.searchScore - left.searchScore);
   const fetchCount = Math.max(
     1,
     Math.min(
-      searchResults.length,
-      Number(options.fetchPages) || Math.min(2, searchResults.length)
+      rankedSearchResults.length,
+      Number(options.fetchPages) || Math.min(2, rankedSearchResults.length)
     )
   );
+  const selectedResults = rankedSearchResults.slice(0, fetchCount);
 
-  const fetchedDocuments = [];
-  for (let index = 0; index < fetchCount; index += 1) {
-    const result = searchResults[index];
+  const fetchedDocuments = await Promise.all(selectedResults.map(async (result) => {
     try {
       const page = await fetchPageContent(result.url);
-      fetchedDocuments.push({
+      return {
         ...result,
         content: page.content,
-      });
+      };
     } catch (_error) {
-      fetchedDocuments.push({
+      return {
         ...result,
         content: cleanText(result.snippet || ''),
-      });
+      };
     }
-  }
+  }));
 
-  return fetchedDocuments.filter((entry) => cleanText(entry.content));
+  return fetchedDocuments
+    .filter((entry) => cleanText(entry.content))
+    .sort((left, right) => (Number(right.searchScore) || 0) - (Number(left.searchScore) || 0));
 }
 
 module.exports = {

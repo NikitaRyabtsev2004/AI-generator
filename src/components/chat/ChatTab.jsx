@@ -9,6 +9,9 @@ import {
 } from '@mui/material';
 import AddCommentRoundedIcon from '@mui/icons-material/AddCommentRounded';
 import DeleteOutlineRoundedIcon from '@mui/icons-material/DeleteOutlineRounded';
+import CheckRoundedIcon from '@mui/icons-material/CheckRounded';
+import ContentCopyRoundedIcon from '@mui/icons-material/ContentCopyRounded';
+import OpenInNewRoundedIcon from '@mui/icons-material/OpenInNewRounded';
 import MenuRoundedIcon from '@mui/icons-material/MenuRounded';
 import SendRoundedIcon from '@mui/icons-material/SendRounded';
 import ThumbDownAltRoundedIcon from '@mui/icons-material/ThumbDownAltRounded';
@@ -17,6 +20,7 @@ import ThumbUpAltRoundedIcon from '@mui/icons-material/ThumbUpAltRounded';
 import ThumbUpAltOutlinedIcon from '@mui/icons-material/ThumbUpAltOutlined';
 import GlassPanel from '../shared/GlassPanel';
 import StatusPill from '../shared/StatusPill';
+import { highlightCode, parseMessageContent, splitTextParagraphs } from '../../utils/chatContent';
 import { formatDateTime, formatNumber, previewText } from '../../utils/text';
 import '../../styles/chat-tab.css';
 
@@ -132,6 +136,179 @@ function getNextTypingIndex(text, currentIndex) {
   return Math.max(currentIndex + 1, Math.min(nextIndex, value.length));
 }
 
+function renderInlineContent(text) {
+  const segments = String(text || '').split(/(`[^`\n]+`)/gu);
+  return segments.map((segment, index) => {
+    if (/^`[^`\n]+`$/u.test(segment)) {
+      return (
+        <code key={`inline-${index}`} className="message-inline-code">
+          {segment.slice(1, -1)}
+        </code>
+      );
+    }
+
+    const lines = segment.split('\n');
+    return (
+      <span key={`text-${index}`}>
+        {lines.map((line, lineIndex) => (
+          <span key={`line-${lineIndex}`}>
+            {line}
+            {lineIndex < lines.length - 1 ? <br /> : null}
+          </span>
+        ))}
+      </span>
+    );
+  });
+}
+
+function MessageTextBlock({ content }) {
+  const paragraphs = useMemo(() => splitTextParagraphs(content), [content]);
+
+  return (
+    <>
+      {paragraphs.map((paragraph, index) => (
+        <p key={`${paragraph.slice(0, 24)}-${index}`} className="message-text-block">
+          {renderInlineContent(paragraph)}
+        </p>
+      ))}
+    </>
+  );
+}
+
+function CodeBlock({ code, language }) {
+  const [copied, setCopied] = useState(false);
+  const highlightedLines = useMemo(() => highlightCode(code, language), [code, language]);
+
+  const handleCopy = async () => {
+    try {
+      await window.navigator.clipboard.writeText(code);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1400);
+    } catch (_error) {
+      setCopied(false);
+    }
+  };
+
+  return (
+    <div className="message-code-block">
+      <div className="message-code-block__header">
+        <div className="message-code-block__meta">
+          <StatusPill label={language || 'text'} tone="neutral" />
+          <span className="message-code-block__line-count">
+            {highlightedLines.length} lines
+          </span>
+        </div>
+        <IconButton size="small" className="message-code-block__copy" onClick={handleCopy}>
+          {copied ? <CheckRoundedIcon fontSize="small" /> : <ContentCopyRoundedIcon fontSize="small" />}
+        </IconButton>
+      </div>
+      <div className="message-code-block__body">
+        <div className="message-code-block__gutter">
+          {highlightedLines.map((_tokens, index) => (
+            <span key={`line-number-${index + 1}`}>{index + 1}</span>
+          ))}
+        </div>
+        <pre className="message-code-block__pre">
+          <code>
+            {highlightedLines.map((tokens, lineIndex) => (
+              <div key={`code-line-${lineIndex}`} className="message-code-block__line">
+                {tokens.length ? tokens.map((token, tokenIndex) => (
+                  <span
+                    key={`token-${lineIndex}-${tokenIndex}`}
+                    className={`token token--${token.type}`.trim()}
+                  >
+                    {token.text}
+                  </span>
+                )) : ' '}
+              </div>
+            ))}
+          </code>
+        </pre>
+      </div>
+    </div>
+  );
+}
+
+function MessageContent({ content }) {
+  const parts = useMemo(() => parseMessageContent(content), [content]);
+
+  return (
+    <>
+      {parts.map((part, index) => (
+        part.type === 'code' ? (
+          <CodeBlock
+            key={`code-${index}`}
+            code={part.content}
+            language={part.language}
+          />
+        ) : (
+          <MessageTextBlock
+            key={`text-${index}`}
+            content={part.content}
+          />
+        )
+      ))}
+    </>
+  );
+}
+
+function MessageReferences({ references = [] }) {
+  if (!references.length) {
+    return null;
+  }
+
+  return (
+    <div className="message-references">
+      <div className="message-references__header">
+        <span>Sources</span>
+        <StatusPill label={`${references.length}`} tone="neutral" />
+      </div>
+      <div className="message-references__list">
+        {references.map((reference, index) => {
+          const card = (
+            <>
+              <div className="message-reference-card__head">
+                <StatusPill
+                  label={reference.type === 'web' ? 'Web' : 'Knowledge'}
+                  tone={reference.type === 'web' ? 'accent' : 'neutral'}
+                />
+                {reference.host ? (
+                  <span className="message-reference-card__host">{reference.host}</span>
+                ) : null}
+              </div>
+              <strong className="message-reference-card__title">{reference.title}</strong>
+              {reference.excerpt ? (
+                <span className="message-reference-card__excerpt">{reference.excerpt}</span>
+              ) : null}
+            </>
+          );
+
+          return reference.url ? (
+            <a
+              key={`${reference.url}-${index}`}
+              className="message-reference-card message-reference-card--link"
+              href={reference.url}
+              target="_blank"
+              rel="noreferrer"
+            >
+              {card}
+              <OpenInNewRoundedIcon fontSize="small" className="message-reference-card__icon" />
+            </a>
+          ) : (
+            <div key={`${reference.title}-${index}`} className="message-reference-card">
+              {card}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function supportsTypingAnimation(message) {
+  return !message?.metadata?.hasCodeBlocks && !/```/u.test(String(message?.content || ''));
+}
+
 function MessageBubble({
   message,
   busy,
@@ -159,10 +336,10 @@ function MessageBubble({
             <span>{message.metadata?.loadingLabel || 'Формирую ответ...'}</span>
           </div>
         ) : (
-          <Typography variant="body1" className="message-bubble__content">
-            {displayContent ?? message.content}
+          <div className="message-bubble__content">
+            <MessageContent content={displayContent ?? message.content} />
             {isTyping ? <span className="message-bubble__typing-cursor" aria-hidden>|</span> : null}
-          </Typography>
+          </div>
         )}
 
         {message.metadata ? (
@@ -181,6 +358,8 @@ function MessageBubble({
             ) : null}
           </div>
         ) : null}
+
+        <MessageReferences references={message.metadata?.references || []} />
 
         {isRateable ? (
           <div className="message-bubble__feedback">
@@ -305,7 +484,7 @@ export default function ChatTab({
   }, []);
 
   const startTypingForMessage = useCallback((message) => {
-    if (!isAssistantReplyMessage(message) || !message.content) {
+    if (!isAssistantReplyMessage(message) || !message.content || !supportsTypingAnimation(message)) {
       return false;
     }
 
@@ -643,6 +822,11 @@ export default function ChatTab({
               Генерация ответа выполняется на сервере.
             </Alert>
           ) : null}
+          {activeChat?.truncated ? (
+            <Alert severity="info">
+              {`Показаны последние ${formatNumber(activeChat.returnedMessageCount || 0)} из ${formatNumber(activeChat.totalMessageCount || 0)} сообщений, чтобы чат не перегружал память.`}
+            </Alert>
+          ) : null}
           {!canChat ? (
             <Alert severity="info">
               Сначала обучите модель на вкладке обучения, иначе ответы будут недоступны.
@@ -651,7 +835,11 @@ export default function ChatTab({
 
           <div className="message-list" ref={messageListRef} onScroll={handleMessageListScroll}>
             {visibleMessages.map((message) => {
-              const isTyping = message.id === typingMessageId && isAssistantReplyMessage(message);
+              const isTyping = (
+                message.id === typingMessageId &&
+                isAssistantReplyMessage(message) &&
+                supportsTypingAnimation(message)
+              );
               const displayContent = isTyping
                 ? message.content.slice(0, Math.min(typingVisibleLength, message.content.length))
                 : message.content;

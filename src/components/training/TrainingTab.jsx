@@ -45,6 +45,308 @@ function formatSettingValue(control, value) {
   return valueWithUnit(value, control.unit);
 }
 
+function clampControlValue(control, value) {
+  const numericValue = Number(value);
+  if (Number.isNaN(numericValue)) {
+    return control.min;
+  }
+
+  const clamped = Math.min(control.max, Math.max(control.min, numericValue));
+  if (control.precision) {
+    return Number(clamped.toFixed(control.precision));
+  }
+
+  return clamped;
+}
+
+function estimateParameterCount(settings = {}) {
+  const training = settings.training || {};
+  const sequenceLength = Math.max(Number(training.sequenceLength) || 0, 1);
+  const embeddingSize = Math.max(Number(training.embeddingSize) || 0, 1);
+  const transformerLayers = Math.max(Number(training.transformerLayers) || 0, 1);
+  const feedForwardSize = Math.max(Number(training.feedForwardSize) || 0, embeddingSize);
+  const vocabularyLimit = Math.max(Number(training.vocabularyLimit) || 0, 256);
+
+  const tokenEmbeddings = vocabularyLimit * embeddingSize;
+  const positionalEmbeddings = sequenceLength * embeddingSize;
+  const attentionWeightsPerLayer = 4 * embeddingSize * embeddingSize;
+  const feedForwardWeightsPerLayer = 2 * embeddingSize * feedForwardSize;
+  const layerNormAndBiasPerLayer = (embeddingSize * 6) + feedForwardSize;
+  const transformerWeights = transformerLayers * (
+    attentionWeightsPerLayer +
+    feedForwardWeightsPerLayer +
+    layerNormAndBiasPerLayer
+  );
+  const outputProjection = vocabularyLimit * embeddingSize;
+
+  return Math.round(
+    tokenEmbeddings +
+    positionalEmbeddings +
+    transformerWeights +
+    outputProjection
+  );
+}
+
+const TARGET_MODEL_PARAMETER_COUNT = 500_000_000;
+
+function buildControlMap() {
+  const map = new Map();
+  SETTING_GROUPS.forEach((group) => {
+    group.controls.forEach((control) => {
+      map.set(`${control.section}.${control.key}`, control);
+    });
+  });
+  return map;
+}
+
+const CONTROL_MAP = buildControlMap();
+
+function getControl(section, key) {
+  return CONTROL_MAP.get(`${section}.${key}`) || null;
+}
+
+function snapToControl(control, value, fallback = null) {
+  if (!control) {
+    return Number(value) || 0;
+  }
+  const baseValue = Number.isFinite(Number(value)) ? Number(value) : (fallback ?? control.min);
+  const bounded = Math.max(control.min, Math.min(control.max, baseValue));
+  const step = Number(control.step) || 1;
+  const snapped = control.min + (Math.round((bounded - control.min) / step) * step);
+  if (control.precision) {
+    return Number(snapped.toFixed(control.precision));
+  }
+  return snapped;
+}
+
+function resolveAttentionHeads(embeddingSize, requestedHeads, maxHeads) {
+  const allowed = [];
+  for (let value = 1; value <= maxHeads; value += 1) {
+    if (embeddingSize % value === 0) {
+      allowed.push(value);
+    }
+  }
+  if (!allowed.length) {
+    return 1;
+  }
+  const requested = Math.max(1, Math.floor(Number(requestedHeads) || 1));
+  const lowerOrEqual = allowed.filter((value) => value <= requested);
+  if (lowerOrEqual.length) {
+    return lowerOrEqual[lowerOrEqual.length - 1];
+  }
+  return allowed[0];
+}
+
+function estimateMaxSafeBatchSize(sequenceLength, embeddingSize, attentionHeads, transformerLayers, feedForwardSize = null) {
+  const seq = Math.max(16, Number(sequenceLength) || 16);
+  const emb = Math.max(32, Number(embeddingSize) || 32);
+  const heads = Math.max(1, Number(attentionHeads) || 1);
+  const layers = Math.max(1, Number(transformerLayers) || 1);
+
+  let base;
+  if (seq <= 128) base = 64;
+  else if (seq <= 256) base = 24;
+  else if (seq <= 384) base = 12;
+  else if (seq <= 512) base = 8;
+  else if (seq <= 768) base = 4;
+  else if (seq <= 1024) base = 2;
+  else base = 1;
+
+  const widthPenalty = Math.sqrt(Math.max(1, emb / 512));
+  const headPenalty = Math.sqrt(Math.max(1, heads / 8));
+  const depthPenalty = Math.sqrt(Math.max(1, layers / 12));
+  const feedForwardPenalty = feedForwardSize
+    ? Math.sqrt(Math.max(1, Number(feedForwardSize) / Math.max(emb * 4, 1)))
+    : 1;
+  const corrected = Math.floor(base / (widthPenalty * headPenalty * depthPenalty * feedForwardPenalty));
+  return Math.max(1, corrected);
+}
+
+function estimateAttentionTensorBytes(training = {}) {
+  const batchSize = Math.max(1, Number(training.batchSize) || 1);
+  const attentionHeads = Math.max(1, Number(training.attentionHeads) || 1);
+  const sequenceLength = Math.max(16, Number(training.sequenceLength) || 16);
+  return batchSize * attentionHeads * sequenceLength * sequenceLength * 4;
+}
+
+function estimateFfnTensorBytes(training = {}) {
+  const batchSize = Math.max(1, Number(training.batchSize) || 1);
+  const sequenceLength = Math.max(16, Number(training.sequenceLength) || 16);
+  const feedForwardSize = Math.max(64, Number(training.feedForwardSize) || 64);
+  return batchSize * sequenceLength * feedForwardSize * 4;
+}
+
+function estimateMaxSafeFeedForwardSize(sequenceLength, batchSize, transformerLayers, embeddingSize, controlMax = 32768) {
+  const seq = Math.max(16, Number(sequenceLength) || 16);
+  const batch = Math.max(1, Number(batchSize) || 1);
+  const layers = Math.max(1, Number(transformerLayers) || 1);
+  const emb = Math.max(32, Number(embeddingSize) || 32);
+
+  const ratioCap = emb * 8;
+  const activationBudgetBytes = 96 * 1024 * 1024;
+  const denominator = Math.max(1, batch * seq * 4);
+  const activationCap = Math.floor((activationBudgetBytes / denominator) / Math.max(1, Math.sqrt(layers / 12)));
+  return Math.max(emb, Math.min(controlMax, ratioCap, activationCap));
+}
+
+function applyModelConstraints(settings = {}) {
+  const nextSettings = structuredClone(settings || {});
+  nextSettings.training = { ...(nextSettings.training || {}) };
+  nextSettings.generation = { ...(nextSettings.generation || {}) };
+  const adjustments = [];
+
+  const sequenceControl = getControl('training', 'sequenceLength');
+  const embeddingControl = getControl('training', 'embeddingSize');
+  const headsControl = getControl('training', 'attentionHeads');
+  const layersControl = getControl('training', 'transformerLayers');
+  const feedForwardControl = getControl('training', 'feedForwardSize');
+  const batchControl = getControl('training', 'batchSize');
+  const chunkSizeControl = getControl('training', 'chunkSize');
+  const chunkOverlapControl = getControl('training', 'chunkOverlap');
+  const maxGeneratedTokensControl = getControl('generation', 'maxGeneratedTokens');
+
+  const prevSequenceLength = Number(nextSettings.training.sequenceLength);
+  nextSettings.training.sequenceLength = snapToControl(sequenceControl, prevSequenceLength, 128);
+
+  const prevEmbeddingSize = Number(nextSettings.training.embeddingSize);
+  nextSettings.training.embeddingSize = snapToControl(embeddingControl, prevEmbeddingSize, 128);
+
+  const prevAttentionHeads = Number(nextSettings.training.attentionHeads);
+  nextSettings.training.attentionHeads = resolveAttentionHeads(
+    nextSettings.training.embeddingSize,
+    prevAttentionHeads,
+    headsControl?.max || 64
+  );
+
+  const prevLayers = Number(nextSettings.training.transformerLayers);
+  nextSettings.training.transformerLayers = snapToControl(layersControl, prevLayers, 4);
+
+  const feedForwardFloor = Math.max(
+    nextSettings.training.embeddingSize,
+    feedForwardControl?.min || 64
+  );
+
+  const prevChunkSize = Number(nextSettings.training.chunkSize);
+  nextSettings.training.chunkSize = snapToControl(chunkSizeControl, prevChunkSize, 180);
+
+  const prevChunkOverlap = Number(nextSettings.training.chunkOverlap);
+  const overlapCeiling = Math.max(
+    chunkOverlapControl?.min || 0,
+    Math.min(chunkOverlapControl?.max || 1024, nextSettings.training.chunkSize - 8)
+  );
+  nextSettings.training.chunkOverlap = Math.min(
+    overlapCeiling,
+    snapToControl(chunkOverlapControl, prevChunkOverlap, 36)
+  );
+
+  const dynamicBatchMaxByCore = estimateMaxSafeBatchSize(
+    nextSettings.training.sequenceLength,
+    nextSettings.training.embeddingSize,
+    nextSettings.training.attentionHeads,
+    nextSettings.training.transformerLayers
+  );
+  const prevBatchSize = Number(nextSettings.training.batchSize);
+  nextSettings.training.batchSize = Math.max(
+    1,
+    Math.min(dynamicBatchMaxByCore, snapToControl(batchControl, prevBatchSize, 8))
+  );
+
+  const prevFeedForward = Number(nextSettings.training.feedForwardSize);
+  const dynamicFeedForwardMax = Math.max(
+    feedForwardFloor,
+    estimateMaxSafeFeedForwardSize(
+      nextSettings.training.sequenceLength,
+      nextSettings.training.batchSize,
+      nextSettings.training.transformerLayers,
+      nextSettings.training.embeddingSize,
+      feedForwardControl?.max || 32768
+    )
+  );
+  nextSettings.training.feedForwardSize = Math.max(
+    feedForwardFloor,
+    snapToControl(
+      { ...feedForwardControl, min: feedForwardFloor, max: dynamicFeedForwardMax },
+      prevFeedForward,
+      nextSettings.training.embeddingSize * 4
+    )
+  );
+
+  const dynamicBatchMax = estimateMaxSafeBatchSize(
+    nextSettings.training.sequenceLength,
+    nextSettings.training.embeddingSize,
+    nextSettings.training.attentionHeads,
+    nextSettings.training.transformerLayers,
+    nextSettings.training.feedForwardSize
+  );
+  nextSettings.training.batchSize = Math.min(
+    nextSettings.training.batchSize,
+    Math.max(1, dynamicBatchMax)
+  );
+
+  const prevMaxGeneratedTokens = Number(nextSettings.generation.maxGeneratedTokens);
+  const generatedLimit = Math.max(
+    maxGeneratedTokensControl?.min || 16,
+    Math.min(maxGeneratedTokensControl?.max || 4096, nextSettings.training.sequenceLength)
+  );
+  nextSettings.generation.maxGeneratedTokens = Math.min(
+    generatedLimit,
+    snapToControl(maxGeneratedTokensControl, prevMaxGeneratedTokens, 320)
+  );
+
+  if (prevAttentionHeads !== nextSettings.training.attentionHeads) {
+    adjustments.push('`attentionHeads` автоматически подстроен под `embeddingSize` (должен делиться без остатка).');
+  }
+  if (prevBatchSize !== nextSettings.training.batchSize) {
+    adjustments.push('`batchSize` ограничен динамически по длине контекста и размеру модели для снижения риска OOM.');
+  }
+  if (prevFeedForward !== nextSettings.training.feedForwardSize) {
+    adjustments.push('`feedForwardSize` ограничен динамически по архитектуре и памяти (FFN/GELU).');
+  }
+  if (prevChunkOverlap !== nextSettings.training.chunkOverlap) {
+    adjustments.push('`chunkOverlap` ограничен так, чтобы оставаться меньше `chunkSize`.');
+  }
+  if (prevMaxGeneratedTokens !== nextSettings.generation.maxGeneratedTokens) {
+    adjustments.push('`maxGeneratedTokens` ограничен текущей длиной контекста модели.');
+  }
+
+  const parameterCount = estimateParameterCount(nextSettings);
+  const attentionTensorBytes = estimateAttentionTensorBytes(nextSettings.training);
+  const ffnTensorBytes = estimateFfnTensorBytes(nextSettings.training);
+  const ratioToTarget = parameterCount / TARGET_MODEL_PARAMETER_COUNT;
+  const nearTarget = ratioToTarget >= 0.8 && ratioToTarget <= 1.2;
+  const attentionTensorGb = attentionTensorBytes / (1024 ** 3);
+  const ffnTensorGb = ffnTensorBytes / (1024 ** 3);
+  const highOomRisk = attentionTensorGb >= 1.1 || ffnTensorGb >= 0.2;
+
+  return {
+    settings: nextSettings,
+    adjustments,
+    dynamicLimits: {
+      batchSizeMax: dynamicBatchMax,
+      feedForwardSizeMax: dynamicFeedForwardMax,
+      generatedTokensMax: generatedLimit,
+      chunkOverlapMax: overlapCeiling,
+    },
+    diagnostics: {
+      parameterCount,
+      ratioToTarget,
+      nearTarget,
+      attentionTensorBytes,
+      attentionTensorGb,
+      ffnTensorBytes,
+      ffnTensorGb,
+      highOomRisk,
+    },
+  };
+}
+
+function formatRangeValue(control, value) {
+  if (control.precision) {
+    return Number(value).toFixed(control.precision);
+  }
+  return formatNumber(value);
+}
+
 function modelFactRows(snapshot) {
   const { model, runtime, knowledge } = snapshot;
 
@@ -179,7 +481,9 @@ export default function TrainingTab({
   const snapshotSettingsKey = useMemo(() => JSON.stringify(snapshot.settings), [snapshot.settings]);
   const runtimeConfig = useMemo(() => snapshot.runtime?.config || {}, [snapshot.runtime?.config]);
   const runtimeSnapshotKey = useMemo(() => JSON.stringify(runtimeConfig), [runtimeConfig]);
-  const [settingsDraft, setSettingsDraft] = useState(() => structuredClone(snapshot.settings));
+  const [settingsDraft, setSettingsDraft] = useState(
+    () => applyModelConstraints(structuredClone(snapshot.settings)).settings
+  );
   const [runtimeDraft, setRuntimeDraft] = useState(() => structuredClone(runtimeConfig));
   const [urlInput, setUrlInput] = useState('');
   const [queueNameInput, setQueueNameInput] = useState('');
@@ -202,7 +506,7 @@ export default function TrainingTab({
     const currentDraftKey = currentDraftKeyRef.current;
 
     if (currentDraftKey === previousSnapshotKey || currentDraftKey === snapshotSettingsKey) {
-      setSettingsDraft(structuredClone(snapshot.settings));
+      setSettingsDraft(applyModelConstraints(structuredClone(snapshot.settings)).settings);
       currentDraftKeyRef.current = snapshotSettingsKey;
     }
 
@@ -223,10 +527,18 @@ export default function TrainingTab({
 
   const factRows = useMemo(() => modelFactRows(snapshot), [snapshot]);
   const statusEntries = snapshot.training?.recentStatuses || [];
+  const modelConstraintReport = useMemo(
+    () => applyModelConstraints(settingsDraft),
+    [settingsDraft]
+  );
   const hasUnsavedSettings = useMemo(
     () => JSON.stringify(settingsDraft) !== snapshotSettingsKey,
     [settingsDraft, snapshotSettingsKey]
   );
+  const estimatedParameterCount = modelConstraintReport.diagnostics.parameterCount;
+  const parameterDelta = estimatedParameterCount - TARGET_MODEL_PARAMETER_COUNT;
+  const parameterDeltaSign = parameterDelta >= 0 ? '+' : '-';
+  const parameterDeltaAbs = Math.abs(parameterDelta);
   const hasUnsavedRuntimeSettings = useMemo(
     () => JSON.stringify(runtimeDraft) !== runtimeSnapshotKey,
     [runtimeDraft, runtimeSnapshotKey]
@@ -271,10 +583,21 @@ export default function TrainingTab({
   const canRollbackTraining = (isTraining || isSavingCheckpoint || isQueueRunnerActive) && snapshot.model.trainedEpochs > 0;
   const rollbackActionLabel = 'Остановить и откатить';
   const deleteActionLabel = trainingLocked ? 'Остановить и удалить' : 'Удалить модель';
+  const updateSettingsDraft = (updater) => {
+    setSettingsDraft((current) => {
+      const nextDraft = typeof updater === 'function' ? updater(current) : updater;
+      return applyModelConstraints(nextDraft).settings;
+    });
+  };
 
   const handleTrainClick = async () => {
+    const constrainedDraft = modelConstraintReport.settings;
+    if (JSON.stringify(constrainedDraft) !== JSON.stringify(settingsDraft)) {
+      setSettingsDraft(constrainedDraft);
+    }
+
     if (hasUnsavedSettings) {
-      const savedSnapshot = await onSaveSettings(settingsDraft);
+      const savedSnapshot = await onSaveSettings(constrainedDraft);
       if (!savedSnapshot) {
         return;
       }
@@ -373,6 +696,16 @@ export default function TrainingTab({
               Есть несохраненные изменения настроек.
             </Alert>
           ) : null}
+          {modelConstraintReport.adjustments.length ? (
+            <Alert severity="info">
+              {`Автокоррекция параметров: ${modelConstraintReport.adjustments.join(' ')}`}
+            </Alert>
+          ) : null}
+          {modelConstraintReport.diagnostics.highOomRisk ? (
+            <Alert severity="warning">
+              {`Высокий риск OOM: attention ~${formatBytes(modelConstraintReport.diagnostics.attentionTensorBytes)}, FFN/GELU ~${formatBytes(modelConstraintReport.diagnostics.ffnTensorBytes)} на шаге. Уменьшите batch size, sequence length или feed-forward size.`}
+            </Alert>
+          ) : null}
           {!canTrain ? (
             <Alert severity="info">
               Добавьте хотя бы один `TXT`, `CSV`, `JSON`-файл или URL.
@@ -433,6 +766,43 @@ export default function TrainingTab({
                   Создать и переключить
                 </Button>
               </div>
+
+              <div className="settings-estimate-card">
+                <div>
+                  <Typography variant="subtitle2">Оценка параметров</Typography>
+                  <Typography variant="caption" className="muted-text">
+                    По текущим настройкам модель будет приблизительно этого масштаба. Значение удобно для проверки крупных конфигов.
+                  </Typography>
+                </div>
+                <div className="settings-estimate-card__value">
+                  <strong>{formatNumber(estimatedParameterCount)}</strong>
+                  <span>params</span>
+                </div>
+              </div>
+              <div className="settings-guidance-grid">
+                <div className="settings-guidance-chip">
+                  <Typography variant="caption" className="muted-text">Цель</Typography>
+                  <Typography variant="body2">~{formatNumber(TARGET_MODEL_PARAMETER_COUNT)} params</Typography>
+                </div>
+                <div className="settings-guidance-chip">
+                  <Typography variant="caption" className="muted-text">Отклонение</Typography>
+                  <Typography variant="body2">{`${parameterDeltaSign}${formatNumber(parameterDeltaAbs)}`}</Typography>
+                </div>
+                <div className="settings-guidance-chip">
+                  <Typography variant="caption" className="muted-text">Риск тензоров/OOM</Typography>
+                  <Typography variant="body2">
+                    {`${Math.max(
+                      modelConstraintReport.diagnostics.attentionTensorGb,
+                      modelConstraintReport.diagnostics.ffnTensorGb
+                    ).toFixed(2)} GB`}
+                  </Typography>
+                </div>
+              </div>
+              {!modelConstraintReport.diagnostics.nearTarget ? (
+                <Typography variant="caption" className="muted-text">
+                  Для модели около 500M параметров поднимайте в первую очередь `embeddingSize` и `transformerLayers`, но компенсируйте это уменьшением `batchSize` и/или `sequenceLength`.
+                </Typography>
+              ) : null}
 
               <div className="model-library-list">
                 {modelRegistry.length ? modelRegistry.map((entry) => (
@@ -534,6 +904,63 @@ export default function TrainingTab({
                   />
                 </div>
 
+                <div className="settings-number-grid">
+                  <TextField
+                    className="text-input"
+                    type="number"
+                    label="Результатов в поиске"
+                    value={runtimeDraft?.generation?.webSearchMaxResults ?? 6}
+                    disabled={trainingLocked}
+                    inputProps={{ min: 1, max: 24, step: 1 }}
+                    onChange={(event) => {
+                      const nextValue = Math.min(24, Math.max(1, Number(event.target.value) || 1));
+                      setRuntimeDraft((current) => ({
+                        ...current,
+                        generation: {
+                          ...current.generation,
+                          webSearchMaxResults: nextValue,
+                        },
+                      }));
+                    }}
+                  />
+                  <TextField
+                    className="text-input"
+                    type="number"
+                    label="Страниц для чтения"
+                    value={runtimeDraft?.generation?.webSearchFetchPages ?? 3}
+                    disabled={trainingLocked}
+                    inputProps={{ min: 1, max: 12, step: 1 }}
+                    onChange={(event) => {
+                      const nextValue = Math.min(12, Math.max(1, Number(event.target.value) || 1));
+                      setRuntimeDraft((current) => ({
+                        ...current,
+                        generation: {
+                          ...current.generation,
+                          webSearchFetchPages: nextValue,
+                        },
+                      }));
+                    }}
+                  />
+                  <TextField
+                    className="text-input"
+                    type="number"
+                    label="Timeout web-поиска"
+                    value={runtimeDraft?.generation?.webSearchTimeoutMs ?? 12000}
+                    disabled={trainingLocked}
+                    inputProps={{ min: 2000, max: 60000, step: 1000 }}
+                    onChange={(event) => {
+                      const nextValue = Math.min(60000, Math.max(2000, Number(event.target.value) || 2000));
+                      setRuntimeDraft((current) => ({
+                        ...current,
+                        generation: {
+                          ...current.generation,
+                          webSearchTimeoutMs: nextValue,
+                        },
+                      }));
+                    }}
+                  />
+                </div>
+
                 <div className="settings-control">
                   <div className="settings-control__header">
                     <Typography variant="subtitle2">Системный промпт</Typography>
@@ -584,7 +1011,7 @@ export default function TrainingTab({
                         value={value}
                         onChange={(event) => {
                           const nextValue = event.target.value;
-                          setSettingsDraft((current) => ({
+                          updateSettingsDraft((current) => ({
                             ...current,
                             [control.section]: {
                               ...current[control.section],
@@ -629,6 +1056,43 @@ export default function TrainingTab({
                   <div className="settings-control-list">
                     {group.controls.map((control) => {
                       const value = settingsDraft?.[control.section]?.[control.key];
+                      const embeddingSizeForHeads = Math.max(1, Number(settingsDraft?.training?.embeddingSize) || 1);
+                      const maxAllowedHeads = (() => {
+                        if (control.key !== 'attentionHeads') {
+                          return control.max;
+                        }
+                        let candidate = 1;
+                        for (let head = 1; head <= control.max; head += 1) {
+                          if (embeddingSizeForHeads % head === 0) {
+                            candidate = head;
+                          }
+                        }
+                        return candidate;
+                      })();
+                      const dynamicMax = control.key === 'batchSize'
+                        ? Math.max(control.min, modelConstraintReport.dynamicLimits.batchSizeMax)
+                        : control.key === 'feedForwardSize'
+                          ? Math.max(control.min, modelConstraintReport.dynamicLimits.feedForwardSizeMax)
+                        : control.key === 'chunkOverlap'
+                          ? Math.max(control.min, modelConstraintReport.dynamicLimits.chunkOverlapMax)
+                          : control.key === 'maxGeneratedTokens'
+                            ? Math.max(control.min, modelConstraintReport.dynamicLimits.generatedTokensMax)
+                            : control.key === 'attentionHeads'
+                              ? Math.max(1, maxAllowedHeads)
+                              : control.max;
+                      const dynamicMin = control.min;
+                      const hasDynamicRange = dynamicMax < control.max;
+                      const sliderMarks = hasDynamicRange
+                        ? [
+                            { value: control.min, label: `${formatRangeValue(control, control.min)}` },
+                            { value: dynamicMax, label: `лимит ${formatRangeValue(control, dynamicMax)}` },
+                            { value: control.max, label: `${formatRangeValue(control, control.max)}` },
+                          ]
+                        : [
+                            { value: control.min, label: `${formatRangeValue(control, control.min)}` },
+                            { value: control.max, label: `${formatRangeValue(control, control.max)}` },
+                          ];
+                      const isOutsideDynamic = Number(value) > dynamicMax || Number(value) < dynamicMin;
                       return (
                         <div className="settings-control" key={control.key}>
                           <div className="settings-control__header">
@@ -638,9 +1102,44 @@ export default function TrainingTab({
                                 <InfoOutlinedIcon className="info-icon" />
                               </Tooltip>
                             </div>
-                            <span className="settings-control__value">
-                              {formatSettingValue(control, value)}
-                            </span>
+                            <div className="settings-control__tools">
+                              <span className="settings-control__value">
+                                {formatSettingValue(control, value)}
+                              </span>
+                              <TextField
+                                className="settings-control__input"
+                                type="number"
+                                size="small"
+                                value={value}
+                                disabled={trainingLocked}
+                                inputProps={{
+                                  min: control.min,
+                                  max: control.max,
+                                  step: control.step,
+                                }}
+                                error={isOutsideDynamic}
+                                helperText={hasDynamicRange
+                                  ? `Сейчас доступно: ${formatRangeValue(control, dynamicMin)}-${formatRangeValue(control, dynamicMax)}`
+                                  : ' '}
+                                onChange={(event) => {
+                                  const nextValue = Number(event.target.value);
+                                  if (Number.isNaN(nextValue)) {
+                                    return;
+                                  }
+
+                                  updateSettingsDraft((current) => ({
+                                    ...current,
+                                    [control.section]: {
+                                      ...current[control.section],
+                                      [control.key]: clampControlValue(
+                                        { ...control, min: dynamicMin, max: dynamicMax },
+                                        nextValue
+                                      ),
+                                    },
+                                  }));
+                                }}
+                              />
+                            </div>
                           </div>
                           <Slider
                             value={value}
@@ -648,18 +1147,27 @@ export default function TrainingTab({
                             max={control.max}
                             step={control.step}
                             disabled={trainingLocked}
+                            marks={sliderMarks}
                             valueLabelDisplay="auto"
                             valueLabelFormat={(nextValue) => formatSettingValue(control, nextValue)}
                             onChange={(_event, nextValue) =>
-                              setSettingsDraft((current) => ({
+                              updateSettingsDraft((current) => ({
                                 ...current,
                                 [control.section]: {
                                   ...current[control.section],
-                                  [control.key]: nextValue,
+                                  [control.key]: clampControlValue(
+                                    { ...control, min: dynamicMin, max: dynamicMax },
+                                    nextValue
+                                  ),
                                 },
                               }))
                             }
                           />
+                          {hasDynamicRange ? (
+                            <Typography variant="caption" className="muted-text settings-control__range-hint">
+                              {`Полный диапазон: ${formatRangeValue(control, control.min)}-${formatRangeValue(control, control.max)}. Активный лимит сейчас: ${formatRangeValue(control, dynamicMin)}-${formatRangeValue(control, dynamicMax)}.`}
+                            </Typography>
+                          ) : null}
                           {control.key === 'batchSize' && snapshot.model.trainingItemCount > 0 ? (
                             <Typography variant="caption" className="muted-text">
                               {`При ${formatNumber(snapshot.model.trainingItemCount)} обучающих окнах это примерно ${formatNumber(
@@ -671,6 +1179,16 @@ export default function TrainingTab({
                                   1
                                 )
                               )} батч(ей) на эпоху.`}
+                            </Typography>
+                          ) : null}
+                          {control.key === 'batchSize' ? (
+                            <Typography variant="caption" className="muted-text">
+                              {`Динамический лимит batch size для текущей архитектуры: ${formatNumber(modelConstraintReport.dynamicLimits.batchSizeMax)}.`}
+                            </Typography>
+                          ) : null}
+                          {control.key === 'feedForwardSize' ? (
+                            <Typography variant="caption" className="muted-text">
+                              {`Динамический лимит feed-forward для текущей архитектуры: ${formatNumber(modelConstraintReport.dynamicLimits.feedForwardSizeMax)}.`}
                             </Typography>
                           ) : null}
                         </div>
@@ -686,7 +1204,7 @@ export default function TrainingTab({
             <Button
               variant="contained"
               className="action-button"
-              onClick={() => onSaveSettings(settingsDraft)}
+              onClick={() => onSaveSettings(modelConstraintReport.settings)}
               disabled={busy || trainingLocked || !hasUnsavedSettings}
             >
               Сохранить настройки сервера

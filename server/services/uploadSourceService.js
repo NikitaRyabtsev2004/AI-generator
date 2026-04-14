@@ -361,6 +361,24 @@ async function inspectDatasetFile(file, fileKind) {
     return null;
   }
 
+  const normalizeParquetInspectionError = (rawError = '') => {
+    const normalized = cleanText(String(rawError || ''));
+    if (!normalized) {
+      return 'Не удалось прочитать parquet-файл.';
+    }
+
+    if (/pyarrow/iu.test(normalized)) {
+      return 'Parquet не может быть обработан: в Python-окружении отсутствует пакет pyarrow. ' +
+        'Установите зависимости в каталоге server/python и повторите загрузку.';
+    }
+
+    if (/not[_\s-]?found|enoent/iu.test(normalized)) {
+      return 'Parquet-файл не найден во временном хранилище. Повторите загрузку.';
+    }
+
+    return `Не удалось обработать parquet-файл: ${normalized}`;
+  };
+
   try {
     const payload = await runPythonBackendJson(
       'inspect_dataset',
@@ -385,11 +403,30 @@ async function inspectDatasetFile(file, fileKind) {
 
     const fileSummary = Array.isArray(payload?.files) ? payload.files[0] : null;
     if (!fileSummary || typeof fileSummary !== 'object') {
-      return null;
+      throw new Error('Не удалось получить результат инспекции parquet-файла.');
     }
+
+    if (fileSummary.error) {
+      throw new Error(normalizeParquetInspectionError(fileSummary.error));
+    }
+
+    const sampleRecordCount = Math.max(Number(fileSummary.sampleRecordCount) || 0, 0);
+    const estimatedRecordCount = Math.max(
+      Number(fileSummary.estimatedRecordCount) || 0,
+      Number(fileSummary.rowCount) || 0,
+      0
+    );
+    const fileSizeBytes = Math.max(Number(fileSummary.sizeBytes) || 0, Number(file.size) || 0, 0);
+    if (!sampleRecordCount && !estimatedRecordCount && fileSizeBytes > 0) {
+      throw new Error(
+        'Не удалось извлечь ни одной текстовой записи из parquet-файла. ' +
+        'Проверьте, что в файле есть текстовые колонки или строковые поля.'
+      );
+    }
+
     return fileSummary;
-  } catch (_error) {
-    return null;
+  } catch (error) {
+    throw new Error(normalizeParquetInspectionError(error?.message || error));
   }
 }
 

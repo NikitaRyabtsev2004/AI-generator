@@ -102,19 +102,12 @@ class TransformerBlock(keras.layers.Layer):
         self.norm_ffn = keras.layers.LayerNormalization(epsilon=1e-5)
 
     def call(self, inputs, training: Optional[bool] = None):
-        seq_len = tf.shape(inputs)[1]
-        batch_size = tf.shape(inputs)[0]
-
-        causal = tf.linalg.band_part(tf.ones((seq_len, seq_len)), -1, 0)
-        causal = tf.reshape(causal, (1, seq_len, seq_len))
-        causal = tf.tile(causal, [batch_size, 1, 1])
-
         attention_out = self.attention(
             query=inputs,
             value=inputs,
             key=inputs,
-            attention_mask=causal,
             training=training,
+            use_causal_mask=True,
         )
         attention_out = self.dropout_attention(attention_out, training=training)
         hidden = self.norm_attention(inputs + attention_out)

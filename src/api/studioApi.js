@@ -466,7 +466,7 @@ export async function sendChatMessage(chatId, content) {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ content }),
-    timeoutMs: 70000,
+    timeoutMs: 120000,
   });
   return payload.snapshot;
 }

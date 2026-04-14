@@ -79,6 +79,30 @@ const SHORT_SOCIAL_MESSAGE_PATTERN = /^(привет|здравствуй|здр
 const MARKDOWN_LINK_PATTERN = /\[([^\]]{1,120})\]\((https?:\/\/[^\s)]+)\)/giu;
 const URL_PATTERN = /https?:\/\/[^\s)]+/giu;
 const NOISY_WEB_HOST_PATTERN = /(dictionary|translate|wiktionary|reverso|thesaurus)/iu;
+const ARTIFACT_NOISE_PATTERN =
+  /\b(commit\s*:|old_file\s*:|new_file\s*:|old_contents\s*:|new_contents\s*:|repos\s*:|license\s*:|data\.jsonl)\b/iu;
+const STRUCTURED_TEXT_FIELDS = new Set([
+  'text',
+  'comment',
+  'description',
+  'explanation',
+  'summary',
+  'content',
+]);
+const STRUCTURED_CODE_FIELDS = new Set([
+  'code',
+  'snippet',
+  'example',
+  'new_contents',
+  'old_contents',
+]);
+const STRUCTURED_LANGUAGE_FIELDS = new Set([
+  'language',
+  'lang',
+  'syntax',
+]);
+const LOOSE_STRUCTURED_FIELD_PATTERN =
+  /["']?(text|comment|description|explanation|summary|content|code|snippet|example|new_contents|old_contents|language|lang|syntax)["']?\s*:\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/giu;
 const COMMON_QUERY_STOPWORDS = new Set([
   'и', 'а', 'но', 'или', 'если', 'то', 'же', 'ли', 'бы', 'в', 'во', 'на', 'по', 'к', 'ко',
   'с', 'со', 'у', 'о', 'об', 'от', 'до', 'за', 'из', 'под', 'над', 'при', 'для', 'про',
@@ -264,6 +288,33 @@ function createModelRegistryItemFromState(state, name = '') {
   };
 }
 
+function createFreshModelRegistryItem(state, name = '') {
+  const timestamp = nowIso();
+  const base = createDefaultModelRegistryItem();
+  return {
+    ...base,
+    id: createId('model'),
+    name: cleanText(name || '') || `Модель ${Math.max((state.modelRegistry?.items || []).length, 0) + 1}`,
+    kind: 'local',
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    lastUsedAt: timestamp,
+    packagePath: '',
+    hasCheckpoint: false,
+    summary: {
+      ...base.summary,
+      lifecycle: 'not_created',
+      trainedEpochs: 0,
+      parameterCount: 0,
+      vocabularySize: 0,
+      tokenCount: 0,
+      sourceCount: 0,
+      replyPairCount: 0,
+      backend: getGeneratorBackend(),
+    },
+  };
+}
+
 function ensureModelRegistryState(state) {
   if (!state.modelRegistry || !Array.isArray(state.modelRegistry.items)) {
     state.modelRegistry = createDefaultModelRegistryState();
@@ -401,6 +452,69 @@ function summarizeChat(chat) {
     updatedAt: chat.updatedAt,
     messageCount: chat.messages.length,
     lastMessagePreview: previewText(chat.messages[chat.messages.length - 1]?.content || '', 90),
+  };
+}
+
+const MAX_ACTIVE_CHAT_MESSAGES = 400;
+const MAX_ACTIVE_CHAT_MESSAGE_CHARS = 24000;
+const MAX_ACTIVE_CHAT_TOTAL_CHARS = 2_000_000;
+
+function sanitizeMessageMetadataForTransport(metadata = null) {
+  if (!metadata || typeof metadata !== 'object') {
+    return metadata || null;
+  }
+  const nextMetadata = { ...metadata };
+  if (Array.isArray(nextMetadata.references)) {
+    nextMetadata.references = nextMetadata.references.slice(0, 24).map((reference) => ({
+      ...reference,
+      title: previewText(reference?.title || '', 180),
+      excerpt: previewText(reference?.excerpt || '', 600),
+      host: previewText(reference?.host || '', 120),
+      url: reference?.url || '',
+    }));
+  }
+  return nextMetadata;
+}
+
+function summarizeActiveChat(chat) {
+  if (!chat) {
+    return null;
+  }
+  const allMessages = Array.isArray(chat.messages) ? chat.messages : [];
+  const tailMessages = allMessages.slice(-MAX_ACTIVE_CHAT_MESSAGES);
+  let totalChars = 0;
+  const compactMessages = [];
+
+  for (let index = tailMessages.length - 1; index >= 0; index -= 1) {
+    const message = tailMessages[index];
+    const content = String(message?.content || '');
+    const trimmedContent = content.length > MAX_ACTIVE_CHAT_MESSAGE_CHARS
+      ? `${content.slice(0, MAX_ACTIVE_CHAT_MESSAGE_CHARS)}\n...[truncated]`
+      : content;
+    const nextSize = totalChars + trimmedContent.length;
+    if (nextSize > MAX_ACTIVE_CHAT_TOTAL_CHARS) {
+      break;
+    }
+    totalChars = nextSize;
+    compactMessages.push({
+      id: message.id,
+      role: message.role,
+      content: trimmedContent,
+      createdAt: message.createdAt,
+      metadata: sanitizeMessageMetadataForTransport(message.metadata),
+    });
+  }
+
+  compactMessages.reverse();
+  return {
+    id: chat.id,
+    title: chat.title,
+    createdAt: chat.createdAt,
+    updatedAt: chat.updatedAt,
+    messages: compactMessages,
+    totalMessageCount: allMessages.length,
+    returnedMessageCount: compactMessages.length,
+    truncated: compactMessages.length < allMessages.length,
   };
 }
 
@@ -908,9 +1022,506 @@ function normalizeFinalReplyText(text) {
   );
 }
 
+function splitReplyIntoCodeBlocks(text = '') {
+  const value = String(text || '').replace(/\r\n/g, '\n').trim();
+  if (!value) {
+    return [];
+  }
+
+  const blocks = [];
+  const pattern = /```([\w#+.-]*)\n([\s\S]*?)```/gu;
+  let lastIndex = 0;
+  let match = pattern.exec(value);
+
+  while (match) {
+    if (match.index > lastIndex) {
+      blocks.push({
+        type: 'text',
+        content: value.slice(lastIndex, match.index),
+      });
+    }
+
+    blocks.push({
+      type: 'code',
+      language: cleanText(match[1] || '').toLowerCase(),
+      content: String(match[2] || '').replace(/\n+$/u, ''),
+    });
+
+    lastIndex = pattern.lastIndex;
+    match = pattern.exec(value);
+  }
+
+  if (lastIndex < value.length) {
+    blocks.push({
+      type: 'text',
+      content: value.slice(lastIndex),
+    });
+  }
+
+  return blocks.filter((block) => cleanText(block.content || '') || String(block.content || '').trim());
+}
+
+function renderMarkdownCodeBlock(language, code) {
+  const normalizedCode = String(code || '').replace(/\r\n/g, '\n').trim();
+  if (!normalizedCode) {
+    return '';
+  }
+
+  return `\`\`\`${cleanText(language || '').toLowerCase()}\n${normalizedCode}\n\`\`\``.trim();
+}
+
+function finalizeCodeAwareReply(text, maxSentences = 0) {
+  const blocks = splitReplyIntoCodeBlocks(text);
+  if (!blocks.some((block) => block.type === 'code')) {
+    return '';
+  }
+
+  let remainingSentences = Math.max(Number(maxSentences) || 0, 0);
+  const unlimited = remainingSentences === 0;
+  const resultBlocks = [];
+
+  blocks.forEach((block) => {
+    if (block.type === 'code') {
+      const renderedCode = renderMarkdownCodeBlock(block.language, block.content);
+      if (renderedCode) {
+        resultBlocks.push(renderedCode);
+      }
+      return;
+    }
+
+    const normalizedText = normalizeFinalReplyText(block.content);
+    if (!normalizedText) {
+      return;
+    }
+
+    if (unlimited) {
+      resultBlocks.push(normalizedText);
+      return;
+    }
+
+    const sentences = splitIntoSentences(normalizedText);
+    if (!sentences.length || remainingSentences <= 0) {
+      return;
+    }
+
+    const selected = sentences.slice(0, remainingSentences);
+    if (!selected.length) {
+      return;
+    }
+
+    resultBlocks.push(cleanText(selected.join(' ')));
+    remainingSentences -= selected.length;
+  });
+
+  return resultBlocks.join('\n\n').trim();
+}
+
+function looksLikeCodeLine(line = '') {
+  const value = String(line || '').trim();
+  if (!value) {
+    return false;
+  }
+  if (/^(function\s+\w+|const\s+\w+|let\s+\w+|var\s+\w+|if\s*\(|for\s*\(|while\s*\(|return\b|class\s+\w+|import\s+|export\s+|<[/a-z!])/iu.test(value)) {
+    return true;
+  }
+  if (/[{};<>]/u.test(value) && /(=|\(|\)|=>|<\/?[a-z])/iu.test(value)) {
+    return true;
+  }
+  return false;
+}
+
+function looksLikeUnfencedCodeBlock(text = '') {
+  const value = String(text || '').replace(/\r\n/g, '\n').trim();
+  if (!value || /```/u.test(value)) {
+    return false;
+  }
+  const lines = value
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length < 2) {
+    return false;
+  }
+  const codeLikeCount = lines.filter(looksLikeCodeLine).length;
+  const ratio = codeLikeCount / lines.length;
+  return codeLikeCount >= 2 && ratio >= 0.5;
+}
+
+function enforceCodeBlocksForCodeLikeReply(text = '', userMessage = '') {
+  const value = String(text || '').trim();
+  if (!value || /```/u.test(value)) {
+    return value;
+  }
+  const userAskedCode = /\b(code|function|javascript|js|typescript|python|sql|html|css|код|функц)\b/iu.test(cleanText(userMessage || ''));
+  if (!userAskedCode && !looksLikeUnfencedCodeBlock(value)) {
+    return value;
+  }
+  if (!looksLikeUnfencedCodeBlock(value)) {
+    return value;
+  }
+  const language = detectCodeLanguage(value, '');
+  return renderMarkdownCodeBlock(language, value);
+}
+
+function findClampBoundary(text, limit) {
+  const candidates = [];
+  const punctuationPattern = /[.!?](?=\s|$)/gu;
+  const paragraphPattern = /\n{2,}/gu;
+  const linePattern = /\n/gu;
+  const whitespacePattern = /\s/gu;
+
+  [paragraphPattern, punctuationPattern, linePattern, whitespacePattern].forEach((pattern) => {
+    let match = pattern.exec(text);
+    while (match) {
+      const boundary = match.index + match[0].length;
+      if (boundary <= limit) {
+        candidates.push(boundary);
+      }
+      match = pattern.exec(text);
+    }
+  });
+
+  return candidates.length ? Math.max(...candidates) : -1;
+}
+
+function clampReplyCharacters(text, maxCharacters = 0) {
+  const normalized = String(text || '').trim();
+  const limit = Math.max(Number(maxCharacters) || 0, 0);
+  if (!normalized || !limit || normalized.length <= limit) {
+    return {
+      content: normalized,
+      truncated: false,
+    };
+  }
+
+  const codeBlocks = splitReplyIntoCodeBlocks(normalized);
+  if (codeBlocks.some((block) => block.type === 'code')) {
+    const buffer = Math.min(Math.max(Math.floor(limit * 0.18), 180), 2400);
+    const target = limit + buffer;
+    const collected = [];
+    let totalLength = 0;
+
+    for (const block of codeBlocks) {
+      const rendered = block.type === 'code'
+        ? renderMarkdownCodeBlock(block.language, block.content)
+        : normalizeFinalReplyText(block.content);
+      if (!rendered) {
+        continue;
+      }
+
+      const separatorLength = collected.length ? 2 : 0;
+      const projectedLength = totalLength + separatorLength + rendered.length;
+      if (projectedLength <= target || !collected.length) {
+        collected.push(rendered);
+        totalLength = projectedLength;
+        continue;
+      }
+
+      break;
+    }
+
+    const content = collected.join('\n\n').trim();
+    return {
+      content,
+      truncated: content.length < normalized.length,
+    };
+  }
+
+  const boundary = findClampBoundary(normalized, limit);
+  if (boundary >= Math.floor(limit * 0.55)) {
+    return {
+      content: normalized.slice(0, boundary).trim(),
+      truncated: true,
+    };
+  }
+
+  return {
+    content: normalized.slice(0, limit).trim(),
+    truncated: true,
+  };
+}
+
+function detectCodeLanguage(code = '', hint = '') {
+  const normalizedHint = cleanText(hint).toLowerCase();
+  if (normalizedHint) {
+    return normalizedHint;
+  }
+
+  const value = String(code || '');
+  if (!value.trim()) {
+    return 'text';
+  }
+
+  if (/^\s*[\[{]/u.test(value) && /"\s*:\s*/u.test(value)) {
+    return 'json';
+  }
+  if (/<[a-z][\s\S]*>/iu.test(value)) {
+    return 'html';
+  }
+  if (/\b(function|const|let|var|=>|document\.|console\.)\b/u.test(value)) {
+    return 'javascript';
+  }
+  if (/\b(def |import |print\(|self\b|None\b|True\b|False\b)\b/u.test(value)) {
+    return 'python';
+  }
+  if (/\b(SELECT|FROM|WHERE|INSERT|UPDATE|DELETE|JOIN)\b/u.test(value)) {
+    return 'sql';
+  }
+  if (/\b(display\s*:|position\s*:|color\s*:|background\s*:)\b/u.test(value)) {
+    return 'css';
+  }
+  if (/^\s*(npm|yarn|pnpm|git|cd|ls|mkdir|curl|wget)\b/mu.test(value)) {
+    return 'bash';
+  }
+
+  return 'text';
+}
+
+function decodeStructuredFieldValue(value = '') {
+  const normalized = String(value || '').trim();
+  if (!normalized) {
+    return '';
+  }
+
+  if (normalized.startsWith('"') && normalized.endsWith('"')) {
+    try {
+      return JSON.parse(normalized);
+    } catch (_error) {
+      // Fallback handled below.
+    }
+  }
+
+  let unwrapped = normalized;
+  if (
+    (normalized.startsWith('"') && normalized.endsWith('"')) ||
+    (normalized.startsWith('\'') && normalized.endsWith('\''))
+  ) {
+    unwrapped = normalized.slice(1, -1);
+  }
+
+  return unwrapped
+    .replace(/\\\\/gu, '\\')
+    .replace(/\\n/gu, '\n')
+    .replace(/\\r/gu, '')
+    .replace(/\\t/gu, '  ')
+    .replace(/\\"/gu, '"')
+    .replace(/\\'/gu, '\'')
+    .trim();
+}
+
+function extractTopLevelJsonFragments(text = '') {
+  const value = String(text || '').trim();
+  if (!value) {
+    return [];
+  }
+
+  const fragments = [];
+  let startIndex = -1;
+  let depth = 0;
+  let inString = false;
+  let isEscaped = false;
+
+  for (let index = 0; index < value.length; index += 1) {
+    const symbol = value[index];
+    if (inString) {
+      if (isEscaped) {
+        isEscaped = false;
+        continue;
+      }
+      if (symbol === '\\') {
+        isEscaped = true;
+        continue;
+      }
+      if (symbol === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (symbol === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (symbol === '{' || symbol === '[') {
+      if (depth === 0) {
+        startIndex = index;
+      }
+      depth += 1;
+      continue;
+    }
+
+    if (symbol === '}' || symbol === ']') {
+      depth = Math.max(0, depth - 1);
+      if (depth === 0 && startIndex >= 0) {
+        fragments.push(value.slice(startIndex, index + 1));
+        startIndex = -1;
+      }
+    }
+  }
+
+  return fragments;
+}
+
+function collectStructuredReplyParts(payload, target = []) {
+  if (Array.isArray(payload)) {
+    payload.forEach((item) => collectStructuredReplyParts(item, target));
+    return target;
+  }
+
+  if (!payload || typeof payload !== 'object') {
+    return target;
+  }
+
+  const title = cleanText(payload.title || payload.heading || payload.name || '');
+  if (title) {
+    target.push({
+      type: 'text',
+      content: title,
+    });
+  }
+
+  const textContent = cleanText(
+    payload.text ||
+    payload.comment ||
+    payload.description ||
+    payload.explanation ||
+    payload.summary ||
+    payload.content ||
+    ''
+  );
+  if (textContent) {
+    target.push({
+      type: 'text',
+      content: textContent,
+    });
+  }
+
+  const codeContent = String(payload.code || payload.snippet || payload.example || '').replace(/\r\n/g, '\n').trim();
+  if (codeContent) {
+    target.push({
+      type: 'code',
+      language: detectCodeLanguage(codeContent, payload.language || payload.lang || payload.syntax || ''),
+      content: codeContent,
+    });
+  }
+
+  return target;
+}
+
+function collectLooseStructuredReplyParts(rawText, target = []) {
+  const raw = String(rawText || '');
+  if (!raw) {
+    return target;
+  }
+
+  let pendingLanguage = '';
+  let match = LOOSE_STRUCTURED_FIELD_PATTERN.exec(raw);
+  while (match) {
+    const fieldName = cleanText(match[1] || '').toLowerCase();
+    const fieldValue = decodeStructuredFieldValue(match[2] || '');
+
+    if (STRUCTURED_LANGUAGE_FIELDS.has(fieldName)) {
+      pendingLanguage = cleanText(fieldValue).toLowerCase();
+    } else if (STRUCTURED_CODE_FIELDS.has(fieldName)) {
+      const codeValue = String(fieldValue || '').replace(/\r\n/g, '\n').trim();
+      if (codeValue) {
+        target.push({
+          type: 'code',
+          language: detectCodeLanguage(codeValue, pendingLanguage),
+          content: codeValue,
+        });
+      }
+      pendingLanguage = '';
+    } else if (STRUCTURED_TEXT_FIELDS.has(fieldName)) {
+      const textValue = cleanText(fieldValue || '');
+      if (textValue) {
+        target.push({
+          type: 'text',
+          content: textValue,
+        });
+      }
+    }
+
+    match = LOOSE_STRUCTURED_FIELD_PATTERN.exec(raw);
+  }
+  LOOSE_STRUCTURED_FIELD_PATTERN.lastIndex = 0;
+  return target;
+}
+
+function convertStructuredReplyToMarkdown(text) {
+  const raw = String(text || '').trim();
+  if (!raw) {
+    return '';
+  }
+
+  if (/```/u.test(raw)) {
+    return raw;
+  }
+
+  if (!/"(?:text|code|snippet|example|language|lang)"/u.test(raw)) {
+    return cleanText(raw);
+  }
+
+  const candidates = [];
+  if (/^[\[{]/u.test(raw)) {
+    candidates.push(raw);
+  }
+  candidates.push(...extractTopLevelJsonFragments(raw));
+
+  const parts = [];
+  candidates.forEach((candidate) => {
+    try {
+      const parsed = JSON.parse(candidate);
+      collectStructuredReplyParts(parsed, parts);
+    } catch (_error) {
+      // Ignore malformed JSON fragments and continue with the next candidate.
+    }
+  });
+
+  if (!parts.length) {
+    collectLooseStructuredReplyParts(raw, parts);
+  }
+
+  if (!parts.length) {
+    return cleanText(raw);
+  }
+
+  const renderedParts = [];
+  const seen = new Set();
+  parts.forEach((part) => {
+    const rendered = part.type === 'code'
+      ? renderMarkdownCodeBlock(part.language, part.content)
+      : cleanText(part.content);
+    if (!rendered) {
+      return;
+    }
+
+    const signature = `${part.type}:${rendered}`;
+    if (seen.has(signature)) {
+      return;
+    }
+
+    seen.add(signature);
+    renderedParts.push(rendered);
+  });
+
+  return renderedParts.join('\n\n').trim();
+}
+
 function finalizeReplyForOutput(text, options = {}) {
   const maxSentences = Math.max(Number(options.maxSentences) || 0, 0);
-  const normalized = normalizeFinalReplyText(text);
+  const normalizedMarkup = convertStructuredReplyToMarkdown(text);
+  const codeEnforcedMarkup = enforceCodeBlocksForCodeLikeReply(
+    normalizedMarkup,
+    options.userMessage || ''
+  );
+  const codeAwareReply = finalizeCodeAwareReply(codeEnforcedMarkup, maxSentences);
+  if (codeAwareReply) {
+    return codeAwareReply;
+  }
+
+  const normalized = normalizeFinalReplyText(codeEnforcedMarkup);
   const sentenceClamped = clampReplySentenceCount(normalized, maxSentences);
   if (sentenceClamped) {
     return sentenceClamped;
@@ -952,6 +1563,37 @@ function isNoisyWebChunk(chunk = {}) {
   }
 
   return tokens.length > 24 && uniqueRatio < 0.22;
+}
+
+function isNoisyKnowledgeArtifactText(text = '') {
+  const normalized = cleanText(text || '');
+  if (!normalized) {
+    return true;
+  }
+
+  if (ARTIFACT_NOISE_PATTERN.test(normalized)) {
+    return true;
+  }
+
+  const tokenCount = tokenizeWords(normalized).length;
+  const linkCount = (normalized.match(MARKDOWN_LINK_PATTERN) || []).length;
+  const urlCount = (normalized.match(URL_PATTERN) || []).length;
+  if (tokenCount < 6) {
+    return false;
+  }
+
+  if (linkCount >= 2 || urlCount >= 3) {
+    return true;
+  }
+
+  if (
+    tokenCount > 72 &&
+    /(?:old_contents|new_contents|subject|message|lang|repos)\s*:/iu.test(normalized)
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 function isEchoReply(userText, replyText) {
@@ -1364,6 +2006,68 @@ function createExternalKnowledgeChunk(entry) {
   };
 }
 
+function extractHostLabel(url = '') {
+  try {
+    return new URL(url).host.replace(/^www\./u, '');
+  } catch (_error) {
+    return '';
+  }
+}
+
+function buildReplyReferences(chunkCandidates = []) {
+  const references = [];
+  const seen = new Set();
+
+  chunkCandidates.forEach((chunk) => {
+    const key = cleanText(chunk.url || `${chunk.sourceType || 'knowledge'}:${chunk.label || chunk.ownerId || chunk.id}`);
+    if (!key || seen.has(key) || references.length >= 4) {
+      return;
+    }
+
+    seen.add(key);
+    const excerptSource = chunk.sentences?.[0] || chunk.text || '';
+    const excerpt = clampReplyCharacters(normalizeFinalReplyText(excerptSource), 260).content;
+
+    references.push({
+      type: chunk.sourceType === 'web' ? 'web' : 'knowledge',
+      title: cleanText(chunk.label || chunk.ownerId || chunk.url || 'Источник'),
+      url: chunk.url || null,
+      host: extractHostLabel(chunk.url || ''),
+      excerpt,
+      score: Number((chunk.score || 0).toFixed(3)),
+    });
+  });
+
+  return references;
+}
+
+function buildReplyPayload(rawContent, options = {}) {
+  const {
+    maxSentences = 0,
+    maxCharacters = 0,
+    userMessage = '',
+    metadata = {},
+    references = [],
+  } = options;
+
+  const finalized = finalizeReplyForOutput(rawContent, {
+    maxSentences,
+    userMessage,
+  });
+  const limited = clampReplyCharacters(finalized, maxCharacters);
+
+  return {
+    content: limited.content,
+    metadata: {
+      ...metadata,
+      references,
+      contentTruncated: limited.truncated,
+      contentLength: limited.content.length,
+      hasCodeBlocks: /```/u.test(limited.content),
+    },
+  };
+}
+
 async function fetchWebKnowledgeCandidates({
   userMessage,
   queryMap,
@@ -1510,7 +2214,9 @@ function extractDialoguePairsFromChat(chat) {
       ownerId: chat.id,
       title: chat.title,
       origin: 'chat_feedback',
-      score: currentMessage.metadata?.userRating === 1 ? 1 : currentMessage.metadata?.selfScore || 0.7,
+      score: currentMessage.metadata?.userRating === 1
+        ? Math.max(0.86, Math.min(0.97, Number(currentMessage.metadata?.selfScore || 0.82) + 0.08))
+        : Math.max(0.15, Math.min(0.94, Number(currentMessage.metadata?.selfScore || 0.7))),
       promptText: cleanText(previousMessage.content),
       responseText: cleanText(currentMessage.content),
       combinedText: cleanText(`Пользователь: ${previousMessage.content}\nАссистент: ${currentMessage.content}`),
@@ -2390,14 +3096,18 @@ function computeSelfScore({
   const questionPenalty = cleanReply.endsWith('?') ? 0.12 : 0;
   const repeatPenalty = computeRecentReplyPenalty(cleanReply, recentAssistantReplies);
 
-  return Math.max(
+  const rawScore = 0.16 + groundedOverlap * 0.46 + topicalAlignment * 0.3 + lengthScore * 0.14
+    - echoPenalty - loopPenalty - questionPenalty - repeatPenalty;
+  const boundedRaw = Math.max(0.02, Math.min(0.985, rawScore));
+  const confidence = Math.max(
     0,
     Math.min(
       1,
-      0.16 + groundedOverlap * 0.46 + topicalAlignment * 0.3 + lengthScore * 0.14
-      - echoPenalty - loopPenalty - questionPenalty - repeatPenalty
+      groundedOverlap * 0.58 + topicalAlignment * 0.42 + Math.min(replyTokens.length / 48, 0.22)
     )
   );
+  const smoothed = 0.08 + boundedRaw * 0.72 + confidence * 0.2;
+  return Math.max(0.02, Math.min(0.985, smoothed));
 }
 
 function computeLowTopicalPenalty(relevanceScore) {
@@ -2647,6 +3357,7 @@ function buildDashboard(state, chatId = null) {
   ensureModelRegistryState(state);
   const runtimeConfig = getRuntimeConfig();
   const selectedChat = state.chats.find((chat) => chat.id === chatId) || state.chats[0] || null;
+  const activeChat = summarizeActiveChat(selectedChat);
   const ratedMessages = state.chats
     .flatMap((chat) => chat.messages)
     .filter((message) => message.role === 'assistant' && message.metadata?.userRating)
@@ -2682,7 +3393,7 @@ function buildDashboard(state, chatId = null) {
       runner: state.trainingQueues?.runner || createDefaultTrainingQueuesState().runner,
     },
     chats: state.chats.map(summarizeChat),
-    activeChat: selectedChat,
+    activeChat,
   };
 }
 
@@ -3345,6 +4056,11 @@ function markQueueAsRunning(state, queueId) {
     };
   }
 
+  function isStringSizeLimitError(error) {
+    const message = cleanText(error?.message || '').toLowerCase();
+    return message.includes('cannot create a string longer than') || message.includes('invalid string length');
+  }
+
   async function writeImportedArtifacts(storage, artifactsPayload = {}) {
     const normalizedStorage = normalizeStoragePaths(storage);
     if (!normalizedStorage.artifactDir || !normalizedStorage.neuralModelDir) {
@@ -3378,7 +4094,11 @@ function markQueueAsRunning(state, queueId) {
   }
 
   async function buildModelPackagePayload(state, options = {}) {
-    const artifactsPayload = await collectModelArtifactsForExport(state.model.storage);
+    const includeKnowledgeSnapshot = options.includeKnowledgeSnapshot !== false;
+    const includeArtifactsPayload = options.includeArtifactsPayload !== false;
+    const artifactsPayload = includeArtifactsPayload
+      ? await collectModelArtifactsForExport(state.model.storage)
+      : {};
     const artifactPaths = normalizeStoragePaths(state.model.storage);
     const hasCheckpointArtifacts = Boolean(
       artifactsPayload.tokenizer &&
@@ -3398,9 +4118,18 @@ function markQueueAsRunning(state, queueId) {
       snapshot: {
         settings: structuredClone(state.settings),
         model: normalizeModelForExport(structuredClone(state.model)),
-        knowledge: structuredClone(state.knowledge),
+        knowledge: includeKnowledgeSnapshot
+          ? structuredClone(state.knowledge)
+          : {
+            ...createDefaultKnowledgeState(),
+            languageModel: {
+              ...createDefaultKnowledgeState().languageModel,
+              ...(state.knowledge?.languageModel || {}),
+            },
+          },
       },
       runtimeConfig: structuredClone(getRuntimeConfig()),
+      embeddedArtifacts: includeArtifactsPayload,
       artifacts: hasCheckpointArtifacts
         ? {
           ...artifactsPayload,
@@ -3468,17 +4197,76 @@ function markQueueAsRunning(state, queueId) {
       return null;
     }
 
-    const payload = await buildModelPackagePayload(state, {
-      strictCheckpoint: false,
-    });
+    let payload;
+    try {
+      payload = await buildModelPackagePayload(state, {
+        strictCheckpoint: false,
+        includeKnowledgeSnapshot: false,
+        includeArtifactsPayload: false,
+      });
+    } catch (error) {
+      if (!isStringSizeLimitError(error)) {
+        throw error;
+      }
+      log('warn', 'Model library package exceeded string limit; storing compact package.', {
+        scope: 'model_library',
+        modelId: activeItem.id,
+      });
+      payload = {
+        format: MODEL_PACKAGE_FORMAT,
+        version: MODEL_PACKAGE_VERSION,
+        engine: state.model.engine,
+        exportedAt: nowIso(),
+        snapshot: {
+          settings: structuredClone(state.settings),
+          model: normalizeModelForExport(structuredClone(state.model)),
+          knowledge: {
+            ...createDefaultKnowledgeState(),
+            languageModel: {
+              ...createDefaultKnowledgeState().languageModel,
+              ...(state.knowledge?.languageModel || {}),
+            },
+          },
+        },
+        runtimeConfig: structuredClone(getRuntimeConfig()),
+        embeddedArtifacts: false,
+        artifacts: {
+          manifest: {
+            engine: state.model.engine,
+            updatedAt: state.meta?.updatedAt || nowIso(),
+            trainedEpochs: state.model.trainedEpochs,
+            parameterCount: state.model.parameterCount,
+            vocabularySize: state.model.vocabularySize,
+            sourceCount: state.model.sourceCount,
+            replyPairCount: state.model.replyPairCount,
+            corpusSignature: state.model.corpusSignature,
+            checkpointReady: false,
+            tokenizerReady: false,
+            files: normalizeStoragePaths(state.model.storage),
+          },
+          knowledgeIndex: {
+            chunks: [],
+            replyMemories: [],
+            vocabulary: {},
+            bm25: createDefaultKnowledgeState().bm25,
+          },
+          languageModel: {
+            ...createDefaultKnowledgeState().languageModel,
+            ...(state.knowledge?.languageModel || {}),
+          },
+          tokenizer: null,
+          weightsSpec: null,
+          weightsBinBase64: '',
+        },
+      };
+    }
     const packagePath = await writeModelLibraryPackage(activeItem.id, payload);
     activeItem.packagePath = packagePath;
     activeItem.updatedAt = nowIso();
     activeItem.lastUsedAt = nowIso();
     activeItem.hasCheckpoint = Boolean(
-      payload.artifacts?.tokenizer &&
-      payload.artifacts?.weightsSpec &&
-      payload.artifacts?.weightsBinBase64
+      Number(state.model?.trainedEpochs || 0) > 0 &&
+      state.knowledge?.languageModel?.checkpointReady
     );
     return activeItem;
   }
@@ -3508,7 +4296,7 @@ function markQueueAsRunning(state, queueId) {
 
     if (hasCheckpointArtifacts) {
       await writeImportedArtifacts(state.model.storage, packageArtifacts);
-    } else {
+    } else if (modelPackage.embeddedArtifacts !== false) {
       await removeModelArtifacts(state.model.storage);
     }
 
@@ -4414,8 +5202,10 @@ function markQueueAsRunning(state, queueId) {
     const runtimeConfig = getRuntimeConfig();
     const userLanguage = detectMessageLanguage(userMessage);
     if (isSimpleGreetingMessage(userMessage)) {
-      return {
-        content: buildGreetingReply(userLanguage),
+      return buildReplyPayload(buildGreetingReply(userLanguage), {
+        maxSentences: state.settings.generation.maxReplySentences,
+        maxCharacters: state.settings.generation.maxReplyCharacters,
+        userMessage,
         metadata: {
           mode: 'system',
           type: 'system',
@@ -4426,8 +5216,9 @@ function markQueueAsRunning(state, queueId) {
           selfScore: 0.92,
           userRating: 0,
           usedWebSources: [],
+          usedWebSourceEntries: [],
         },
-      };
+      });
     }
 
     const { queryMap, contextMessages } = buildWeightedQueryMap(userMessage, chat, runtimeConfig);
@@ -4472,6 +5263,8 @@ function markQueueAsRunning(state, queueId) {
             (memory.origin === 'source' ? 0.16 : 0),
         };
       })
+      .filter((memory) => !isNoisyKnowledgeArtifactText(memory.promptText))
+      .filter((memory) => !isNoisyKnowledgeArtifactText(memory.responseText))
       .filter((memory) => memory.score >= softMatchThreshold)
       .filter((memory) => memory.topicalRelevance >= topicalGate)
       .filter((memory) => memory.responseSideRelevance >= (preferGroundedKnowledge ? 0.12 : 0.06))
@@ -4493,6 +5286,7 @@ function markQueueAsRunning(state, queueId) {
             topicalRelevance * 0.45,
         };
       })
+      .filter((chunk) => !isNoisyKnowledgeArtifactText(chunk.text))
       .filter((chunk) => chunk.score > 0)
       .filter((chunk) => chunk.topicalRelevance >= topicalGate)
       .sort((left, right) => right.score - left.score)
@@ -4550,6 +5344,8 @@ function markQueueAsRunning(state, queueId) {
     const chunkCandidates = [...localChunkCandidates, ...webChunkCandidates]
       .sort((left, right) => right.score - left.score)
       .slice(0, Math.max(state.settings.training.topKChunks, webChunkCandidates.length));
+    const replyReferences = buildReplyReferences(chunkCandidates);
+    const usedWebSourceEntries = replyReferences.filter((reference) => reference.type === 'web');
 
     const knowledgeSentences = selectKnowledgeSentences(
       chunkCandidates,
@@ -4648,13 +5444,11 @@ function markQueueAsRunning(state, queueId) {
           recentAssistantReplies,
         });
 
-        return {
-          content: previewText(
-            finalizeReplyForOutput(groundedFallback, {
-              maxSentences: state.settings.generation.maxReplySentences,
-            }),
-            state.settings.generation.maxReplyCharacters
-          ),
+        return buildReplyPayload(groundedFallback, {
+          maxSentences: state.settings.generation.maxReplySentences,
+          maxCharacters: state.settings.generation.maxReplyCharacters,
+          userMessage,
+          references: replyReferences,
           metadata: {
             mode: 'knowledge',
             usedContextMessages: contextMessages.length,
@@ -4664,16 +5458,20 @@ function markQueueAsRunning(state, queueId) {
             selfScore: Number(fallbackScore.toFixed(3)),
             userRating: 0,
             usedWebSources: webChunkCandidates.map((chunk) => chunk.url).filter(Boolean).slice(0, 4),
+            usedWebSourceEntries,
           },
-        };
+        });
       }
 
       const fallbackMessage = runtimeConfig.generation?.webSearchEnabled
         ? 'Надежный ответ не найден ни в локальной базе, ни в веб-источниках. Уточните вопрос (например, версию языка, фреймворк или конкретную задачу).'
         : 'Пока в базе знаний не нашлось достаточно надежного ответа. Включите веб-поиск или добавьте профильные источники и переобучите модель.';
 
-      return {
-        content: fallbackMessage,
+      return buildReplyPayload(fallbackMessage, {
+        maxSentences: state.settings.generation.maxReplySentences,
+        maxCharacters: state.settings.generation.maxReplyCharacters,
+        userMessage,
+        references: replyReferences,
         metadata: {
           mode: 'fallback',
           usedContextMessages: contextMessages.length,
@@ -4683,8 +5481,9 @@ function markQueueAsRunning(state, queueId) {
           selfScore: 0,
           userRating: 0,
           usedWebSources: webChunkCandidates.map((chunk) => chunk.url).filter(Boolean).slice(0, 4),
+          usedWebSourceEntries,
         },
-      };
+      });
     }
 
     const selfScore = computeSelfScore({
@@ -4696,13 +5495,11 @@ function markQueueAsRunning(state, queueId) {
       recentAssistantReplies,
     });
 
-    return {
-      content: previewText(
-        finalizeReplyForOutput(candidate.content, {
-          maxSentences: state.settings.generation.maxReplySentences,
-        }),
-        state.settings.generation.maxReplyCharacters
-      ),
+    return buildReplyPayload(candidate.content, {
+      maxSentences: state.settings.generation.maxReplySentences,
+      maxCharacters: state.settings.generation.maxReplyCharacters,
+      userMessage,
+      references: replyReferences,
       metadata: {
         mode: candidate.mode,
         usedContextMessages: contextMessages.length,
@@ -4712,8 +5509,9 @@ function markQueueAsRunning(state, queueId) {
         selfScore: Number(selfScore.toFixed(3)),
         userRating: 0,
         usedWebSources: webChunkCandidates.map((chunk) => chunk.url).filter(Boolean).slice(0, 4),
+        usedWebSourceEntries,
       },
-    };
+    });
   }
 
   return {
@@ -5183,8 +5981,6 @@ function markQueueAsRunning(state, queueId) {
           ...(partialSettings.generation || {}),
         },
       };
-      const requiresKnowledgeRebuild = hasCorpusRebuildImpact(currentSettings, nextSettings);
-
       return updateState(async (state) => {
         assertTrainingUnlocked(state, 'Изменение настроек');
         const previousSettings = structuredClone(state.settings);
@@ -5200,7 +5996,7 @@ function markQueueAsRunning(state, queueId) {
             'Изменены архитектурные или корпусные параметры. Текущий чекпоинт сохранен и доступен, но для применения новой конфигурации рекомендуется запустить дообучение.'
           );
         } else {
-          pushStatus(state, 'idle', 'settings_updated', 'РќР°СЃС‚СЂРѕР№РєРё СЃРµСЂРІРµСЂР° РѕР±РЅРѕРІР»РµРЅС‹.');
+          pushStatus(state, 'idle', 'settings_updated', 'Настройки сервера обновлены.');
         }
 
         if (hasCorpusRebuildImpact(previousSettings, state.settings)) {
@@ -5209,7 +6005,7 @@ function markQueueAsRunning(state, queueId) {
       }, {
         writeSources: false,
         writeChats: false,
-        writeArtifacts: requiresKnowledgeRebuild,
+        writeArtifacts: false,
       }).then((state) => buildDashboard(state));
     },
 
@@ -5222,7 +6018,7 @@ function markQueueAsRunning(state, queueId) {
         await disposeNeuralRuntime();
         activeTrainingRollbackSnapshot = null;
 
-        const nextModelItem = createModelRegistryItemFromState(state, name);
+        const nextModelItem = createFreshModelRegistryItem(state, name);
         nextModelItem.packagePath = getModelLibraryPackagePath(nextModelItem.id);
         state.modelRegistry.items.push(nextModelItem);
         state.modelRegistry.activeModelId = nextModelItem.id;
@@ -5462,7 +6258,6 @@ function markQueueAsRunning(state, queueId) {
         ensureModelRegistryState(state);
         await updateRuntimeConfig(partialRuntimeConfig || {});
         updateActiveModelRegistrySummary(state);
-        await saveActiveModelPackage(state);
         pushStatus(
           state,
           'idle',
@@ -5645,7 +6440,7 @@ function markQueueAsRunning(state, queueId) {
     async sendMessage(chatId, content) {
       const normalizedContent = cleanText(content);
       if (!normalizedContent) {
-        throw new Error('РЎРѕРѕР±С‰РµРЅРёРµ РїСѓСЃС‚РѕРµ.');
+        throw new Error('Сообщение пустое.');
       }
 
       const snapshot = await updateState(async (state) => {
@@ -5727,11 +6522,11 @@ function markQueueAsRunning(state, queueId) {
         assertTrainingUnlocked(state, 'Оценка ответов');
         const located = findMessageById(state, messageId);
         if (!located) {
-          throw new Error('РЎРѕРѕР±С‰РµРЅРёРµ РґР»СЏ РѕС†РµРЅРєРё РЅРµ РЅР°Р№РґРµРЅРѕ.');
+          throw new Error('Сообщение для оценки не найдено.');
         }
 
         if (located.message.role !== 'assistant' || located.message.metadata?.type === 'system') {
-          throw new Error('РћС†РµРЅРёРІР°С‚СЊ РјРѕР¶РЅРѕ С‚РѕР»СЊРєРѕ РѕС‚РІРµС‚С‹ РјРѕРґРµР»Рё.');
+          throw new Error('Оценивать можно только ответы модели.');
         }
 
         located.message.metadata = {
@@ -5746,7 +6541,7 @@ function markQueueAsRunning(state, queueId) {
             state,
             'learning_from_feedback',
             'feedback_recorded',
-            'РџРѕР»РѕР¶РёС‚РµР»СЊРЅР°СЏ РѕС†РµРЅРєР° СЃРѕС…СЂР°РЅРµРЅР°. Р­С‚РѕС‚ РѕС‚РІРµС‚ РІРѕР№РґРµС‚ РІ РїР°РјСЏС‚СЊ РјРѕРґРµР»Рё Рё РІ СЃР»РµРґСѓСЋС‰РёР№ РѕР±СѓС‡Р°СЋС‰РёР№ РїСЂРѕРіРѕРЅ.',
+            'Положительная оценка сохранена. Этот ответ войдет в память модели и в следующий обучающий прогон.',
             { updateTrainingState: false }
           );
         } else {
@@ -5755,7 +6550,7 @@ function markQueueAsRunning(state, queueId) {
             state,
             'learning_from_feedback',
             'feedback_recorded',
-            'РћС‚СЂРёС†Р°С‚РµР»СЊРЅР°СЏ РѕС†РµРЅРєР° СЃРѕС…СЂР°РЅРµРЅР°. Р­С‚РѕС‚ РѕС‚РІРµС‚ Р±СѓРґРµС‚ РїРѕРґР°РІР»СЏС‚СЊСЃСЏ РІ Р±СѓРґСѓС‰РёС… РѕС‚РІРµС‚Р°С… Рё РёСЃРєР»СЋС‡РµРЅ РёР· РѕР±СѓС‡Р°СЋС‰РёС… РїСЂРёРјРµСЂРѕРІ.',
+            'Отрицательная оценка сохранена. Этот ответ будет подавляться в будущих ответах и исключен из обучающих примеров.',
             { updateTrainingState: false }
           );
         }

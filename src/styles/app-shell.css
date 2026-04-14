@@ -16,6 +16,11 @@
   --hero-badge-text: rgba(255, 255, 255, 0.98);
   --hero-badge-subtext: rgba(255, 255, 255, 0.84);
   --hero-badge-icon: rgba(255, 255, 255, 0.96);
+  --mui-status-solid: #8fc4ff;
+  --mui-status-soft: rgba(95, 170, 255, 0.22);
+  --mui-status-border: rgba(143, 196, 255, 0.56);
+  --mui-status-glow: rgba(84, 154, 249, 0.34);
+  --accent: var(--mui-status-solid);
 }
 
 .app-shell__status-layer {
@@ -104,6 +109,10 @@
   --hero-badge-text: rgba(255, 255, 255, 0.98);
   --hero-badge-subtext: rgba(255, 255, 255, 0.84);
   --hero-badge-icon: rgba(255, 255, 255, 0.96);
+  --mui-status-solid: #8fc4ff;
+  --mui-status-soft: rgba(95, 170, 255, 0.22);
+  --mui-status-border: rgba(143, 196, 255, 0.56);
+  --mui-status-glow: rgba(84, 154, 249, 0.34);
 }
 
 .app-shell--status-ready_for_training {
@@ -113,6 +122,10 @@
   --hero-badge-text: rgba(255, 255, 255, 0.98);
   --hero-badge-subtext: rgba(255, 255, 255, 0.84);
   --hero-badge-icon: rgba(255, 255, 255, 0.96);
+  --mui-status-solid: #84b0ff;
+  --mui-status-soft: rgba(80, 136, 255, 0.24);
+  --mui-status-border: rgba(132, 176, 255, 0.6);
+  --mui-status-glow: rgba(75, 123, 255, 0.34);
 }
 
 .app-shell--status-training {
@@ -122,6 +135,10 @@
   --hero-badge-text: rgba(255, 255, 255, 0.98);
   --hero-badge-subtext: rgba(255, 255, 255, 0.84);
   --hero-badge-icon: rgba(255, 255, 255, 0.96);
+  --mui-status-solid: #cca1ff;
+  --mui-status-soft: rgba(166, 100, 255, 0.26);
+  --mui-status-border: rgba(204, 161, 255, 0.64);
+  --mui-status-glow: rgba(143, 73, 230, 0.36);
 }
 
 .app-shell--status-paused {
@@ -131,6 +148,10 @@
   --hero-badge-text: rgba(24, 24, 24, 0.95);
   --hero-badge-subtext: rgba(24, 24, 24, 0.74);
   --hero-badge-icon: rgba(24, 24, 24, 0.9);
+  --mui-status-solid: #f2f2f2;
+  --mui-status-soft: rgba(246, 246, 246, 0.42);
+  --mui-status-border: rgba(255, 255, 255, 0.76);
+  --mui-status-glow: rgba(206, 206, 206, 0.4);
 }
 
 .app-shell--status-trained {
@@ -140,6 +161,10 @@
   --hero-badge-text: rgba(255, 255, 255, 0.98);
   --hero-badge-subtext: rgba(255, 255, 255, 0.84);
   --hero-badge-icon: rgba(255, 255, 255, 0.96);
+  --mui-status-solid: #90f3bb;
+  --mui-status-soft: rgba(83, 220, 143, 0.24);
+  --mui-status-border: rgba(144, 243, 187, 0.58);
+  --mui-status-glow: rgba(74, 196, 140, 0.34);
 }
 
 .app-shell--status-generating_reply {
@@ -149,6 +174,10 @@
   --hero-badge-text: rgba(255, 255, 255, 0.98);
   --hero-badge-subtext: rgba(255, 255, 255, 0.84);
   --hero-badge-icon: rgba(255, 255, 255, 0.96);
+  --mui-status-solid: #ffd4b2;
+  --mui-status-soft: rgba(255, 184, 140, 0.24);
+  --mui-status-border: rgba(255, 212, 178, 0.62);
+  --mui-status-glow: rgba(255, 160, 107, 0.34);
 }
 
 .app-shell--status-syncing_knowledge {
@@ -158,6 +187,10 @@
   --hero-badge-text: rgba(255, 255, 255, 0.98);
   --hero-badge-subtext: rgba(255, 255, 255, 0.84);
   --hero-badge-icon: rgba(255, 255, 255, 0.96);
+  --mui-status-solid: #ffbde5;
+  --mui-status-soft: rgba(255, 154, 218, 0.25);
+  --mui-status-border: rgba(255, 189, 229, 0.6);
+  --mui-status-glow: rgba(233, 122, 199, 0.36);
 }
 
 .app-shell--status-learning_from_feedback {
@@ -167,6 +200,10 @@
   --hero-badge-text: rgba(33, 28, 8, 0.96);
   --hero-badge-subtext: rgba(33, 28, 8, 0.76);
   --hero-badge-icon: rgba(33, 28, 8, 0.92);
+  --mui-status-solid: #ffef9a;
+  --mui-status-soft: rgba(255, 227, 106, 0.28);
+  --mui-status-border: rgba(255, 239, 154, 0.64);
+  --mui-status-glow: rgba(244, 203, 87, 0.36);
 }
 
 .app-shell--status-error {
@@ -176,6 +213,83 @@
   --hero-badge-text: rgba(255, 255, 255, 0.98);
   --hero-badge-subtext: rgba(255, 255, 255, 0.84);
   --hero-badge-icon: rgba(255, 255, 255, 0.96);
+  --mui-status-solid: #ffffff;
+  --mui-status-soft: rgba(0, 0, 0, 0.46);
+  --mui-status-border: rgba(255, 255, 255, 0.68);
+  --mui-status-glow: rgba(0, 0, 0, 0.64);
+}
+
+/* Global MUI status tinting (inherits hero badge tone) */
+.app-shell .MuiButton-contained:not(.Mui-disabled) {
+  background: var(--mui-status-soft) !important;
+  border: 1px solid var(--mui-status-border) !important;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08), 0 10px 22px -16px var(--mui-status-glow) !important;
+}
+
+.app-shell .MuiButton-contained:not(.Mui-disabled):hover {
+  background: var(--mui-status-soft) !important;
+  filter: brightness(1.06);
+}
+
+.app-shell .MuiButton-outlined:not(.Mui-disabled) {
+  border-color: var(--mui-status-border) !important;
+  color: var(--mui-status-solid) !important;
+  background: rgba(255, 255, 255, 0.03) !important;
+}
+
+.app-shell .MuiButton-text:not(.Mui-disabled),
+.app-shell .MuiIconButton-root:not(.Mui-disabled),
+.app-shell .MuiTab-root:not(.Mui-disabled),
+.app-shell .MuiFormControlLabel-label {
+  color: var(--mui-status-solid) !important;
+}
+
+.app-shell .MuiTabs-indicator {
+  background-color: var(--mui-status-solid) !important;
+  box-shadow: 0 0 12px -3px var(--mui-status-glow);
+}
+
+.app-shell .MuiOutlinedInput-root .MuiOutlinedInput-notchedOutline {
+  border-color: var(--mui-status-border) !important;
+}
+
+.app-shell .MuiOutlinedInput-root:hover .MuiOutlinedInput-notchedOutline {
+  border-color: var(--mui-status-solid) !important;
+}
+
+.app-shell .MuiOutlinedInput-root.Mui-focused .MuiOutlinedInput-notchedOutline {
+  border-color: var(--mui-status-solid) !important;
+  box-shadow: 0 0 0 1px var(--mui-status-border);
+}
+
+.app-shell .MuiInputLabel-root.Mui-focused {
+  color: var(--mui-status-solid) !important;
+}
+
+.app-shell .MuiSlider-track,
+.app-shell .MuiSlider-thumb,
+.app-shell .MuiSlider-valueLabel,
+.app-shell .MuiRadio-root.Mui-checked,
+.app-shell .MuiCheckbox-root.Mui-checked,
+.app-shell .MuiSwitch-switchBase.Mui-checked {
+  color: var(--mui-status-solid) !important;
+}
+
+.app-shell .MuiSlider-rail,
+.app-shell .MuiSwitch-track {
+  background-color: var(--mui-status-soft) !important;
+  border-color: var(--mui-status-border) !important;
+}
+
+.app-shell .MuiLinearProgress-bar,
+.app-shell .MuiCircularProgress-circle {
+  stroke: var(--mui-status-solid) !important;
+  background-color: var(--mui-status-solid) !important;
+}
+
+.app-shell .MuiTooltip-tooltip {
+  border: 1px solid var(--mui-status-border);
+  box-shadow: 0 8px 20px -14px var(--mui-status-glow);
 }
 
 .app-shell__container {
@@ -193,6 +307,7 @@
 .hero-panel {
   flex: 0 0 auto;
   margin-bottom: 10px;
+  height: 140px !important;
 }
 
 .hero-panel .glass-panel__inner {
@@ -256,7 +371,7 @@
 }
 
 .hero-panel__brand {
-  font-size: clamp(1.3rem, 2.6vw, 1.92rem);
+  font-size: clamp(2.3rem, 3.6vw, 2.92rem);
   line-height: 1;
 }
 
@@ -270,8 +385,8 @@
   display: flex;
   flex-wrap: wrap;
   justify-content: flex-end;
-  gap: 10px;
-  max-width: 620px;
+  gap: 5px;
+  max-width: 700px;
 }
 
 .hero-status-button {
@@ -377,9 +492,9 @@
   font-size: 0.8rem;
 }
 
-.hero-panel__tabs {
-  margin-top: 8px;
-}
+/*.hero-panel__tabs {*/
+/*  margin-top: 8px;*/
+/*}*/
 
 .top-alert {
   flex: 0 0 auto;
