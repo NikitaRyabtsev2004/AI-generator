@@ -712,6 +712,7 @@ async function startPythonBackendProcess(commandName, configPath, options = {}) 
       ...(options.env || {}),
       PYTHONUTF8: '1',
       PYTHONIOENCODING: 'utf-8',
+      TF_CPP_MIN_LOG_LEVEL: process.env.TF_CPP_MIN_LOG_LEVEL || '2',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,

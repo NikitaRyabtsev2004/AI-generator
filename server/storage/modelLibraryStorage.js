@@ -27,7 +27,7 @@ async function writeModelLibraryPackage(modelId, payload) {
   const targetDir = getModelLibraryItemDir(modelId);
   await fs.mkdir(targetDir, { recursive: true });
   const targetPath = getModelLibraryPackagePath(modelId);
-  await fs.writeFile(targetPath, JSON.stringify(payload, null, 2), 'utf8');
+  await fs.writeFile(targetPath, JSON.stringify(payload), 'utf8');
   return targetPath;
 }
 

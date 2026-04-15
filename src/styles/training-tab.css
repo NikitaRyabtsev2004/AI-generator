@@ -393,6 +393,20 @@
   padding-right: 6px;
 }
 
+.training-live-alert .MuiAlert-message {
+  width: 100%;
+}
+
+.training-live-alert__line {
+  display: block;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .metric-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));

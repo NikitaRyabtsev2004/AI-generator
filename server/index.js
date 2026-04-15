@@ -27,7 +27,7 @@ const { createChatsRoutes } = require('./routes/chatsRoutes');
 const PORT = Number(process.env.PORT || 4000);
 const SLOW_REQUEST_THRESHOLD_MS = readPositiveIntegerEnv('SLOW_REQUEST_THRESHOLD_MS', 3000);
 const SSE_HEARTBEAT_MS = readPositiveIntegerEnv('SSE_HEARTBEAT_MS', 20000);
-const SSE_STATE_THROTTLE_MS = readPositiveIntegerEnv('SSE_STATE_THROTTLE_MS', 250);
+const SSE_STATE_THROTTLE_MS = readPositiveIntegerEnv('SSE_STATE_THROTTLE_MS', 80);
 
 async function bootstrap() {
   await initializeLogger();

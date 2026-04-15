@@ -443,6 +443,11 @@ def create_datasets(
     validation_split: float = 0.1,
     shuffle_buffer: int = 4096,
     stride: int | None = None,
+    shuffle_seed: int | None = 1337,
+    reshuffle_each_iteration: bool = False,
+    prefetch_batches: int = 1,
+    deterministic: bool = True,
+    private_threadpool_size: int = 0,
 ) -> DatasetBundle:
     if tf is None:
         raise RuntimeError("TensorFlow is required to build tf.data datasets.")
@@ -491,15 +496,43 @@ def create_datasets(
     train_dataset = tf.data.Dataset.from_tensor_slices(
         (train_array[:, :-1], train_array[:, 1:])
     )
-    train_dataset = train_dataset.shuffle(min(max(train_count, 64), shuffle_buffer))
+    shuffle_kwargs = {
+        "buffer_size": min(max(train_count, 64), shuffle_buffer),
+        "reshuffle_each_iteration": bool(reshuffle_each_iteration),
+    }
+    if shuffle_seed is not None:
+        shuffle_kwargs["seed"] = int(shuffle_seed)
+    train_dataset = train_dataset.shuffle(**shuffle_kwargs)
     train_dataset = train_dataset.batch(max(1, int(batch_size)), drop_remainder=False)
-    train_dataset = train_dataset.prefetch(tf.data.AUTOTUNE)
+    options = tf.data.Options()
+    try:
+        options.deterministic = bool(deterministic)
+    except Exception:
+        pass
+    try:
+        options.experimental_deterministic = bool(deterministic)
+    except Exception:
+        pass
+    if int(private_threadpool_size) > 0:
+        try:
+            options.threading.private_threadpool_size = int(private_threadpool_size)
+        except Exception:
+            pass
+        try:
+            options.experimental_threading.private_threadpool_size = int(private_threadpool_size)
+        except Exception:
+            pass
+    train_dataset = train_dataset.with_options(options)
+    if int(prefetch_batches) > 0:
+        train_dataset = train_dataset.prefetch(int(prefetch_batches))
 
     validation_dataset = tf.data.Dataset.from_tensor_slices(
         (validation_array[:, :-1], validation_array[:, 1:])
     )
     validation_dataset = validation_dataset.batch(max(1, int(batch_size)), drop_remainder=False)
-    validation_dataset = validation_dataset.prefetch(tf.data.AUTOTUNE)
+    validation_dataset = validation_dataset.with_options(options)
+    if int(prefetch_batches) > 0:
+        validation_dataset = validation_dataset.prefetch(int(prefetch_batches))
 
     batches_per_epoch = max(1, (train_count + max(1, int(batch_size)) - 1) // max(1, int(batch_size)))
     return DatasetBundle(

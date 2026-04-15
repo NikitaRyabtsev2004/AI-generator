@@ -423,6 +423,25 @@ function formatBytes(value) {
   return `${normalized.toFixed(precision)} ${units[unitIndex]}`;
 }
 
+function formatDurationClock(totalSeconds) {
+  const seconds = Math.max(0, Math.round(Number(totalSeconds) || 0));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainingSeconds = seconds % 60;
+  return [
+    String(hours).padStart(2, '0'),
+    String(minutes).padStart(2, '0'),
+    String(remainingSeconds).padStart(2, '0'),
+  ].join(':');
+}
+
+function formatPercent(value) {
+  if (!Number.isFinite(Number(value))) {
+    return '0.00';
+  }
+  return Number(value).toFixed(2);
+}
+
 function formatQueueSourceStats(source = {}) {
   const typeLabel = String(source.type || 'file').toUpperCase();
   const tokenCount = Math.max(Number(source.stats?.tokenCount) || 0, 0);
@@ -556,6 +575,21 @@ export default function TrainingTab({
 
   const factRows = useMemo(() => modelFactRows(snapshot), [snapshot]);
   const statusEntries = snapshot.training?.recentStatuses || [];
+  const trainingProgress = snapshot.training?.progress || {};
+  const trainingEtaSeconds = Number.isFinite(Number(trainingProgress.etaSeconds))
+    ? Math.max(0, Math.round(Number(trainingProgress.etaSeconds)))
+    : null;
+  const trainingAvgBatchMs = Number.isFinite(Number(trainingProgress.avgBatchTimeMs))
+    ? Math.max(0, Number(trainingProgress.avgBatchTimeMs))
+    : null;
+  const trainingThroughputBps = Number.isFinite(Number(trainingProgress.throughputBatchesPerSec))
+    ? Math.max(0, Number(trainingProgress.throughputBatchesPerSec))
+    : null;
+  const trainingPercentLabel = formatPercent(trainingProgress.percent);
+  const trainingEpochNow = Math.max(0, Number(trainingProgress.currentEpoch) || 0);
+  const trainingEpochTotal = Math.max(0, Number(trainingProgress.totalEpochs) || 0);
+  const trainingBatchNow = Math.max(0, Number(trainingProgress.currentBatch) || 0);
+  const trainingBatchTotal = Math.max(0, Number(trainingProgress.totalBatches) || 0);
   const modelConstraintReport = useMemo(
     () => applyModelConstraints(settingsDraft),
     [settingsDraft]
@@ -1405,9 +1439,9 @@ export default function TrainingTab({
               <div className="upload-progress-wrap">
                 <Typography variant="caption" className="muted-text">
                   {isServerProcessing
-                    ? `Обработка данных на сервере: ${uploadIndicatorPercent.toFixed(1)}%`
+                    ? `Обработка данных на сервере: ${uploadIndicatorPercent.toFixed(2)}%`
                     : normalizedUploadProgress < 100
-                      ? `Загрузка файла: ${normalizedUploadProgress.toFixed(1)}%`
+                      ? `Загрузка файла: ${normalizedUploadProgress.toFixed(2)}%`
                       : 'Файл загружен, запуск обработки данных...'}
                 </Typography>
                 <LinearProgress
@@ -1474,9 +1508,9 @@ export default function TrainingTab({
               <div className="upload-progress-wrap">
                 <Typography variant="caption" className="muted-text">
                   {isServerProcessing
-                    ? `Обработка файлов очереди: ${uploadIndicatorPercent.toFixed(1)}%`
+                    ? `Обработка файлов очереди: ${uploadIndicatorPercent.toFixed(2)}%`
                     : normalizedUploadProgress < 100
-                      ? `Загрузка файлов очереди: ${normalizedUploadProgress.toFixed(1)}%`
+                      ? `Загрузка файлов очереди: ${normalizedUploadProgress.toFixed(2)}%`
                       : 'Файлы очереди загружены, запускается обработка...'}
                 </Typography>
                 <LinearProgress
@@ -1587,6 +1621,16 @@ export default function TrainingTab({
             <Alert severity={snapshot.model.lifecycle === 'error' ? 'error' : 'info'}>
               {snapshot.training.message}
             </Alert>
+            {isTraining && trainingEtaSeconds !== null ? (
+              <Alert severity="info" className="training-live-alert">
+                <span className="training-live-alert__line">
+                  {`Эпоха ${trainingEpochNow}/${trainingEpochTotal} | Батч ${trainingBatchNow}/${trainingBatchTotal} | Прогресс ${trainingPercentLabel}%`}
+                </span>
+                <span className="training-live-alert__line">
+                  {`ETA ${formatDurationClock(trainingEtaSeconds)} | Окончание ${formatDateTime(trainingProgress.etaAt)} | Скорость ${trainingThroughputBps ? formatDecimal(trainingThroughputBps, 3) : '—'} батч/с | Шаг ~${trainingAvgBatchMs ? formatDecimal(trainingAvgBatchMs, 1) : '—'} мс`}
+                </span>
+              </Alert>
+            ) : null}
 
             {serverStatus ? (
               <Alert severity="info">

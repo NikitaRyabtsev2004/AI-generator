@@ -616,11 +616,42 @@ async function loadArtifacts() {
 
 async function saveArtifacts(currentState) {
   const artifactPaths = getArtifactPaths();
+  const compactChunks = (Array.isArray(currentState.knowledge.chunks) ? currentState.knowledge.chunks : [])
+    .map((chunk, index) => ({
+      id: chunk?.id || `knowledge_chunk_${index}`,
+      sourceId: chunk?.sourceId || `knowledge_chunk_${index}`,
+      sourceType: chunk?.sourceType || 'knowledge',
+      sourceKind: chunk?.sourceKind || 'knowledge',
+      label: cleanText(chunk?.label || '') || 'Архив знаний',
+      text: cleanText(chunk?.text || ''),
+    }))
+    .filter((entry) => Boolean(entry.text));
+  const compactReplyMemories = (Array.isArray(currentState.knowledge.replyMemories)
+    ? currentState.knowledge.replyMemories
+    : [])
+    .map((entry, index) => {
+      const promptText = cleanText(entry?.promptText || '');
+      const responseText = cleanText(entry?.responseText || '');
+      if (!promptText || !responseText) {
+        return null;
+      }
+      return {
+        id: entry?.id || `knowledge_pair_${index}`,
+        ownerId: entry?.ownerId || 'knowledge',
+        title: cleanText(entry?.title || '') || 'Архив знаний',
+        origin: entry?.origin || 'knowledge',
+        score: Number(entry?.score || 0.78),
+        promptText,
+        responseText,
+        combinedText: cleanText(entry?.combinedText || `Пользователь: ${promptText}\nАссистент: ${responseText}`),
+      };
+    })
+    .filter(Boolean);
   const knowledgeIndex = {
-    chunks: currentState.knowledge.chunks,
-    replyMemories: currentState.knowledge.replyMemories,
-    vocabulary: currentState.knowledge.vocabulary,
-    bm25: currentState.knowledge.bm25,
+    chunks: compactChunks,
+    replyMemories: compactReplyMemories,
+    vocabulary: {},
+    bm25: createDefaultKnowledgeState().bm25,
   };
   const manifest = {
     engine: currentState.model.engine,
@@ -644,13 +675,13 @@ async function saveArtifacts(currentState) {
     files: artifactPaths,
   };
 
-  await fs.writeFile(KNOWLEDGE_INDEX_FILE, JSON.stringify(knowledgeIndex, null, 2), 'utf8');
+  await fs.writeFile(KNOWLEDGE_INDEX_FILE, JSON.stringify(knowledgeIndex), 'utf8');
   await fs.writeFile(
     LANGUAGE_MODEL_FILE,
-    JSON.stringify(currentState.knowledge.languageModel, null, 2),
+    JSON.stringify(currentState.knowledge.languageModel),
     'utf8'
   );
-  await fs.writeFile(MODEL_MANIFEST_FILE, JSON.stringify(manifest, null, 2), 'utf8');
+  await fs.writeFile(MODEL_MANIFEST_FILE, JSON.stringify(manifest), 'utf8');
 }
 
 function normalizePersistOptions(options = {}) {

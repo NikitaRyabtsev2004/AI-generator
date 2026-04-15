@@ -206,7 +206,7 @@ function App() {
       .slice(0, 5);
   }, [chatNotices, studio.error, tab, trainingNotices]);
 
-  const backgroundImg = 'b-1.gif'
+  const backgroundImg = 'b-4.gif'
 
   if (studio.loading || !studio.snapshot) {
     return (

@@ -3304,7 +3304,13 @@ function resetTrainedModelState(state) {
     totalEpochs: 0,
     currentBatch: 0,
     totalBatches: 0,
+    completedBatches: 0,
+    totalPlannedBatches: 0,
     percent: 0,
+    etaSeconds: null,
+    etaAt: null,
+    avgBatchTimeMs: null,
+    throughputBatchesPerSec: null,
   };
   state.knowledge.languageModel = createDefaultKnowledgeState().languageModel;
 }
@@ -4105,6 +4111,16 @@ function markQueueAsRunning(state, queueId) {
       artifactsPayload.weightsSpec &&
       artifactsPayload.weightsBinBase64
     );
+    const compactKnowledgeIndex = {
+      chunks: [],
+      replyMemories: [],
+      vocabulary: {},
+      bm25: createDefaultKnowledgeState().bm25,
+    };
+    const compactLanguageModel = {
+      ...createDefaultKnowledgeState().languageModel,
+      ...(state.knowledge?.languageModel || {}),
+    };
 
     if (options.strictCheckpoint && !hasCheckpointArtifacts) {
       throw new Error('Экспорт недоступен: нейросетевой чекпоинт не найден или поврежден.');
@@ -4122,10 +4138,7 @@ function markQueueAsRunning(state, queueId) {
           ? structuredClone(state.knowledge)
           : {
             ...createDefaultKnowledgeState(),
-            languageModel: {
-              ...createDefaultKnowledgeState().languageModel,
-              ...(state.knowledge?.languageModel || {}),
-            },
+            languageModel: compactLanguageModel,
           },
       },
       runtimeConfig: structuredClone(getRuntimeConfig()),
@@ -4177,13 +4190,8 @@ function markQueueAsRunning(state, queueId) {
             tokenizerReady: false,
             files: artifactPaths,
           },
-          knowledgeIndex: {
-            chunks: state.knowledge.chunks,
-            replyMemories: state.knowledge.replyMemories,
-            vocabulary: state.knowledge.vocabulary,
-            bm25: state.knowledge.bm25,
-          },
-          languageModel: state.knowledge.languageModel,
+          knowledgeIndex: compactKnowledgeIndex,
+          languageModel: compactLanguageModel,
           tokenizer: null,
           weightsSpec: null,
           weightsBinBase64: '',
@@ -4584,6 +4592,7 @@ function markQueueAsRunning(state, queueId) {
           : stage === 'extracting_dialogues'
             ? Math.min(16, 10 + Math.round((Number(progress.percent) || 0) * 0.06))
             : Math.min(22, 16 + Math.round((Number(progress.percent) || 0) * 0.06));
+        const normalizedPercent = Number(Number(percent).toFixed(2));
 
         updateState(async (state) => {
           if (state.training.status !== 'training') {
@@ -4598,7 +4607,13 @@ function markQueueAsRunning(state, queueId) {
             totalEpochs: Math.max(Number(state.settings.training.epochs) || 1, 1),
             currentBatch: 0,
             totalBatches: 0,
-            percent: Math.max(state.training.progress.percent || 0, percent),
+            completedBatches: 0,
+            totalPlannedBatches: 0,
+            percent: Math.max(state.training.progress.percent || 0, normalizedPercent),
+            etaSeconds: null,
+            etaAt: null,
+            avgBatchTimeMs: null,
+            throughputBatchesPerSec: null,
           };
           if (lastPreparationPhase !== stage) {
             pushStatus(state, 'training', stage, message, { updateTrainingState: false });
@@ -4669,8 +4684,18 @@ function markQueueAsRunning(state, queueId) {
         checkpointTrainingSettings.attentionHeads === requestedTrainingSettings.attentionHeads &&
         checkpointTrainingSettings.transformerLayers === requestedTrainingSettings.transformerLayers &&
         checkpointTrainingSettings.feedForwardSize === requestedTrainingSettings.feedForwardSize;
+      const pausedByUser =
+        String(initialState.training?.status || '').toLowerCase() === 'paused' &&
+        String(initialState.training?.phase || '').toLowerCase() === 'paused_by_user';
       const requestedResumeEpochOffset = canResumeFromCheckpoint
         ? Math.max(Number(initialState.model.trainedEpochs) || 0, 0)
+        : 0;
+      const previousBatchesPerEpoch = Math.max(Number(initialState.model.batchesPerEpoch) || 0, 0);
+      const requestedResumeBatchOffset = canResumeFromCheckpoint && pausedByUser
+        ? Math.min(
+          Math.max(Number(initialState.training?.progress?.currentBatch) || 0, 0),
+          Math.max(previousBatchesPerEpoch - 1, 0)
+        )
         : 0;
 
       await disposeNeuralRuntime();
@@ -4700,6 +4725,7 @@ function markQueueAsRunning(state, queueId) {
             storage: initialState.model.storage,
             resumeFromCheckpoint: Boolean(canResumeFromCheckpoint),
             resumeEpochOffset: requestedResumeEpochOffset,
+            resumeBatchOffset: requestedResumeBatchOffset,
             manifest,
             positiveFeedbackCount: initialTrainingArtifacts.positiveFeedbackCount,
             stopSignalBuffer: stopSignal.buffer,
@@ -4711,6 +4737,8 @@ function markQueueAsRunning(state, queueId) {
         let workerQueue = Promise.resolve();
         let knownBatchesPerEpoch = 1;
         let lastPreparationStage = '';
+        let lastValidationStage = '';
+        let lastCheckpointStage = '';
 
         const finalizeFailure = (error) => {
           if (finished) {
@@ -4745,6 +4773,94 @@ function markQueueAsRunning(state, queueId) {
         const enqueueWorkerUpdate = (task) => {
           workerQueue = workerQueue.then(task).catch(finalizeFailure);
         };
+        let pendingBatchMessage = null;
+        let batchFlushQueued = false;
+
+        const applyBatchMessage = async (batchMessage) => {
+          knownBatchesPerEpoch = Math.max(batchMessage.batchesThisEpoch || knownBatchesPerEpoch, 1);
+          const totalEpochs = Math.max(batchMessage.effectiveEpochs || initialState.settings.training.epochs, 1);
+          const totalBatches = Math.max(batchMessage.batchesThisEpoch * totalEpochs, 1);
+          const completedBatches = Math.min(
+            Math.max(
+              ((Math.max(batchMessage.epoch, 1) - 1) * Math.max(batchMessage.batchesThisEpoch, 1)) +
+                Math.max(batchMessage.batch, 1),
+              1
+            ),
+            totalBatches
+          );
+          const completedBatchesReported = Number.isFinite(Number(batchMessage.completedBatches))
+            ? Math.max(1, Math.round(Number(batchMessage.completedBatches)))
+            : completedBatches;
+          const totalPlannedBatches = Number.isFinite(Number(batchMessage.totalPlannedBatches))
+            ? Math.max(1, Math.round(Number(batchMessage.totalPlannedBatches)))
+            : totalBatches;
+          const etaSeconds = Number.isFinite(Number(batchMessage.etaSeconds))
+            ? Math.max(0, Math.round(Number(batchMessage.etaSeconds)))
+            : null;
+          const etaAt = cleanText(batchMessage.etaAt || '');
+          const avgBatchTimeMs = Number.isFinite(Number(batchMessage.avgBatchDurationMs))
+            ? Number(batchMessage.avgBatchDurationMs)
+            : null;
+          const throughputBatchesPerSec = Number.isFinite(Number(batchMessage.throughputBatchesPerSec))
+            ? Number(batchMessage.throughputBatchesPerSec)
+            : null;
+
+          await updateState(async (state) => {
+            state.training.status = 'training';
+            state.training.phase = 'training_batches';
+            state.model.batchesPerEpoch = batchMessage.batchesThisEpoch;
+            state.model.targetEpochs = totalEpochs;
+            state.training.message = batchMessage.enforcedStepBudget
+              ? 'Обучение идет в реальном времени. Минимальный бюджет обучения увеличил число эпох.'
+              : 'Обучение идет в реальном времени.';
+            state.training.progress = {
+              currentEpoch: batchMessage.epoch,
+              totalEpochs,
+              currentBatch: batchMessage.batch,
+              totalBatches: batchMessage.batchesThisEpoch,
+              completedBatches: completedBatchesReported,
+              totalPlannedBatches,
+              percent: Number(((completedBatchesReported / totalPlannedBatches) * 100).toFixed(2)),
+              etaSeconds,
+              etaAt: etaAt || null,
+              avgBatchTimeMs,
+              throughputBatchesPerSec,
+            };
+            if (batchMessage.historyEntry) {
+              if (!Array.isArray(state.training.history)) {
+                state.training.history = [];
+              }
+              state.training.history.push(batchMessage.historyEntry);
+              const maxHistory = Math.max(Number(state.settings.training.maxHistoryPoints) || 0, 0);
+              if (maxHistory > 0 && state.training.history.length > maxHistory) {
+                state.training.history.splice(0, state.training.history.length - maxHistory);
+              }
+            }
+            state.training.updatedAt = nowIso();
+            state.model.lastLoss = batchMessage.lastLoss;
+            state.model.averageLoss = batchMessage.averageLoss;
+            state.model.perplexity = batchMessage.averageLoss ? Number(Math.exp(batchMessage.averageLoss).toFixed(4)) : null;
+            state.model.batchesProcessed = completedBatchesReported;
+          }, { persist: false });
+        };
+
+        const flushLatestBatchMessage = () => {
+          if (batchFlushQueued) {
+            return;
+          }
+          batchFlushQueued = true;
+          enqueueWorkerUpdate(async () => {
+            while (pendingBatchMessage && !finished) {
+              const currentBatchMessage = pendingBatchMessage;
+              pendingBatchMessage = null;
+              await applyBatchMessage(currentBatchMessage);
+            }
+            batchFlushQueued = false;
+            if (pendingBatchMessage && !finished) {
+              flushLatestBatchMessage();
+            }
+          });
+        };
 
         worker.on('message', (message) => {
           if (!message?.type || finished) {
@@ -4769,7 +4885,16 @@ function markQueueAsRunning(state, queueId) {
                   totalEpochs: Math.max(Number(state.settings.training.epochs) || 1, 1),
                   currentBatch: 0,
                   totalBatches: 0,
-                  percent: Math.max(Number(message.progress) || 0, state.training.progress.percent || 0),
+                  completedBatches: 0,
+                  totalPlannedBatches: 0,
+                  percent: Math.max(
+                    Number((Number(message.progress) || 0).toFixed(2)),
+                    state.training.progress.percent || 0
+                  ),
+                  etaSeconds: null,
+                  etaAt: null,
+                  avgBatchTimeMs: null,
+                  throughputBatchesPerSec: null,
                 };
 
                 if (lastPreparationStage !== state.training.phase) {
@@ -4804,6 +4929,7 @@ function markQueueAsRunning(state, queueId) {
                   checkpoint_incompatible: 'чекпоинт несовместим',
                 };
                 const resumedEpochs = Math.max(Number(message.effectiveResumeEpochOffset) || 0, 0);
+                const resumedBatchOffset = Math.max(Number(message.effectiveResumeBatchOffset) || 0, 0);
                 const scheduledEpochs = Math.max(Number(message.requestedEpochs) || state.settings.training.epochs || 1, 1);
                 const totalEpochsPlanned = Math.max(Number(message.effectiveEpochs) || (resumedEpochs + scheduledEpochs), 1);
                 const resumeNote = message.resumedFromCheckpoint
@@ -4813,6 +4939,9 @@ function markQueueAsRunning(state, queueId) {
                   : message.requestedResumeEpochOffset > 0
                     ? ` Возобновление чекпоинта недоступно (${fallbackReasonMap[message.resumeRestartReason] || 'изменился токенизатор'}), обучение перезапущено с нуля на ${scheduledEpochs} эпох.`
                     : '';
+                const resumeBatchNote = resumedBatchOffset > 0
+                  ? ` Возобновление внутри эпохи: пропускаем первые ${resumedBatchOffset} батч(ей) в текущей эпохе.`
+                  : '';
                 state.model.trainingItemCount = message.trainingSampleCount;
                 state.model.batchesPerEpoch = message.batchesPerEpoch;
                 state.model.parameterCount = message.parameterCount;
@@ -4821,12 +4950,12 @@ function markQueueAsRunning(state, queueId) {
                 state.model.computeBackendWarning = message.backendWarning || '';
                 state.model.targetEpochs = totalEpochsPlanned;
                 state.training.phase = 'training_batches';
-                state.training.message = `Подготовлено ${message.trainingSampleCount} обучающих окон, ${message.validationSampleCount} валидационных и ${message.batchesPerEpoch} батчей на эпоху. Backend: ${message.backendLabel || message.backendName}.${batchSizeNote}${resumeNote}${backendWarningNote}`;
+                state.training.message = `Подготовлено ${message.trainingSampleCount} обучающих окон, ${message.validationSampleCount} валидационных и ${message.batchesPerEpoch} батчей на эпоху. Backend: ${message.backendLabel || message.backendName}.${batchSizeNote}${resumeNote}${resumeBatchNote}${backendWarningNote}`;
                 pushStatus(
                   state,
                   'training',
                   'training_batches',
-                  `Нейросеть обучается в отдельном воркере: ${message.parameterCount} параметров, ${message.trainingSampleCount} обучающих окон и ${message.validationSampleCount} окон для валидации. Backend: ${message.backendLabel || message.backendName}.${batchSizeNote}${resumeNote}${backendWarningNote}`
+                  `Нейросеть обучается в отдельном воркере: ${message.parameterCount} параметров, ${message.trainingSampleCount} обучающих окон и ${message.validationSampleCount} окон для валидации. Backend: ${message.backendLabel || message.backendName}.${batchSizeNote}${resumeNote}${resumeBatchNote}${backendWarningNote}`
                 );
               }, {
                 writeSources: false,
@@ -4846,46 +4975,34 @@ function markQueueAsRunning(state, queueId) {
 
                 state.training.phase = 'training_batches';
                 state.training.updatedAt = nowIso();
-                state.training.message = `Обучение продолжается: эпоха ${message.epoch}/${message.effectiveEpochs}, выполняется батч ${message.batch}/${message.batchesThisEpoch}.`;
               }, { persist: false });
             });
             return;
           }
 
           if (message.type === 'batch') {
+            pendingBatchMessage = message;
+            flushLatestBatchMessage();
+            return;
+          }
+
+          if (message.type === 'validation') {
             enqueueWorkerUpdate(async () => {
-              knownBatchesPerEpoch = Math.max(message.batchesThisEpoch || knownBatchesPerEpoch, 1);
-              const totalEpochs = Math.max(message.effectiveEpochs || initialState.settings.training.epochs, 1);
-              const totalBatches = Math.max(message.batchesThisEpoch * totalEpochs, 1);
-              const completedBatches = Math.min(
-                Math.max(
-                  ((Math.max(message.epoch, 1) - 1) * Math.max(message.batchesThisEpoch, 1)) +
-                    Math.max(message.batch, 1),
-                  1
-                ),
-                totalBatches
-              );
+              const validationStage = cleanText(message.stage || '') || 'running';
               await updateState(async (state) => {
-                state.training.status = 'training';
-                state.training.phase = 'training_batches';
-                state.model.batchesPerEpoch = message.batchesThisEpoch;
-                state.model.targetEpochs = totalEpochs;
-                state.training.message = message.enforcedStepBudget
-                  ? `Обучение идет: эпоха ${message.epoch}/${totalEpochs}, батч ${message.batch}/${message.batchesThisEpoch}. Минимальный бюджет обучения увеличил число эпох.`
-                  : `Обучение идет: эпоха ${message.epoch}/${totalEpochs}, батч ${message.batch}/${message.batchesThisEpoch}.`;
-                state.training.progress = {
-                  currentEpoch: message.epoch,
-                  totalEpochs,
-                  currentBatch: message.batch,
-                  totalBatches: message.batchesThisEpoch,
-                  percent: Number(((completedBatches / totalBatches) * 100).toFixed(1)),
-                };
-                state.training.history = [...state.training.history, message.historyEntry].slice(-state.settings.training.maxHistoryPoints);
+                if (state.training.status !== 'training') {
+                  return;
+                }
+                state.training.phase = 'validation_epoch';
+                state.training.message = cleanText(
+                  message.message ||
+                  `Идет валидация эпохи ${Math.max(Number(message.epoch) || 0, 1)}/${Math.max(Number(message.effectiveEpochs) || 1, 1)}.`
+                );
                 state.training.updatedAt = nowIso();
-                state.model.lastLoss = message.lastLoss;
-                state.model.averageLoss = message.averageLoss;
-                state.model.perplexity = message.averageLoss ? Number(Math.exp(message.averageLoss).toFixed(4)) : null;
-                state.model.batchesProcessed = completedBatches;
+                if (validationStage !== lastValidationStage) {
+                  pushStatus(state, 'training', 'validation_epoch', state.training.message, { updateTrainingState: false });
+                  lastValidationStage = validationStage;
+                }
               }, { persist: false });
             });
             return;
@@ -4893,17 +5010,19 @@ function markQueueAsRunning(state, queueId) {
 
           if (message.type === 'checkpointing') {
             enqueueWorkerUpdate(async () => {
+              const checkpointStage = cleanText(message.stage || '') || 'running';
+              const phase = checkpointStage === 'running' ? 'saving_checkpoint' : `saving_checkpoint_${checkpointStage}`;
+              const stageMessage = cleanText(message.message || '') ||
+                'Обучение завершено, сервер сохраняет веса модели и токенизатор.';
               await updateState(async (state) => {
                 state.model.lifecycle = 'syncing_knowledge';
                 state.model.status = 'saving_checkpoint';
-                state.training.phase = 'saving_checkpoint';
-                state.training.message = 'Обучение завершено, сервер сохраняет веса модели и токенизатор.';
-                pushStatus(
-                  state,
-                  'syncing_knowledge',
-                  'saving_checkpoint',
-                  'Сохранение нейросетевого чекпоинта и артефактов retriever.'
-                );
+                state.training.phase = phase;
+                state.training.message = stageMessage;
+                if (checkpointStage !== lastCheckpointStage) {
+                  pushStatus(state, 'syncing_knowledge', phase, stageMessage);
+                  lastCheckpointStage = checkpointStage;
+                }
               }, { persist: false });
             });
             return;
@@ -4912,6 +5031,19 @@ function markQueueAsRunning(state, queueId) {
           if (message.type === 'done') {
             enqueueWorkerUpdate(async () => {
               await disposeNeuralRuntime();
+              let shouldPersistSources = false;
+              await updateState(async (state) => {
+                state.model.lifecycle = 'syncing_knowledge';
+                state.model.status = 'saving_checkpoint';
+                state.training.phase = 'rebuilding_retriever';
+                state.training.message = 'Финализация обучения: пересборка retriever-индекса и метаданных модели.';
+                pushStatus(
+                  state,
+                  'syncing_knowledge',
+                  'rebuilding_retriever',
+                  state.training.message
+                );
+              }, { persist: false });
               await updateState(async (state) => {
                 state.model.exists = true;
                 state.model.lastLoss = message.trainingResult.lastLoss;
@@ -4946,6 +5078,7 @@ function markQueueAsRunning(state, queueId) {
                   markQueueAsPendingAfterInterruption(state, queueContext.queueId, 'paused');
                 }
                 if (!queueContext?.queueId && !message.trainingResult.stopRequested && shouldAutoClearSources(state)) {
+                  shouldPersistSources = true;
                   await Promise.all((state.sources || []).map(async (source) => {
                     const datasetPath = resolveDatasetSourcePath(source);
                     if (!datasetPath) {
@@ -4975,11 +5108,24 @@ function markQueueAsRunning(state, queueId) {
                       ? 'Обучение завершено. Чекпоинт и индекс знаний сохранены, очередь источников очищена.'
                       : 'Обучение завершено. Нейросеть, токенизатор и индекс знаний сохранены на сервере.';
                 state.training.progress = {
-                  currentEpoch: message.trainingResult.completedEpochs,
+                  currentEpoch: message.trainingResult.stopRequested
+                    ? Math.max(Number(message.trainingResult.stoppedAtEpoch) || state.training.progress.currentEpoch || 0, 0)
+                    : message.trainingResult.completedEpochs,
                   totalEpochs: message.trainingResult.effectiveEpochs,
-                  currentBatch: 0,
+                  currentBatch: message.trainingResult.stopRequested
+                    ? Math.max(Number(message.trainingResult.stoppedAtBatch) || state.training.progress.currentBatch || 0, 0)
+                    : 0,
                   totalBatches: knownBatchesPerEpoch,
+                  completedBatches: message.trainingResult.processedBatches,
+                  totalPlannedBatches: Math.max(
+                    message.trainingResult.processedBatches || 0,
+                    (message.trainingResult.effectiveEpochs || 0) * knownBatchesPerEpoch
+                  ),
                   percent: message.trainingResult.stopRequested ? state.training.progress.percent : 100,
+                  etaSeconds: null,
+                  etaAt: null,
+                  avgBatchTimeMs: null,
+                  throughputBatchesPerSec: null,
                 };
                 pushStatus(
                   state,
@@ -4996,7 +5142,21 @@ function markQueueAsRunning(state, queueId) {
                   savedAt: state.model.lastTrainingAt,
                 });
               }, {
-                writeChats: false,
+                persist: false,
+              });
+              await updateState(async (state) => {
+                state.model.lifecycle = 'syncing_knowledge';
+                state.model.status = 'saving_checkpoint';
+                state.training.phase = 'saving_model_package';
+                state.training.message = 'Финализация обучения: сохранение пакета активной модели.';
+                pushStatus(
+                  state,
+                  'syncing_knowledge',
+                  'saving_model_package',
+                  state.training.message
+                );
+              }, {
+                persist: false,
               });
               await updateState(async (state) => {
                 ensureModelRegistryState(state);
@@ -5004,6 +5164,31 @@ function markQueueAsRunning(state, queueId) {
                 await saveActiveModelPackage(state);
               }, {
                 writeSources: false,
+                writeChats: false,
+                writeArtifacts: false,
+              });
+              await updateState(async (state) => {
+                state.model.lifecycle = 'syncing_knowledge';
+                state.model.status = 'saving_checkpoint';
+                state.training.phase = 'persisting_state';
+                state.training.message = 'Финализация обучения: запись артефактов и итогового состояния.';
+                pushStatus(
+                  state,
+                  'syncing_knowledge',
+                  'persisting_state',
+                  state.training.message
+                );
+              }, {
+                persist: false,
+              });
+              await updateState(async (state) => {
+                state.model.lifecycle = message.trainingResult.stopRequested ? 'paused' : 'trained';
+                state.model.status = 'ready';
+                state.training.status = message.trainingResult.stopRequested ? 'paused' : 'completed';
+                state.training.phase = message.trainingResult.stopRequested ? 'paused_by_user' : 'ready_for_chat';
+                state.training.updatedAt = nowIso();
+              }, {
+                writeSources: shouldPersistSources,
                 writeChats: false,
               });
               log('info', 'Training worker finished successfully.', {

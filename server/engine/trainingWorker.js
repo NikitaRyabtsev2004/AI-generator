@@ -11,6 +11,10 @@ const {
 let stopRequested = false;
 let activeChild = null;
 let stopSignalPath = '';
+const STDERR_RING_LIMIT_CHARS = Math.max(16_384, Number(process.env.TRAINING_STDERR_RING_LIMIT_CHARS) || 262_144);
+const TRAINING_NO_OUTPUT_TIMEOUT_MS = Math.max(60_000, Number(process.env.TRAINING_NO_OUTPUT_TIMEOUT_MS) || 240_000);
+const PREPARATION_NO_OUTPUT_TIMEOUT_MS = Math.max(120_000, Number(process.env.PREPARATION_NO_OUTPUT_TIMEOUT_MS) || 1_800_000);
+const CHECKPOINT_NO_OUTPUT_TIMEOUT_MS = Math.max(120_000, Number(process.env.CHECKPOINT_NO_OUTPUT_TIMEOUT_MS) || 3_600_000);
 
 function postMessage(type, payload = {}) {
   if (!parentPort) {
@@ -54,6 +58,16 @@ process.on('exit', () => {
   }
 });
 
+function resolveNoOutputTimeoutMs(lastPayloadType) {
+  if (lastPayloadType === 'checkpointing') {
+    return CHECKPOINT_NO_OUTPUT_TIMEOUT_MS;
+  }
+  if (lastPayloadType === 'preparing' || lastPayloadType === 'prepared') {
+    return PREPARATION_NO_OUTPUT_TIMEOUT_MS;
+  }
+  return TRAINING_NO_OUTPUT_TIMEOUT_MS;
+}
+
 async function main() {
   const {
     settings,
@@ -61,6 +75,7 @@ async function main() {
     storage,
     resumeFromCheckpoint,
     resumeEpochOffset = 0,
+    resumeBatchOffset = 0,
     manifest,
     positiveFeedbackCount,
     stopSignalBuffer = null,
@@ -80,6 +95,7 @@ async function main() {
     storage,
     resumeFromCheckpoint: Boolean(resumeFromCheckpoint),
     resumeEpochOffset: Math.max(Number(resumeEpochOffset) || 0, 0),
+    resumeBatchOffset: Math.max(Number(resumeBatchOffset) || 0, 0),
     manifest: manifest || {},
     positiveFeedbackCount: Number(positiveFeedbackCount) || 0,
     stopSignalPath,
@@ -89,9 +105,49 @@ async function main() {
   let finished = false;
   let stderrOutput = '';
   let forwardedError = false;
+  let lastPayloadAtMs = Date.now();
+  let lastPayloadType = 'startup';
+  let stallWatchdogId = null;
 
   try {
     activeChild = await startPythonBackendProcess('train', temp.filePath);
+
+    const updatePayloadHeartbeat = (payloadType = '') => {
+      lastPayloadAtMs = Date.now();
+      if (payloadType) {
+        lastPayloadType = String(payloadType);
+      }
+    };
+
+    updatePayloadHeartbeat('startup');
+    stallWatchdogId = setInterval(() => {
+      if (finished || !activeChild || activeChild.killed) {
+        return;
+      }
+      const now = Date.now();
+      const timeoutMs = resolveNoOutputTimeoutMs(lastPayloadType);
+      const idleMs = now - lastPayloadAtMs;
+      if (idleMs < timeoutMs) {
+        return;
+      }
+
+      forwardedError = true;
+      finished = true;
+      const idleSec = Math.max(1, Math.round(idleMs / 1000));
+      postMessage('error', {
+        error: {
+          message:
+            `Воркер обучения не присылал телеметрию ${idleSec} с (последний тип: ${lastPayloadType}). ` +
+            'Процесс автоматически остановлен как зависший.',
+          stack: '',
+        },
+      });
+      try {
+        activeChild.kill('SIGTERM');
+      } catch (_error) {
+        // Ignore kill failures.
+      }
+    }, 5000);
 
     const stdoutReader = readline.createInterface({
       input: activeChild.stdout,
@@ -115,6 +171,8 @@ async function main() {
         return;
       }
 
+      updatePayloadHeartbeat(payload.type);
+
       if (payload.type === 'error') {
         forwardedError = true;
         postMessage('error', {
@@ -136,6 +194,9 @@ async function main() {
 
     activeChild.stderr.on('data', (chunk) => {
       stderrOutput += chunk.toString();
+      if (stderrOutput.length > STDERR_RING_LIMIT_CHARS) {
+        stderrOutput = stderrOutput.slice(-STDERR_RING_LIMIT_CHARS);
+      }
     });
 
     const exitCode = await new Promise((resolve, reject) => {
@@ -153,6 +214,10 @@ async function main() {
       });
     }
   } finally {
+    if (stallWatchdogId) {
+      clearInterval(stallWatchdogId);
+      stallWatchdogId = null;
+    }
     activeChild = null;
     await cleanupTempConfig(temp.dir);
   }

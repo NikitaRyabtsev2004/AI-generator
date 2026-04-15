@@ -511,8 +511,8 @@
   display: inline-flex;
   flex-direction: column;
   gap: 2px;
-  min-width: min(620px, calc(100vw - 28px));
-  max-width: min(820px, calc(100vw - 28px));
+  min-width: min(420px, calc(100vw - 28px));
+  max-width: min(620px, calc(100vw - 28px));
   padding: 10px 14px;
   border-radius: 14px;
   border: 1px solid rgba(255, 255, 255, 0.2);

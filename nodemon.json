@@ -4,9 +4,9 @@
   ],
   "ext": "js,cjs,mjs",
   "execMap": {
-    "js": "node --disable-warning=ExperimentalWarning",
-    "cjs": "node --disable-warning=ExperimentalWarning",
-    "mjs": "node --disable-warning=ExperimentalWarning"
+    "js": "node --max-old-space-size=8192 --disable-warning=ExperimentalWarning",
+    "cjs": "node --max-old-space-size=8192 --disable-warning=ExperimentalWarning",
+    "mjs": "node --max-old-space-size=8192 --disable-warning=ExperimentalWarning"
   },
   "ignore": [
     "server/data/**",

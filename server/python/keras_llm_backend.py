@@ -7,12 +7,13 @@ import math
 import os
 import platform
 import re
+import shutil
 import tempfile
 import time
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from llm_tokenizer import SPECIAL_TOKENS, SimpleSubwordTokenizer, TokenizerConfig
 
@@ -55,6 +56,16 @@ def safe_int(value: Any, fallback: int) -> int:
     try:
         parsed = int(value)
     except (TypeError, ValueError):
+        return fallback
+    return parsed
+
+
+def safe_non_negative_int(value: Any, fallback: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    if parsed < 0:
         return fallback
     return parsed
 
@@ -104,6 +115,9 @@ def resolve_training_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
         embedding_size,
         min(feed_forward_requested, feed_forward_ratio_cap, feed_forward_activation_cap),
     )
+    optimizer_name = str(training.get("optimizer") or "adam_legacy").strip().lower()
+    if optimizer_name not in ("adam", "adam_legacy"):
+        optimizer_name = "adam_legacy"
 
     return {
         "executionMode": str(training.get("executionMode") or "native_preferred"),
@@ -116,8 +130,20 @@ def resolve_training_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
         "feedForwardSize": feed_forward_size,
         "dropout": min(0.6, max(0.0, safe_float(training.get("dropout"), 0.1))),
         "learningRate": max(1e-6, safe_float(training.get("learningRate"), 0.001)),
+        "optimizer": optimizer_name,
+        "gradientClipNorm": min(10.0, max(0.0, safe_float(training.get("gradientClipNorm"), 0.0))),
         "batchSize": batch_size,
         "epochs": max(1, safe_int(training.get("epochs"), 1)),
+        # Emit every batch by default so UI progress is real-time.
+        "batchReportInterval": max(1, safe_int(training.get("batchReportInterval"), 1)),
+        # Collect scalar metrics less frequently to reduce GPU↔CPU sync overhead.
+        "metricsReportInterval": max(1, safe_int(training.get("metricsReportInterval"), 16)),
+        # Keep chart points lighter than raw batch stream by default.
+        "historyReportInterval": max(1, safe_int(training.get("historyReportInterval"), 16)),
+        # Conservative tf.data prefetch lowers risk of sporadic pipeline stalls on Windows GPU.
+        "datasetPrefetchBatches": min(8, max(0, safe_non_negative_int(training.get("datasetPrefetchBatches"), 1))),
+        # Optional private threadpool for tf.data (0 = TensorFlow default behavior).
+        "datasetPrivateThreadpoolSize": min(32, max(0, safe_non_negative_int(training.get("datasetPrivateThreadpoolSize"), 0))),
         "vocabularyLimit": max(512, safe_int(training.get("vocabularyLimit"), 12000)),
         "validationSplit": min(0.4, max(0.0, safe_float(training.get("validationSplit"), 0.1))),
     }
@@ -263,7 +289,10 @@ def load_keras_model_from_bytes(weights_path: str):
     }
     with tempfile.TemporaryDirectory(prefix="ai_generator_load_") as temp_dir:
         temp_path = Path(temp_dir) / "runtime_model.keras"
-        temp_path.write_bytes(Path(weights_path).read_bytes())
+        try:
+            os.link(str(weights_path), str(temp_path))
+        except Exception:
+            shutil.copyfile(str(weights_path), str(temp_path))
         model = tf.keras.models.load_model(str(temp_path), custom_objects=custom_objects, compile=False)
     return model
 
@@ -271,10 +300,26 @@ def load_keras_model_from_bytes(weights_path: str):
 def save_keras_model_to_bytes(model, weights_path: str) -> None:
     target = Path(weights_path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="ai_generator_save_") as temp_dir:
-        temp_path = Path(temp_dir) / "runtime_model.keras"
+    fd, temp_name = tempfile.mkstemp(
+        prefix="ai_generator_save_",
+        suffix=".keras",
+        dir=str(target.parent),
+    )
+    os.close(fd)
+    temp_path = Path(temp_name)
+    try:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
         model.save(str(temp_path), include_optimizer=False)
-        target.write_bytes(temp_path.read_bytes())
+        os.replace(str(temp_path), str(target))
+    finally:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except Exception:
+            pass
 
 
 def load_checkpoint_runtime(storage: Dict[str, Any]) -> Tuple[Any, SimpleSubwordTokenizer, Dict[str, Any]]:
@@ -289,11 +334,20 @@ def save_checkpoint_runtime(
     model,
     tokenizer: SimpleSubwordTokenizer,
     spec_payload: Dict[str, Any],
+    on_progress: Optional[Callable[[str, str], None]] = None,
 ) -> None:
+    def report(stage: str, message: str) -> None:
+        if callable(on_progress):
+            on_progress(stage, message)
+
     paths = get_storage_paths(storage)
+    report("tokenizer", "Сохранение токенизатора чекпоинта.")
     tokenizer.save(paths["tokenizerPath"])
+    report("weights", "Сохранение весов нейросети (может занять время на больших моделях).")
     save_keras_model_to_bytes(model, paths["weightsPath"])
+    report("spec", "Сохранение спецификации чекпоинта.")
     write_json(paths["specPath"], spec_payload)
+    report("done", "Чекпоинт успешно сохранен.")
 
 
 def choose_next_token(probabilities, top_k: int, repetition_penalty: float, generated: List[int], pad_id: int, unk_id: int) -> int:
@@ -542,32 +596,23 @@ def create_training_text_iterator(payload: Dict[str, Any]):
 
 
 def compute_masked_loss(tf, labels, logits, pad_id: int):
-    losses = tf.keras.losses.sparse_categorical_crossentropy(labels, logits, from_logits=True)
+    losses = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=tf.cast(labels, tf.int32), logits=logits)
     mask = tf.cast(tf.not_equal(labels, pad_id), losses.dtype)
     masked = losses * mask
     denominator = tf.maximum(tf.reduce_sum(mask), tf.constant(1.0, dtype=losses.dtype))
     return tf.reduce_sum(masked) / denominator
 
 
-def train_batch(tf, model, optimizer, x_batch, y_batch, clip_norm: float, pad_id: int, use_loss_scale: bool) -> float:
-    with tf.GradientTape() as tape:
-        logits = model(x_batch, training=True)
-        loss = compute_masked_loss(tf, y_batch, logits, pad_id=pad_id)
-        scaled_loss = optimizer.get_scaled_loss(loss) if use_loss_scale and hasattr(optimizer, "get_scaled_loss") else loss
-
-    gradients = tape.gradient(scaled_loss, model.trainable_variables)
-    if use_loss_scale and hasattr(optimizer, "get_unscaled_gradients"):
-        gradients = optimizer.get_unscaled_gradients(gradients)
-
-    sanitized_gradients = []
-    for gradient, variable in zip(gradients, model.trainable_variables):
-        sanitized_gradients.append(gradient if gradient is not None else tf.zeros_like(variable))
-    clipped_gradients, _ = tf.clip_by_global_norm(sanitized_gradients, clip_norm)
-    optimizer.apply_gradients(zip(clipped_gradients, model.trainable_variables))
-    return float(loss.numpy())
-
-
-def build_train_step(tf, model, optimizer, clip_norm: float, pad_id: int, use_loss_scale: bool, use_xla: bool):
+def build_train_step(
+    tf,
+    model,
+    optimizer,
+    clip_norm: float,
+    pad_id: int,
+    use_loss_scale: bool,
+    use_xla: bool,
+    return_loss: bool = True,
+):
     @tf.function(reduce_retracing=True, jit_compile=use_xla)
     def train_step(x_batch, y_batch):
         with tf.GradientTape() as tape:
@@ -579,12 +624,19 @@ def build_train_step(tf, model, optimizer, clip_norm: float, pad_id: int, use_lo
         if use_loss_scale and hasattr(optimizer, "get_unscaled_gradients"):
             gradients = optimizer.get_unscaled_gradients(gradients)
 
-        sanitized_gradients = []
-        for gradient, variable in zip(gradients, model.trainable_variables):
-            sanitized_gradients.append(gradient if gradient is not None else tf.zeros_like(variable))
-        clipped_gradients, _ = tf.clip_by_global_norm(sanitized_gradients, clip_norm)
-        optimizer.apply_gradients(zip(clipped_gradients, model.trainable_variables))
-        return tf.cast(loss, tf.float32)
+        grads_and_vars = [(gradient, variable) for gradient, variable in zip(gradients, model.trainable_variables) if gradient is not None]
+        if grads_and_vars:
+            if clip_norm > 0.0:
+                grad_values = [pair[0] for pair in grads_and_vars]
+                variables = [pair[1] for pair in grads_and_vars]
+                clipped_gradients, _ = tf.clip_by_global_norm(grad_values, clip_norm)
+                optimizer.apply_gradients(zip(clipped_gradients, variables))
+            else:
+                optimizer.apply_gradients(grads_and_vars)
+
+        if return_loss:
+            return tf.cast(loss, tf.float32)
+        return tf.constant(0.0, dtype=tf.float32)
 
     return train_step
 
@@ -617,6 +669,7 @@ def command_train(config: Dict[str, Any]) -> int:
     positive_feedback_count = safe_int(config.get("positiveFeedbackCount"), 0)
     resume_requested = bool(config.get("resumeFromCheckpoint"))
     resume_epoch_offset = max(0, safe_int(config.get("resumeEpochOffset"), 0))
+    resume_batch_offset = max(0, safe_int(config.get("resumeBatchOffset"), 0))
     stop_signal_path = str(config.get("stopSignalPath") or "").strip()
 
     training_settings = resolve_training_settings(settings)
@@ -725,6 +778,11 @@ def command_train(config: Dict[str, Any]) -> int:
         batch_size=training_settings["batchSize"],
         validation_split=training_settings["validationSplit"],
         stride=training_settings["windowStride"],
+        shuffle_seed=1337,
+        reshuffle_each_iteration=False,
+        prefetch_batches=training_settings["datasetPrefetchBatches"],
+        deterministic=True,
+        private_threadpool_size=training_settings["datasetPrivateThreadpoolSize"],
     )
 
     if stop_requested(stop_signal_path):
@@ -752,9 +810,12 @@ def command_train(config: Dict[str, Any]) -> int:
 
     requested_epochs = training_settings["epochs"]
     effective_resume_epoch_offset = resume_epoch_offset if resumed_from_checkpoint else 0
+    if not resumed_from_checkpoint:
+        resume_batch_offset = 0
     effective_epochs = effective_resume_epoch_offset + requested_epochs
     parameter_count = count_model_parameters(model)
     batches_per_epoch = dataset_bundle.batches_per_epoch
+    resume_batch_offset = min(resume_batch_offset, max(0, batches_per_epoch - 1))
     minimum_steps = max(1, batches_per_epoch * max(1, requested_epochs))
 
     emit(
@@ -770,6 +831,8 @@ def command_train(config: Dict[str, Any]) -> int:
             "backendLabel": tf_info["backendLabel"],
             "executionMode": training_settings["executionMode"],
             "backendWarning": tf_info["backendWarning"],
+            "optimizer": training_settings["optimizer"],
+            "gradientClipNorm": training_settings["gradientClipNorm"],
             "requestedBatchSize": training_settings["batchSize"],
             "effectiveBatchSize": training_settings["batchSize"],
             "windowStride": training_settings["windowStride"],
@@ -778,13 +841,26 @@ def command_train(config: Dict[str, Any]) -> int:
             "resumedFromCheckpoint": resumed_from_checkpoint,
             "requestedResumeEpochOffset": resume_epoch_offset,
             "effectiveResumeEpochOffset": effective_resume_epoch_offset,
+            "requestedResumeBatchOffset": resume_batch_offset,
+            "effectiveResumeBatchOffset": resume_batch_offset,
             "requestedEpochs": requested_epochs,
             "effectiveEpochs": effective_epochs,
             "resumeRestartReason": resume_restart_reason,
+            "batchReportInterval": training_settings["batchReportInterval"],
+            "metricsReportInterval": training_settings["metricsReportInterval"],
+            "historyReportInterval": training_settings["historyReportInterval"],
+            "datasetPrefetchBatches": training_settings["datasetPrefetchBatches"],
+            "datasetPrivateThreadpoolSize": training_settings["datasetPrivateThreadpoolSize"],
         }
     )
 
-    base_optimizer = tf.keras.optimizers.Adam(learning_rate=training_settings["learningRate"])
+    optimizer_name = str(training_settings.get("optimizer") or "adam_legacy").lower()
+    if optimizer_name == "adam_legacy":
+        legacy_module = getattr(tf.keras.optimizers, "legacy", None)
+        AdamClass = getattr(legacy_module, "Adam", tf.keras.optimizers.Adam)
+    else:
+        AdamClass = tf.keras.optimizers.Adam
+    base_optimizer = AdamClass(learning_rate=training_settings["learningRate"])
     optimizer = base_optimizer
     use_loss_scale = False
     if tf_info["mixedPrecision"]:
@@ -797,14 +873,26 @@ def command_train(config: Dict[str, Any]) -> int:
 
     xla_requested = bool(training_settings.get("enableXla")) and bool(tf_info.get("usingGpu"))
     xla_enabled = xla_requested
-    train_step = build_train_step(
+    gradient_clip_norm = max(0.0, float(training_settings.get("gradientClipNorm") or 0.0))
+    train_step_metrics = build_train_step(
         tf=tf,
         model=model,
         optimizer=optimizer,
-        clip_norm=1.0,
+        clip_norm=gradient_clip_norm,
         pad_id=tokenizer.pad_id,
         use_loss_scale=use_loss_scale,
         use_xla=xla_enabled,
+        return_loss=True,
+    )
+    train_step_fast = build_train_step(
+        tf=tf,
+        model=model,
+        optimizer=optimizer,
+        clip_norm=gradient_clip_norm,
+        pad_id=tokenizer.pad_id,
+        use_loss_scale=use_loss_scale,
+        use_xla=xla_enabled,
+        return_loss=False,
     )
     validation_step = build_validation_step(
         tf=tf,
@@ -823,19 +911,43 @@ def command_train(config: Dict[str, Any]) -> int:
     best_weights = None
     heartbeat_interval_s = 15
     last_heartbeat_at = time.time()
-    report_interval = max(1, batches_per_epoch // 60)
+    metrics_interval = max(1, safe_int(training_settings.get("metricsReportInterval"), 16))
+    history_interval = max(1, safe_int(training_settings.get("historyReportInterval"), metrics_interval))
+    batch_report_interval = max(1, safe_int(training_settings.get("batchReportInterval"), 1))
+    total_planned_batches = max(1, batches_per_epoch * effective_epochs)
+    smoothed_batch_seconds: Optional[float] = None
+    smoothed_eta_seconds: Optional[float] = None
+    last_emitted_eta_seconds: Optional[int] = None
     was_stopped = False
+    stopped_at_epoch = effective_resume_epoch_offset
+    stopped_at_batch = 0
 
     for epoch in range(1, requested_epochs + 1):
         batch_index = 0
         for x_batch, y_batch in dataset_bundle.train_dataset:
             if stop_requested(stop_signal_path):
                 was_stopped = True
+                stopped_at_epoch = effective_resume_epoch_offset + epoch
+                stopped_at_batch = batch_index
                 break
 
             batch_index += 1
+            if epoch == 1 and batch_index <= resume_batch_offset:
+                stopped_at_epoch = effective_resume_epoch_offset + epoch
+                stopped_at_batch = batch_index
+                continue
+            batch_started_at = time.time()
+            should_collect_metrics = (
+                batch_index == 1
+                or batch_index == batches_per_epoch
+                or (batch_index % metrics_interval == 0)
+            )
             try:
-                loss_value = float(train_step(x_batch, y_batch).numpy())
+                if should_collect_metrics:
+                    loss_value = float(train_step_metrics(x_batch, y_batch).numpy())
+                else:
+                    train_step_fast(x_batch, y_batch)
+                    loss_value = float(last_loss) if last_loss is not None else 0.0
             except Exception as error:
                 error_message = clean_message(error)
                 can_disable_xla = xla_enabled and ("xla" in error_message.lower() or "jit" in error_message.lower())
@@ -843,14 +955,25 @@ def command_train(config: Dict[str, Any]) -> int:
                     raise
 
                 xla_enabled = False
-                train_step = build_train_step(
+                train_step_metrics = build_train_step(
                     tf=tf,
                     model=model,
                     optimizer=optimizer,
-                    clip_norm=1.0,
+                    clip_norm=gradient_clip_norm,
                     pad_id=tokenizer.pad_id,
                     use_loss_scale=use_loss_scale,
                     use_xla=False,
+                    return_loss=True,
+                )
+                train_step_fast = build_train_step(
+                    tf=tf,
+                    model=model,
+                    optimizer=optimizer,
+                    clip_norm=gradient_clip_norm,
+                    pad_id=tokenizer.pad_id,
+                    use_loss_scale=use_loss_scale,
+                    use_xla=False,
+                    return_loss=False,
                 )
                 validation_step = build_validation_step(
                     tf=tf,
@@ -866,60 +989,135 @@ def command_train(config: Dict[str, Any]) -> int:
                         "details": error_message[:240],
                     }
                 )
-                loss_value = float(train_step(x_batch, y_batch).numpy())
+                loss_value = float(train_step_metrics(x_batch, y_batch).numpy())
             processed_batches += 1
             total_loss += loss_value
             last_loss = loss_value
 
-            should_report = (
-                batch_index == 1
-                or batch_index == batches_per_epoch
-                or (batch_index % report_interval == 0)
+            average_loss = total_loss / max(1, processed_batches)
+            now = time.time()
+            batch_duration_s = max(0.0, now - batch_started_at)
+            if smoothed_batch_seconds is None:
+                smoothed_batch_seconds = batch_duration_s
+            else:
+                smoothed_batch_seconds = (smoothed_batch_seconds * 0.9) + (batch_duration_s * 0.1)
+
+            current_epoch = effective_resume_epoch_offset + epoch
+            completed_batches_global = min(
+                max(((max(current_epoch, 1) - 1) * max(batches_per_epoch, 1)) + max(batch_index, 1), 1),
+                total_planned_batches,
             )
-            if should_report:
-                average_loss = total_loss / max(1, processed_batches)
+            remaining_batches = max(0, total_planned_batches - completed_batches_global)
+            eta_seconds = None
+            eta_at = None
+            if smoothed_batch_seconds is not None:
+                raw_eta_seconds = max(0.0, remaining_batches * smoothed_batch_seconds)
+                if smoothed_eta_seconds is None:
+                    smoothed_eta_seconds = raw_eta_seconds
+                else:
+                    smoothed_eta_seconds = (smoothed_eta_seconds * 0.96) + (raw_eta_seconds * 0.04)
+                eta_seconds = int(max(0, round(smoothed_eta_seconds)))
+                if last_emitted_eta_seconds is not None:
+                    max_change = max(2, min(30, int(round(last_emitted_eta_seconds * 0.04))))
+                    eta_seconds = max(
+                        last_emitted_eta_seconds - max_change,
+                        min(last_emitted_eta_seconds + max_change, eta_seconds),
+                    )
+                if last_emitted_eta_seconds is None or abs(eta_seconds - last_emitted_eta_seconds) >= 1:
+                    last_emitted_eta_seconds = eta_seconds
+                else:
+                    eta_seconds = last_emitted_eta_seconds
+                eta_at = datetime.fromtimestamp(now + eta_seconds, tz=timezone.utc).isoformat()
+
+            history_entry = None
+            should_store_history = (
+                should_collect_metrics
+                and (
+                    batch_index == 1
+                    or batch_index == batches_per_epoch
+                    or (batch_index % history_interval == 0)
+                )
+            )
+            if should_store_history:
                 history_entry = {
                     "step": processed_batches,
-                    "epoch": effective_resume_epoch_offset + epoch,
+                    "epoch": current_epoch,
                     "batch": batch_index,
                     "loss": round(loss_value, 6),
                 }
                 history.append(history_entry)
+
+            should_emit_batch = (
+                batch_index == 1
+                or batch_index == batches_per_epoch
+                or (batch_index % batch_report_interval == 0)
+            )
+            if should_emit_batch:
                 emit(
                     {
                         "type": "batch",
                         "lastLoss": round(loss_value, 6),
                         "averageLoss": round(average_loss, 6),
                         "processedBatches": processed_batches,
-                        "epoch": effective_resume_epoch_offset + epoch,
+                        "completedBatches": completed_batches_global,
+                        "totalPlannedBatches": total_planned_batches,
+                        "epoch": current_epoch,
                         "batch": batch_index,
                         "batchesThisEpoch": batches_per_epoch,
                         "effectiveEpochs": effective_epochs,
                         "requestedEpochs": effective_epochs,
                         "minimumTrainingSteps": minimum_steps,
                         "enforcedStepBudget": False,
+                        "metricsCollected": should_collect_metrics,
+                        "stepDurationMs": round(batch_duration_s * 1000.0, 2),
+                        "avgBatchDurationMs": round((smoothed_batch_seconds or 0.0) * 1000.0, 2),
+                        "throughputBatchesPerSec": round(1.0 / max(smoothed_batch_seconds or 1e-9, 1e-9), 4),
+                        "etaSeconds": eta_seconds,
+                        "etaAt": eta_at,
                         "historyEntry": history_entry,
                     }
                 )
 
-            now = time.time()
             if now - last_heartbeat_at >= heartbeat_interval_s:
                 emit(
                     {
                         "type": "heartbeat",
-                        "epoch": effective_resume_epoch_offset + epoch,
+                        "epoch": current_epoch,
                         "batch": batch_index,
                         "batchesThisEpoch": batches_per_epoch,
                         "effectiveEpochs": effective_epochs,
+                        "etaSeconds": eta_seconds,
+                        "etaAt": eta_at,
                         "startedAt": now_iso(),
                     }
                 )
                 last_heartbeat_at = now
+            stopped_at_epoch = current_epoch
+            stopped_at_batch = batch_index
 
         if was_stopped:
             break
 
+        emit(
+            {
+                "type": "validation",
+                "stage": "start",
+                "epoch": effective_resume_epoch_offset + epoch,
+                "effectiveEpochs": effective_epochs,
+                "message": f"Валидация эпохи {effective_resume_epoch_offset + epoch}/{effective_epochs}.",
+            }
+        )
         last_validation_loss = evaluate_validation(dataset_bundle.validation_dataset, validation_step)
+        emit(
+            {
+                "type": "validation",
+                "stage": "done",
+                "epoch": effective_resume_epoch_offset + epoch,
+                "effectiveEpochs": effective_epochs,
+                "validationLoss": round(last_validation_loss, 6) if last_validation_loss is not None else None,
+                "message": f"Валидация эпохи {effective_resume_epoch_offset + epoch}/{effective_epochs} завершена.",
+            }
+        )
         if last_validation_loss is not None and (
             best_validation_loss is None or last_validation_loss < best_validation_loss
         ):
@@ -934,7 +1132,16 @@ def command_train(config: Dict[str, Any]) -> int:
     average_loss = (total_loss / processed_batches) if processed_batches > 0 else None
     perplexity = math.exp(average_loss) if average_loss is not None else None
 
-    emit({"type": "checkpointing"})
+    def emit_checkpoint_stage(stage: str, message: str) -> None:
+        emit(
+            {
+                "type": "checkpointing",
+                "stage": stage,
+                "message": message,
+            }
+        )
+
+    emit_checkpoint_stage("started", "Обучение завершено, начинается сохранение чекпоинта.")
     parameter_count = count_model_parameters(model)
     saved_at = now_iso()
     language_model = {
@@ -979,7 +1186,13 @@ def command_train(config: Dict[str, Any]) -> int:
             "modelSettings": model_settings_manifest,
         },
     }
-    save_checkpoint_runtime(storage=storage, model=model, tokenizer=tokenizer, spec_payload=spec_payload)
+    save_checkpoint_runtime(
+        storage=storage,
+        model=model,
+        tokenizer=tokenizer,
+        spec_payload=spec_payload,
+        on_progress=emit_checkpoint_stage,
+    )
 
     training_result = {
         "lastLoss": round(last_loss, 6) if last_loss is not None else None,
@@ -997,6 +1210,10 @@ def command_train(config: Dict[str, Any]) -> int:
         "trainingSampleCount": dataset_bundle.training_sample_count,
         "validationSampleCount": dataset_bundle.validation_sample_count,
         "stopRequested": was_stopped,
+        "stoppedAtEpoch": stopped_at_epoch,
+        "stoppedAtBatch": stopped_at_batch,
+        "nextResumeEpochOffset": completed_epochs,
+        "nextResumeBatchOffset": min(stopped_at_batch, max(0, batches_per_epoch - 1)) if was_stopped else 0,
         "history": history[-360:],
     }
 
