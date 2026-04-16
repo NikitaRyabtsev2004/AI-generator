@@ -75,6 +75,20 @@ const ARCHIVED_REPLY_REPLAY_LIMIT = 240;
 const MODEL_PACKAGE_FORMAT = 'ai-generator-model-package';
 const MODEL_PACKAGE_VERSION = 1;
 const TRAINING_STOP_TIMEOUT_MS = 8000;
+const TRAINING_WORKER_MESSAGE_STALL_MS = Math.max(60_000, Number(process.env.TRAINING_WORKER_MESSAGE_STALL_MS) || 180_000);
+const TRAINING_BATCH_PROGRESS_STALL_MS = Math.max(60_000, Number(process.env.TRAINING_BATCH_PROGRESS_STALL_MS) || 180_000);
+const PREPARATION_WORKER_MESSAGE_STALL_MS = Math.max(
+  120_000,
+  Number(process.env.PREPARATION_NO_OUTPUT_TIMEOUT_MS) || 1_800_000
+);
+const CHECKPOINT_WORKER_MESSAGE_STALL_MS = Math.max(
+  120_000,
+  Number(process.env.CHECKPOINT_NO_OUTPUT_TIMEOUT_MS) || 3_600_000
+);
+const TRAINING_AUTO_RECOVERY_RESTART_DELAY_MS = Math.max(
+  500,
+  Number(process.env.TRAINING_AUTO_RECOVERY_RESTART_DELAY_MS) || 1500
+);
 const SHORT_SOCIAL_MESSAGE_PATTERN = /^(привет|здравствуй|здравствуйте|добрый день|доброе утро|добрый вечер|hello|hi|hey|yo|hola)\b/iu;
 const MARKDOWN_LINK_PATTERN = /\[([^\]]{1,120})\]\((https?:\/\/[^\s)]+)\)/giu;
 const URL_PATTERN = /https?:\/\/[^\s)]+/giu;
@@ -3422,20 +3436,37 @@ function createModelEngine({ getState, updateState }) {
   let neuralRuntime = null;
 
   function hasActiveTrainingExecution() {
+    const workerThreadId = Number(activeTrainingWorker?.threadId);
+    const hasLiveTrainingWorker = Number.isFinite(workerThreadId) && workerThreadId > 0;
     return Boolean(
-      activeTrainingPromise ||
+      (activeTrainingPromise && (hasLiveTrainingWorker || activeTrainingStartPromise)) ||
       activeTrainingQueueRunnerPromise ||
-      activeTrainingWorker ||
+      hasLiveTrainingWorker ||
       activeTrainingStartPromise
     );
   }
 
   async function repairStaleExecutionStateIfNeeded(reason = 'stale_execution_state') {
-    if (hasActiveTrainingExecution()) {
+    const snapshot = getState();
+    const workerThreadId = Number(activeTrainingWorker?.threadId);
+    const hasLiveTrainingWorker = Number.isFinite(workerThreadId) && workerThreadId > 0;
+    const lastTrainingUpdateAtMs = snapshot.training?.updatedAt
+      ? Date.parse(snapshot.training.updatedAt)
+      : 0;
+    const staleTrainingWindowElapsedMs = Number.isFinite(lastTrainingUpdateAtMs)
+      ? Math.max(0, Date.now() - lastTrainingUpdateAtMs)
+      : Number.POSITIVE_INFINITY;
+    const hasZombieTrainingExecution = Boolean(
+      snapshot.training?.status === 'training' &&
+      !hasLiveTrainingWorker &&
+      !activeTrainingStartPromise &&
+      !activeTrainingQueueRunnerPromise &&
+      staleTrainingWindowElapsedMs >= 60_000
+    );
+    if (hasActiveTrainingExecution() && !hasZombieTrainingExecution) {
       return false;
     }
 
-    const snapshot = getState();
     const queueRunner = snapshot.trainingQueues?.runner || null;
     const queueRunnerCanBeSanitized = queueRunner?.status !== 'error';
     const hasStaleQueueRunnerSnapshot = Boolean(
@@ -3459,6 +3490,21 @@ function createModelEngine({ getState, updateState }) {
 
     if (!hasStaleTrainingState) {
       return false;
+    }
+
+    if (hasZombieTrainingExecution) {
+      try {
+        activeTrainingWorker?.terminate();
+      } catch (_error) {
+        // Ignore worker termination failures while repairing stale state.
+      }
+      activeTrainingWorker = null;
+      activeTrainingPromise = null;
+      activeTrainingStartPromise = null;
+      activeTrainingStartResolve = null;
+      activeTrainingStartReject = null;
+      activeTrainingStopSignal = null;
+      activeTrainingTerminationMode = null;
     }
 
     await updateState(async (state) => {
@@ -4687,16 +4733,53 @@ function markQueueAsRunning(state, queueId) {
       const pausedByUser =
         String(initialState.training?.status || '').toLowerCase() === 'paused' &&
         String(initialState.training?.phase || '').toLowerCase() === 'paused_by_user';
+      const recoveryPoint = canResumeFromCheckpoint && initialState.training?.status === 'error'
+        ? initialState.training?.recoveryPoint || null
+        : null;
       const requestedResumeEpochOffset = canResumeFromCheckpoint
-        ? Math.max(Number(initialState.model.trainedEpochs) || 0, 0)
-        : 0;
-      const previousBatchesPerEpoch = Math.max(Number(initialState.model.batchesPerEpoch) || 0, 0);
-      const requestedResumeBatchOffset = canResumeFromCheckpoint && pausedByUser
-        ? Math.min(
-          Math.max(Number(initialState.training?.progress?.currentBatch) || 0, 0),
-          Math.max(previousBatchesPerEpoch - 1, 0)
+        ? Math.max(
+          Number(recoveryPoint?.epochOffset ?? initialState.model.trainedEpochs) || 0,
+          0
         )
         : 0;
+      const previousBatchesPerEpoch = Math.max(Number(initialState.model.batchesPerEpoch) || 0, 0);
+      const requestedResumeBatchOffset = canResumeFromCheckpoint
+        ? pausedByUser
+          ? Math.min(
+            Math.max(Number(initialState.training?.progress?.currentBatch) || 0, 0),
+            Math.max(previousBatchesPerEpoch - 1, 0)
+          )
+          : Math.min(
+            Math.max(Number(recoveryPoint?.batchOffset) || 0, 0),
+            Math.max(previousBatchesPerEpoch - 1, 0)
+          )
+        : 0;
+      const maxAutoRecoveryRestarts = Math.max(
+        0,
+        Math.min(32, Number(initialState.settings?.training?.maxAutoRecoveryRestarts) || 12)
+      );
+      let autoRecoveryAttempt = 0;
+      let durableResumeEpochOffset = requestedResumeEpochOffset;
+      let durableResumeBatchOffset = requestedResumeBatchOffset;
+      let durableCheckpointReady = Boolean(canResumeFromCheckpoint);
+      let durableBatchesPerEpoch = Math.max(previousBatchesPerEpoch, 1);
+      let lastObservedEpoch = Math.max(durableResumeEpochOffset + 1, 1);
+      let lastObservedBatch = Math.max(durableResumeBatchOffset, 0);
+      let lastObservedPhase = 'startup';
+
+      const normalizeResumeTarget = (epochOffset, batchOffset) => {
+        const safeBatchesPerEpoch = Math.max(durableBatchesPerEpoch, 1);
+        let normalizedEpochOffset = Math.max(Number(epochOffset) || 0, 0);
+        let normalizedBatchOffset = Math.max(Number(batchOffset) || 0, 0);
+        while (normalizedBatchOffset >= safeBatchesPerEpoch) {
+          normalizedBatchOffset -= safeBatchesPerEpoch;
+          normalizedEpochOffset += 1;
+        }
+        return {
+          epochOffset: normalizedEpochOffset,
+          batchOffset: normalizedBatchOffset,
+        };
+      };
 
       await disposeNeuralRuntime();
 
@@ -4717,28 +4800,55 @@ function markQueueAsRunning(state, queueId) {
       });
       trainingPayloadPathForCleanup = trainingPayloadPath;
 
-      await new Promise((resolve, reject) => {
-        const worker = new Worker(workerPath, {
-          workerData: {
-            settings: initialState.settings,
-            trainingPayloadPath,
-            storage: initialState.model.storage,
-            resumeFromCheckpoint: Boolean(canResumeFromCheckpoint),
-            resumeEpochOffset: requestedResumeEpochOffset,
-            resumeBatchOffset: requestedResumeBatchOffset,
-            manifest,
-            positiveFeedbackCount: initialTrainingArtifacts.positiveFeedbackCount,
-            stopSignalBuffer: stopSignal.buffer,
-          },
-        });
+      const shouldAutoRecoverTrainingError = (error) => {
+        if (isTrainingStopRequested() || activeTrainingTerminationMode) {
+          return false;
+        }
+        if (autoRecoveryAttempt >= maxAutoRecoveryRestarts) {
+          return false;
+        }
+        if (!durableCheckpointReady && durableResumeEpochOffset <= 0 && durableResumeBatchOffset <= 0) {
+          return false;
+        }
+        const message = cleanText(error?.message || '').toLowerCase();
+        return (
+          message.includes('обучение зависло') ||
+          message.includes('воркер обучения') ||
+          message.includes('python training backend exited') ||
+          message.includes('telemetry')
+        );
+      };
 
-        activeTrainingWorker = worker;
-        let finished = false;
-        let workerQueue = Promise.resolve();
-        let knownBatchesPerEpoch = 1;
-        let lastPreparationStage = '';
-        let lastValidationStage = '';
-        let lastCheckpointStage = '';
+      while (true) {
+        try {
+          await new Promise((resolve, reject) => {
+            const worker = new Worker(workerPath, {
+              workerData: {
+                settings: initialState.settings,
+                trainingPayloadPath,
+                storage: initialState.model.storage,
+                resumeFromCheckpoint: Boolean(durableCheckpointReady),
+                resumeEpochOffset: durableResumeEpochOffset,
+                resumeBatchOffset: durableResumeBatchOffset,
+                manifest,
+                positiveFeedbackCount: initialTrainingArtifacts.positiveFeedbackCount,
+                stopSignalBuffer: stopSignal.buffer,
+              },
+            });
+
+            activeTrainingWorker = worker;
+            let finished = false;
+            let workerQueue = Promise.resolve();
+            let knownBatchesPerEpoch = 1;
+            let lastPreparationStage = '';
+            let lastValidationStage = '';
+            let lastCheckpointStage = '';
+            let lastRecoveryCheckpointStage = '';
+            let lastWorkerMessageAtMs = Date.now();
+            let lastWorkerMessageType = 'startup';
+            let lastCompletedBatchesReported = 0;
+            let lastBatchProgressAtMs = Date.now();
+            let stallMonitorId = null;
 
         const finalizeFailure = (error) => {
           if (finished) {
@@ -4756,6 +4866,10 @@ function markQueueAsRunning(state, queueId) {
 
           finished = true;
           activeTrainingWorker = null;
+          if (stallMonitorId) {
+            clearInterval(stallMonitorId);
+            stallMonitorId = null;
+          }
           logError('Training worker failed.', error);
           reject(error);
         };
@@ -4767,6 +4881,10 @@ function markQueueAsRunning(state, queueId) {
 
           finished = true;
           activeTrainingWorker = null;
+          if (stallMonitorId) {
+            clearInterval(stallMonitorId);
+            stallMonitorId = null;
+          }
           resolve();
         };
 
@@ -4775,9 +4893,22 @@ function markQueueAsRunning(state, queueId) {
         };
         let pendingBatchMessage = null;
         let batchFlushQueued = false;
+        let runResumeEpochOffset = Math.max(Number(durableResumeEpochOffset) || 0, 0);
+        let runResumeBatchOffset = Math.max(Number(durableResumeBatchOffset) || 0, 0);
+        let runRequestedEpochs = Math.max(Number(initialState.settings?.training?.epochs) || 1, 1);
+        let runBatchesPerEpoch = Math.max(knownBatchesPerEpoch, 1);
+        let runSmoothedEtaSeconds = null;
+        let runLastEtaSeconds = null;
+        let runLastEtaAtMs = 0;
 
         const applyBatchMessage = async (batchMessage) => {
+          lastWorkerMessageAtMs = Date.now();
+          lastWorkerMessageType = 'batch';
+          lastObservedEpoch = Math.max(Number(batchMessage.epoch) || lastObservedEpoch || 1, 1);
+          lastObservedBatch = Math.max(Number(batchMessage.batch) || 0, 0);
+          lastObservedPhase = 'training_batches';
           knownBatchesPerEpoch = Math.max(batchMessage.batchesThisEpoch || knownBatchesPerEpoch, 1);
+          runBatchesPerEpoch = Math.max(knownBatchesPerEpoch, 1);
           const totalEpochs = Math.max(batchMessage.effectiveEpochs || initialState.settings.training.epochs, 1);
           const totalBatches = Math.max(batchMessage.batchesThisEpoch * totalEpochs, 1);
           const completedBatches = Math.min(
@@ -4791,36 +4922,70 @@ function markQueueAsRunning(state, queueId) {
           const completedBatchesReported = Number.isFinite(Number(batchMessage.completedBatches))
             ? Math.max(1, Math.round(Number(batchMessage.completedBatches)))
             : completedBatches;
+          if (completedBatchesReported > lastCompletedBatchesReported) {
+            lastCompletedBatchesReported = completedBatchesReported;
+            lastBatchProgressAtMs = Date.now();
+          }
           const totalPlannedBatches = Number.isFinite(Number(batchMessage.totalPlannedBatches))
             ? Math.max(1, Math.round(Number(batchMessage.totalPlannedBatches)))
             : totalBatches;
-          const etaSeconds = Number.isFinite(Number(batchMessage.etaSeconds))
-            ? Math.max(0, Math.round(Number(batchMessage.etaSeconds)))
-            : null;
-          const etaAt = cleanText(batchMessage.etaAt || '');
           const avgBatchTimeMs = Number.isFinite(Number(batchMessage.avgBatchDurationMs))
             ? Number(batchMessage.avgBatchDurationMs)
             : null;
           const throughputBatchesPerSec = Number.isFinite(Number(batchMessage.throughputBatchesPerSec))
             ? Number(batchMessage.throughputBatchesPerSec)
             : null;
+          const runBaselineBatches = (runResumeEpochOffset * runBatchesPerEpoch) + runResumeBatchOffset;
+          const runTotalPlannedBatches = Math.max(1, (runRequestedEpochs * runBatchesPerEpoch) - runResumeBatchOffset);
+          const runCompletedFromMessage = Number.isFinite(Number(batchMessage.runCompletedBatches))
+            ? Math.max(0, Math.round(Number(batchMessage.runCompletedBatches)))
+            : null;
+          const runCompletedBatches = runCompletedFromMessage !== null
+            ? Math.min(runTotalPlannedBatches, runCompletedFromMessage)
+            : Math.min(
+              runTotalPlannedBatches,
+              Math.max(0, completedBatchesReported - runBaselineBatches)
+            );
+          const runCurrentEpoch = Number.isFinite(Number(batchMessage.runCurrentEpoch))
+            ? Math.max(1, Math.round(Number(batchMessage.runCurrentEpoch)))
+            : Math.min(runRequestedEpochs, Math.max(1, (Math.max(Number(batchMessage.epoch) || 1, 1) - runResumeEpochOffset)));
+          const runTotalEpochs = Number.isFinite(Number(batchMessage.runTotalEpochs))
+            ? Math.max(1, Math.round(Number(batchMessage.runTotalEpochs)))
+            : runRequestedEpochs;
+          const runRemainingBatches = Math.max(0, runTotalPlannedBatches - runCompletedBatches);
+          let etaSeconds = null;
+          if (Number.isFinite(avgBatchTimeMs) && avgBatchTimeMs > 0) {
+            const rawRunEta = Math.max(0, (runRemainingBatches * avgBatchTimeMs) / 1000);
+            runSmoothedEtaSeconds = Number.isFinite(runSmoothedEtaSeconds)
+              ? (runSmoothedEtaSeconds * 0.9) + (rawRunEta * 0.1)
+              : rawRunEta;
+            etaSeconds = Math.max(0, Math.round(runSmoothedEtaSeconds));
+            if (Number.isFinite(runLastEtaSeconds)) {
+              const elapsedSec = Math.max(0, Math.floor((Date.now() - runLastEtaAtMs) / 1000));
+              const maxDownStep = Math.max(1, elapsedSec + 1);
+              etaSeconds = Math.max(runLastEtaSeconds - maxDownStep, Math.min(runLastEtaSeconds + 3, etaSeconds));
+            }
+            runLastEtaSeconds = etaSeconds;
+            runLastEtaAtMs = Date.now();
+          }
+          const etaAt = etaSeconds === null ? '' : new Date(Date.now() + (etaSeconds * 1000)).toISOString();
 
           await updateState(async (state) => {
             state.training.status = 'training';
             state.training.phase = 'training_batches';
             state.model.batchesPerEpoch = batchMessage.batchesThisEpoch;
-            state.model.targetEpochs = totalEpochs;
+            state.model.targetEpochs = runTotalEpochs;
             state.training.message = batchMessage.enforcedStepBudget
               ? 'Обучение идет в реальном времени. Минимальный бюджет обучения увеличил число эпох.'
               : 'Обучение идет в реальном времени.';
             state.training.progress = {
-              currentEpoch: batchMessage.epoch,
-              totalEpochs,
+              currentEpoch: runCurrentEpoch,
+              totalEpochs: runTotalEpochs,
               currentBatch: batchMessage.batch,
               totalBatches: batchMessage.batchesThisEpoch,
-              completedBatches: completedBatchesReported,
-              totalPlannedBatches,
-              percent: Number(((completedBatchesReported / totalPlannedBatches) * 100).toFixed(2)),
+              completedBatches: runCompletedBatches,
+              totalPlannedBatches: runTotalPlannedBatches,
+              percent: Number(((runCompletedBatches / runTotalPlannedBatches) * 100).toFixed(2)),
               etaSeconds,
               etaAt: etaAt || null,
               avgBatchTimeMs,
@@ -4840,7 +5005,7 @@ function markQueueAsRunning(state, queueId) {
             state.model.lastLoss = batchMessage.lastLoss;
             state.model.averageLoss = batchMessage.averageLoss;
             state.model.perplexity = batchMessage.averageLoss ? Number(Math.exp(batchMessage.averageLoss).toFixed(4)) : null;
-            state.model.batchesProcessed = completedBatchesReported;
+            state.model.batchesProcessed = runCompletedBatches;
           }, { persist: false });
         };
 
@@ -4862,10 +5027,62 @@ function markQueueAsRunning(state, queueId) {
           });
         };
 
+        stallMonitorId = setInterval(() => {
+          if (finished) {
+            return;
+          }
+          const now = Date.now();
+          const workerIdleMs = now - lastWorkerMessageAtMs;
+          const workerSilenceLimitMs = lastWorkerMessageType === 'checkpointing' || lastWorkerMessageType === 'recovery_checkpoint'
+            ? CHECKPOINT_WORKER_MESSAGE_STALL_MS
+            : lastWorkerMessageType === 'preparing' || lastWorkerMessageType === 'prepared'
+              ? PREPARATION_WORKER_MESSAGE_STALL_MS
+              : TRAINING_WORKER_MESSAGE_STALL_MS;
+          if (workerIdleMs >= workerSilenceLimitMs) {
+            const idleSeconds = Math.max(1, Math.round(workerIdleMs / 1000));
+            const error = new Error(
+              `Обучение зависло: от воркера нет сообщений ${idleSeconds} с (последний тип: ${lastWorkerMessageType}).`
+            );
+            try {
+              activeTrainingWorker?.terminate();
+            } catch (_error) {
+              // Ignore terminate failures and fail the job anyway.
+            }
+            finalizeFailure(error);
+            return;
+          }
+
+          const snapshot = getState();
+          const phase = String(snapshot.training?.phase || '');
+          const isBatchPhase = phase === 'training_batches';
+          if (!isBatchPhase || lastCompletedBatchesReported <= 0) {
+            return;
+          }
+
+          const batchIdleMs = now - lastBatchProgressAtMs;
+          if (batchIdleMs < TRAINING_BATCH_PROGRESS_STALL_MS) {
+            return;
+          }
+
+          const idleSeconds = Math.max(1, Math.round(batchIdleMs / 1000));
+          const error = new Error(
+            `Обучение зависло: прогресс батчей не менялся ${idleSeconds} с на шаге ${lastCompletedBatchesReported}.`
+          );
+          try {
+            activeTrainingWorker?.terminate();
+          } catch (_error) {
+            // Ignore terminate failures and fail the job anyway.
+          }
+          finalizeFailure(error);
+        }, 5000);
+
         worker.on('message', (message) => {
           if (!message?.type || finished) {
             return;
           }
+
+          lastWorkerMessageAtMs = Date.now();
+          lastWorkerMessageType = cleanText(message.type || '') || 'unknown';
 
           if (message.type === 'error') {
             finalizeFailure(new Error(message.error?.message || 'Ошибка воркера обучения.'));
@@ -4917,6 +5134,7 @@ function markQueueAsRunning(state, queueId) {
           if (message.type === 'prepared') {
             enqueueWorkerUpdate(async () => {
               knownBatchesPerEpoch = Math.max(message.batchesPerEpoch || 1, 1);
+              durableBatchesPerEpoch = Math.max(message.batchesPerEpoch || durableBatchesPerEpoch, 1);
               await updateState(async (state) => {
                 const batchSizeNote = message.batchSizeAdjusted
                   ? ` Размер батча автоматически скорректирован: ${message.requestedBatchSize} → ${message.effectiveBatchSize}, чтобы уменьшить число батчей и ускорить эпоху.`
@@ -4932,6 +5150,13 @@ function markQueueAsRunning(state, queueId) {
                 const resumedBatchOffset = Math.max(Number(message.effectiveResumeBatchOffset) || 0, 0);
                 const scheduledEpochs = Math.max(Number(message.requestedEpochs) || state.settings.training.epochs || 1, 1);
                 const totalEpochsPlanned = Math.max(Number(message.effectiveEpochs) || (resumedEpochs + scheduledEpochs), 1);
+                runResumeEpochOffset = resumedEpochs;
+                runResumeBatchOffset = Math.min(resumedBatchOffset, Math.max((Number(message.batchesPerEpoch) || 1) - 1, 0));
+                runRequestedEpochs = scheduledEpochs;
+                runBatchesPerEpoch = Math.max(Number(message.batchesPerEpoch) || runBatchesPerEpoch, 1);
+                runSmoothedEtaSeconds = null;
+                runLastEtaSeconds = null;
+                runLastEtaAtMs = 0;
                 const resumeNote = message.resumedFromCheckpoint
                   ? resumedEpochs > 0
                     ? ` Дообучение продолжается с ${resumedEpochs + 1}-й эпохи: +${scheduledEpochs}, итоговый план ${totalEpochsPlanned} эпох.`
@@ -4948,7 +5173,7 @@ function markQueueAsRunning(state, queueId) {
                 state.model.computeBackend = message.backendName || state.model.computeBackend;
                 state.model.computeBackendLabel = message.backendLabel || state.model.computeBackendLabel;
                 state.model.computeBackendWarning = message.backendWarning || '';
-                state.model.targetEpochs = totalEpochsPlanned;
+                state.model.targetEpochs = scheduledEpochs;
                 state.training.phase = 'training_batches';
                 state.training.message = `Подготовлено ${message.trainingSampleCount} обучающих окон, ${message.validationSampleCount} валидационных и ${message.batchesPerEpoch} батчей на эпоху. Backend: ${message.backendLabel || message.backendName}.${batchSizeNote}${resumeNote}${resumeBatchNote}${backendWarningNote}`;
                 pushStatus(
@@ -4968,12 +5193,23 @@ function markQueueAsRunning(state, queueId) {
 
           if (message.type === 'heartbeat') {
             enqueueWorkerUpdate(async () => {
+              if (Number.isFinite(Number(message.epoch))) {
+                lastObservedEpoch = Math.max(Number(message.epoch) || lastObservedEpoch || 1, 1);
+              }
+              if (Number.isFinite(Number(message.batch))) {
+                lastObservedBatch = Math.max(Number(message.batch) || 0, 0);
+              }
+              lastObservedPhase = cleanText(message.phase || '') || 'training_batches';
               await updateState(async (state) => {
                 if (state.training.status !== 'training') {
                   return;
                 }
 
-                state.training.phase = 'training_batches';
+                const heartbeatPhase = cleanText(message.phase || '') || 'training_batches';
+                state.training.phase = heartbeatPhase;
+                if (message.message) {
+                  state.training.message = cleanText(message.message || state.training.message);
+                }
                 state.training.updatedAt = nowIso();
               }, { persist: false });
             });
@@ -5004,6 +5240,64 @@ function markQueueAsRunning(state, queueId) {
                   lastValidationStage = validationStage;
                 }
               }, { persist: false });
+            });
+            return;
+          }
+
+          if (message.type === 'recovery_checkpoint') {
+            enqueueWorkerUpdate(async () => {
+              const recoveryStage = cleanText(message.stage || '') || 'running';
+              const stageMessage = cleanText(message.message || '') ||
+                'Сохраняется промежуточный recovery-чекпоинт обучения.';
+              if (recoveryStage === 'ready') {
+                durableCheckpointReady = true;
+                durableResumeEpochOffset = Math.max(Number(message.epochOffset) || 0, 0);
+                durableResumeBatchOffset = Math.max(Number(message.batchOffset) || 0, 0);
+                lastObservedEpoch = Math.max(durableResumeEpochOffset + 1, 1);
+                lastObservedBatch = Math.max(durableResumeBatchOffset, 0);
+                lastObservedPhase = 'training_batches';
+              }
+              await updateState(async (state) => {
+                if (state.training.status !== 'training') {
+                  return;
+                }
+                state.training.phase = recoveryStage === 'ready'
+                  ? 'training_batches'
+                  : 'saving_recovery_checkpoint';
+                state.training.message = recoveryStage === 'ready'
+                  ? 'Промежуточный recovery-чекпоинт сохранен, обучение продолжается.'
+                  : stageMessage;
+                state.training.updatedAt = nowIso();
+                state.training.recoveryPoint = {
+                  epochOffset: Math.max(Number(message.epochOffset) || 0, 0),
+                  batchOffset: Math.max(Number(message.batchOffset) || 0, 0),
+                  processedBatches: Math.max(Number(message.processedBatches) || 0, 0),
+                  savedAt: cleanText(message.savedAt || '') || nowIso(),
+                };
+                state.model.status = 'training';
+                state.model.lifecycle = 'training';
+                state.knowledge.languageModel = {
+                  ...(state.knowledge.languageModel || {}),
+                  checkpointReady: durableCheckpointReady,
+                  lastSavedAt: cleanText(message.savedAt || '') || state.knowledge.languageModel?.lastSavedAt || null,
+                };
+                if (recoveryStage !== lastRecoveryCheckpointStage) {
+                  pushStatus(
+                    state,
+                    'training',
+                    state.training.phase,
+                    state.training.message,
+                    { updateTrainingState: false }
+                  );
+                  lastRecoveryCheckpointStage = recoveryStage;
+                }
+              }, recoveryStage === 'ready'
+                ? {
+                  writeSources: false,
+                  writeChats: false,
+                  writeArtifacts: false,
+                }
+                : { persist: false });
             });
             return;
           }
@@ -5204,13 +5498,65 @@ function markQueueAsRunning(state, queueId) {
 
         worker.on('error', finalizeFailure);
         worker.on('exit', (code) => {
-          if (finished || code === 0) {
+          if (finished) {
             return;
           }
-
+          if (code === 0) {
+            finalizeFailure(new Error('Воркер обучения завершился без финального результата.'));
+            return;
+          }
           finalizeFailure(new Error(`Воркер обучения завершился с кодом ${code}.`));
         });
-      });
+          });
+          break;
+        } catch (error) {
+          if (!shouldAutoRecoverTrainingError(error)) {
+            throw error;
+          }
+          autoRecoveryAttempt += 1;
+          const normalizedErrorMessage = cleanText(error?.message || '').toLowerCase();
+          let skippedBatchMessage = '';
+          if (normalizedErrorMessage.includes('прогресс батчей')) {
+            const currentObservedEpoch = Math.max(Number(lastObservedEpoch) || 1, 1);
+            const currentObservedBatch = Math.max(Number(lastObservedBatch) || 0, 0);
+            const currentResumeEpoch = Math.max(Number(durableResumeEpochOffset) || 0, 0);
+            const currentResumeBatch = Math.max(Number(durableResumeBatchOffset) || 0, 0);
+            let nextResumeEpoch = Math.max(currentObservedEpoch - 1, currentResumeEpoch, 0);
+            let nextResumeBatch = Math.max(currentObservedBatch, currentResumeBatch);
+            if (nextResumeEpoch === currentResumeEpoch && nextResumeBatch <= currentResumeBatch) {
+              nextResumeBatch = currentResumeBatch + 1;
+            }
+            const normalizedResume = normalizeResumeTarget(nextResumeEpoch, nextResumeBatch);
+            durableResumeEpochOffset = normalizedResume.epochOffset;
+            durableResumeBatchOffset = normalizedResume.batchOffset;
+            skippedBatchMessage =
+              ` Подозрительный батч пропускается: эпоха ${currentObservedEpoch}, батч ${currentObservedBatch}.`;
+          }
+          const restartMessage =
+            `Обнаружен сбой обучения. Автовосстановление ${autoRecoveryAttempt}/${maxAutoRecoveryRestarts}: ` +
+            `перезапуск с чекпоинта эпохи ${durableResumeEpochOffset + 1}, батча ${Math.max(durableResumeBatchOffset, 0)}.` +
+            skippedBatchMessage;
+          await updateState(async (state) => {
+            state.model.lifecycle = 'training';
+            state.model.status = 'training';
+            state.training.status = 'training';
+            state.training.phase = 'auto_recovery_restart';
+            state.training.message = restartMessage;
+            state.training.updatedAt = nowIso();
+            state.training.recoveryPoint = {
+              ...(state.training.recoveryPoint || {}),
+              epochOffset: durableResumeEpochOffset,
+              batchOffset: durableResumeBatchOffset,
+              savedAt: nowIso(),
+            };
+            pushStatus(state, 'training', 'auto_recovery_restart', restartMessage, { updateTrainingState: false });
+          }, {
+            persist: false,
+          });
+          await disposeNeuralRuntime();
+          await delay(TRAINING_AUTO_RECOVERY_RESTART_DELAY_MS);
+        }
+      }
     })().catch((error) => {
       rejectTrainingStartSignal(error);
       throw error;
@@ -5908,6 +6254,44 @@ function markQueueAsRunning(state, queueId) {
         }
 
         pushStatus(state, 'idle', 'source_removed', 'Источник удален из очереди обучения.');
+      }, {
+        writeChats: false,
+        writeArtifacts: false,
+      }).then((state) => buildDashboard(state));
+    },
+
+    async clearSources() {
+      await repairStaleExecutionStateIfNeeded();
+      return updateState(async (state) => {
+        assertTrainingUnlocked(state, 'Изменение источников');
+        const removedSources = Array.isArray(state.sources) ? state.sources : [];
+        const removedDatasetPaths = removedSources
+          .map((source) => resolveDatasetSourcePath(source || {}))
+          .filter(Boolean);
+
+        state.sources = [];
+        state.model.sourceCount = 0;
+        if (state.model.exists) {
+          state.model.lifecycle = state.model.trainedEpochs ? 'trained' : 'ready_for_training';
+          state.model.status = 'ready';
+        }
+
+        await Promise.all(removedDatasetPaths.map(async (datasetPath) => {
+          try {
+            await fs.rm(datasetPath, { force: true });
+          } catch (_error) {
+            // Ignore cleanup failures for removed source dataset files.
+          }
+        }));
+
+        pushStatus(
+          state,
+          'idle',
+          removedSources.length ? 'sources_cleared' : 'sources_already_empty',
+          removedSources.length
+            ? `Удалено ${removedSources.length} источников из очереди обучения.`
+            : 'Очередь источников уже пуста.'
+        );
       }, {
         writeChats: false,
         writeArtifacts: false,

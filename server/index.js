@@ -28,6 +28,56 @@ const PORT = Number(process.env.PORT || 4000);
 const SLOW_REQUEST_THRESHOLD_MS = readPositiveIntegerEnv('SLOW_REQUEST_THRESHOLD_MS', 3000);
 const SSE_HEARTBEAT_MS = readPositiveIntegerEnv('SSE_HEARTBEAT_MS', 20000);
 const SSE_STATE_THROTTLE_MS = readPositiveIntegerEnv('SSE_STATE_THROTTLE_MS', 80);
+const TRAINING_PROGRESS_THROTTLE_MS = readPositiveIntegerEnv('TRAINING_PROGRESS_THROTTLE_MS', 120);
+const TRAINING_SNAPSHOT_THROTTLE_MS = readPositiveIntegerEnv('TRAINING_SNAPSHOT_THROTTLE_MS', 1500);
+
+function isTrainingLikeState(state) {
+  return (
+    state?.training?.status === 'training' ||
+    state?.model?.lifecycle === 'training' ||
+    state?.model?.status === 'saving_checkpoint' ||
+    state?.model?.lifecycle === 'syncing_knowledge'
+  );
+}
+
+function createTrainingProgressPayload(state) {
+  return {
+    model: {
+      lifecycle: state.model?.lifecycle || 'not_created',
+      status: state.model?.status || 'idle',
+      batchesPerEpoch: Number(state.model?.batchesPerEpoch) || 0,
+      batchesProcessed: Number(state.model?.batchesProcessed) || 0,
+      lastLoss: state.model?.lastLoss ?? null,
+      averageLoss: state.model?.averageLoss ?? null,
+      validationLoss: state.model?.validationLoss ?? null,
+      bestValidationLoss: state.model?.bestValidationLoss ?? null,
+      perplexity: state.model?.perplexity ?? null,
+      trainedEpochs: Number(state.model?.trainedEpochs) || 0,
+      targetEpochs: Number(state.model?.targetEpochs) || 0,
+      parameterCount: Number(state.model?.parameterCount) || 0,
+      computeBackend: state.model?.computeBackend || 'cpu',
+      computeBackendLabel: state.model?.computeBackendLabel || '',
+      computeBackendWarning: state.model?.computeBackendWarning || '',
+      lastTrainingAt: state.model?.lastTrainingAt || null,
+    },
+    training: {
+      status: state.training?.status || 'idle',
+      phase: state.training?.phase || 'waiting',
+      message: state.training?.message || '',
+      updatedAt: state.training?.updatedAt || null,
+      progress: state.training?.progress || null,
+      history: Array.isArray(state.training?.history) ? state.training.history : [],
+      recentStatuses: Array.isArray(state.training?.recentStatuses) ? state.training.recentStatuses.slice(0, 12) : [],
+    },
+    knowledge: {
+      languageModel: state.knowledge?.languageModel || null,
+    },
+    runtime: {
+      trainingBackend: state.model?.computeBackendLabel || state.model?.computeBackend || '',
+      trainingBackendWarning: state.model?.computeBackendWarning || '',
+    },
+  };
+}
 
 async function bootstrap() {
   await initializeLogger();
@@ -44,6 +94,7 @@ async function bootstrap() {
   const { sourceUpload, modelPackageUpload, limits } = createUploadMiddlewares();
   const realtimeClients = new Set();
   let pendingStateBroadcast = null;
+  let pendingTrainingProgressBroadcast = null;
   let scheduleStateBroadcast = () => {};
 
   app.use(cors());
@@ -79,6 +130,37 @@ async function bootstrap() {
   };
 
   scheduleStateBroadcast = () => {
+    const state = getState();
+    if (isTrainingLikeState(state)) {
+      if (!pendingTrainingProgressBroadcast) {
+        pendingTrainingProgressBroadcast = setTimeout(() => {
+          pendingTrainingProgressBroadcast = null;
+          try {
+            broadcastEvent('training_progress', {
+              snapshot: createTrainingProgressPayload(getState()),
+            });
+          } catch (error) {
+            logError('Failed to broadcast training progress payload.', error);
+          }
+        }, TRAINING_PROGRESS_THROTTLE_MS);
+      }
+
+      if (pendingStateBroadcast) {
+        return;
+      }
+
+      pendingStateBroadcast = setTimeout(async () => {
+        pendingStateBroadcast = null;
+        try {
+          const snapshot = await engine.getRealtimeSnapshot();
+          broadcastEvent('snapshot', { snapshot });
+        } catch (error) {
+          logError('Failed to broadcast realtime snapshot.', error);
+        }
+      }, TRAINING_SNAPSHOT_THROTTLE_MS);
+      return;
+    }
+
     if (pendingStateBroadcast) {
       return;
     }
@@ -112,6 +194,11 @@ async function bootstrap() {
     try {
       const snapshot = await engine.getRealtimeSnapshot();
       writeSseEvent(response, 'snapshot', { snapshot });
+      if (isTrainingLikeState(getState())) {
+        writeSseEvent(response, 'training_progress', {
+          snapshot: createTrainingProgressPayload(getState()),
+        });
+      }
       writeSseEvent(response, 'logs', {
         logs: getRecentLogs(120),
         logFile: LOG_FILE,
@@ -261,6 +348,9 @@ async function bootstrap() {
   process.on('exit', () => {
     if (pendingStateBroadcast) {
       clearTimeout(pendingStateBroadcast);
+    }
+    if (pendingTrainingProgressBroadcast) {
+      clearTimeout(pendingTrainingProgressBroadcast);
     }
     statusCollector.dispose();
     unsubscribeLogs();

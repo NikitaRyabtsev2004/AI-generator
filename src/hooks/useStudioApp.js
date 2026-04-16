@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   addUrlSource,
+  clearSources,
   createChat,
   createModel,
   createNamedModel,
@@ -137,6 +138,38 @@ export function useStudioApp() {
     }));
   }, []);
 
+  const mergeTrainingProgressSnapshot = useCallback((nextTrainingSnapshot) => {
+    if (!nextTrainingSnapshot) {
+      return;
+    }
+
+    setSnapshot((current) => {
+      if (!current) {
+        return current;
+      }
+
+      return {
+        ...current,
+        model: {
+          ...current.model,
+          ...(nextTrainingSnapshot.model || {}),
+        },
+        training: {
+          ...current.training,
+          ...(nextTrainingSnapshot.training || {}),
+        },
+        knowledge: {
+          ...current.knowledge,
+          ...(nextTrainingSnapshot.knowledge || {}),
+        },
+        runtime: {
+          ...current.runtime,
+          ...(nextTrainingSnapshot.runtime || {}),
+        },
+      };
+    });
+  }, []);
+
   const loadDashboard = useCallback(async (chatId = selectedChatIdRef.current) => {
     const controller = new AbortController();
     const requestId = dashboardRequestIdRef.current + 1;
@@ -250,6 +283,11 @@ export function useStudioApp() {
           mergeRealtimeSnapshot(nextRealtimeSnapshot);
         }
       },
+      onTrainingProgress: ({ snapshot: nextTrainingSnapshot }) => {
+        if (!isDisposed) {
+          mergeTrainingProgressSnapshot(nextTrainingSnapshot);
+        }
+      },
       onLog: ({ entry }) => {
         if (!isDisposed && entry) {
           setServerLogs((current) => mergeLogEntries(current, [entry]));
@@ -279,7 +317,7 @@ export function useStudioApp() {
       isDisposed = true;
       unsubscribe();
     };
-  }, [mergeRealtimeSnapshot]);
+  }, [mergeRealtimeSnapshot, mergeTrainingProgressSnapshot]);
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -409,6 +447,7 @@ export function useStudioApp() {
       { actionName: 'deleteTrainingQueue' }
     ),
     addUrlSource: (url) => runAction(() => addUrlSource(url), { actionName: 'addUrlSource' }),
+    clearSources: () => runAction(() => clearSources(), { actionName: 'clearSources' }),
     removeSource: (sourceId) => runAction(() => removeSource(sourceId), { actionName: 'removeSource' }),
     createModel: () => runAction(() => createModel(), { actionName: 'createModel' }),
     createNamedModel: (name) => runAction(() => createNamedModel(name), { actionName: 'createNamedModel' }),

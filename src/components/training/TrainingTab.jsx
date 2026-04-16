@@ -509,6 +509,7 @@ export default function TrainingTab({
   onRemoveTrainingQueueSource,
   onDeleteTrainingQueue,
   onAddUrlSource,
+  onClearSources,
   onRemoveSource,
   onCreateModel,
   onCreateNamedModel,
@@ -576,13 +577,16 @@ export default function TrainingTab({
   const factRows = useMemo(() => modelFactRows(snapshot), [snapshot]);
   const statusEntries = snapshot.training?.recentStatuses || [];
   const trainingProgress = snapshot.training?.progress || {};
-  const trainingEtaSeconds = Number.isFinite(Number(trainingProgress.etaSeconds))
+  const trainingEtaSeconds = trainingProgress.etaSeconds !== null && trainingProgress.etaSeconds !== undefined &&
+    Number.isFinite(Number(trainingProgress.etaSeconds))
     ? Math.max(0, Math.round(Number(trainingProgress.etaSeconds)))
     : null;
-  const trainingAvgBatchMs = Number.isFinite(Number(trainingProgress.avgBatchTimeMs))
+  const trainingAvgBatchMs = trainingProgress.avgBatchTimeMs !== null && trainingProgress.avgBatchTimeMs !== undefined &&
+    Number.isFinite(Number(trainingProgress.avgBatchTimeMs))
     ? Math.max(0, Number(trainingProgress.avgBatchTimeMs))
     : null;
-  const trainingThroughputBps = Number.isFinite(Number(trainingProgress.throughputBatchesPerSec))
+  const trainingThroughputBps = trainingProgress.throughputBatchesPerSec !== null && trainingProgress.throughputBatchesPerSec !== undefined &&
+    Number.isFinite(Number(trainingProgress.throughputBatchesPerSec))
     ? Math.max(0, Number(trainingProgress.throughputBatchesPerSec))
     : null;
   const trainingPercentLabel = formatPercent(trainingProgress.percent);
@@ -590,6 +594,10 @@ export default function TrainingTab({
   const trainingEpochTotal = Math.max(0, Number(trainingProgress.totalEpochs) || 0);
   const trainingBatchNow = Math.max(0, Number(trainingProgress.currentBatch) || 0);
   const trainingBatchTotal = Math.max(0, Number(trainingProgress.totalBatches) || 0);
+  const trainingEpochLabel = trainingEpochTotal > 0 ? `${trainingEpochNow}/${trainingEpochTotal}` : '—/—';
+  const trainingBatchLabel = trainingBatchTotal > 0 ? `${trainingBatchNow}/${trainingBatchTotal}` : '—/—';
+  const trainingEtaLabel = trainingEtaSeconds !== null ? formatDurationClock(trainingEtaSeconds) : '—';
+  const trainingEtaAtLabel = trainingProgress.etaAt ? formatDateTime(trainingProgress.etaAt) : '—';
   const modelConstraintReport = useMemo(
     () => applyModelConstraints(settingsDraft),
     [settingsDraft]
@@ -1453,6 +1461,25 @@ export default function TrainingTab({
             ) : null}
           </div>
 
+          <div className="source-section__head">
+            <Typography variant="subtitle2">Ручные источники</Typography>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <Typography variant="caption" className="muted-text">
+                {`${snapshot.sources.length} файлов`}
+              </Typography>
+              <Button
+                variant="outlined"
+                size="small"
+                onClick={async () => {
+                  await onClearSources();
+                }}
+                disabled={busy || trainingLocked || !snapshot.sources.length}
+              >
+                Удалить все
+              </Button>
+            </div>
+          </div>
+
           <div className="source-list">
             {snapshot.sources.map((source) => (
               <div className="source-card" key={source.id}>
@@ -1621,13 +1648,13 @@ export default function TrainingTab({
             <Alert severity={snapshot.model.lifecycle === 'error' ? 'error' : 'info'}>
               {snapshot.training.message}
             </Alert>
-            {isTraining && trainingEtaSeconds !== null ? (
+            {isTraining ? (
               <Alert severity="info" className="training-live-alert">
                 <span className="training-live-alert__line">
-                  {`Эпоха ${trainingEpochNow}/${trainingEpochTotal} | Батч ${trainingBatchNow}/${trainingBatchTotal} | Прогресс ${trainingPercentLabel}%`}
+                  {`Эпоха ${trainingEpochLabel} | Батч ${trainingBatchLabel} | Прогресс ${trainingPercentLabel}%`}
                 </span>
                 <span className="training-live-alert__line">
-                  {`ETA ${formatDurationClock(trainingEtaSeconds)} | Окончание ${formatDateTime(trainingProgress.etaAt)} | Скорость ${trainingThroughputBps ? formatDecimal(trainingThroughputBps, 3) : '—'} батч/с | Шаг ~${trainingAvgBatchMs ? formatDecimal(trainingAvgBatchMs, 1) : '—'} мс`}
+                  {`ETA ${trainingEtaLabel} | Окончание ${trainingEtaAtLabel} | Скорость ${trainingThroughputBps ? formatDecimal(trainingThroughputBps, 3) : '—'} батч/с | Шаг ~${trainingAvgBatchMs ? formatDecimal(trainingAvgBatchMs, 1) : '—'} мс`}
                 </span>
               </Alert>
             ) : null}

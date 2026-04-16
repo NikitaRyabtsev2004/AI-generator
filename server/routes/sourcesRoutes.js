@@ -66,6 +66,15 @@ function createSourcesRoutes({
     }
   });
 
+  router.delete('/sources', heavy, async (_request, response) => {
+    try {
+      const snapshot = await engine.clearSources();
+      sendSuccess(response, { snapshot });
+    } catch (error) {
+      sendError(response, error);
+    }
+  });
+
   router.delete('/sources/:sourceId', heavy, async (request, response) => {
     try {
       const snapshot = await engine.removeSource(request.params.sourceId);

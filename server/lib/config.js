@@ -22,6 +22,10 @@ const DEFAULT_SETTINGS = {
     historyReportInterval: 16,
     datasetPrefetchBatches: 1,
     datasetPrivateThreadpoolSize: 0,
+    heartbeatIntervalSeconds: 10,
+    recoveryCheckpointIntervalBatches: 1000,
+    recoveryCheckpointIntervalMinutes: 20,
+    maxAutoRecoveryRestarts: 12,
     chunkSize: 180,
     chunkOverlap: 36,
     vocabularyLimit: 12000,
@@ -161,6 +165,7 @@ function createDefaultTrainingState() {
     },
     history: [],
     recentStatuses: [],
+    recoveryPoint: null,
   };
 }
 

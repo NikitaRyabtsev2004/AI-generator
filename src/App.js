@@ -366,6 +366,7 @@ function App() {
               onRemoveTrainingQueueSource={studio.actions.removeTrainingQueueSource}
               onDeleteTrainingQueue={studio.actions.deleteTrainingQueue}
               onAddUrlSource={studio.actions.addUrlSource}
+              onClearSources={studio.actions.clearSources}
               onRemoveSource={studio.actions.removeSource}
               onCreateModel={studio.actions.createModel}
               onCreateNamedModel={studio.actions.createNamedModel}

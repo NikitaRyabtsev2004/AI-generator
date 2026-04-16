@@ -12,6 +12,7 @@ let stopRequested = false;
 let activeChild = null;
 let stopSignalPath = '';
 const STDERR_RING_LIMIT_CHARS = Math.max(16_384, Number(process.env.TRAINING_STDERR_RING_LIMIT_CHARS) || 262_144);
+const STDOUT_RING_LIMIT_CHARS = Math.max(16_384, Number(process.env.TRAINING_STDOUT_RING_LIMIT_CHARS) || 262_144);
 const TRAINING_NO_OUTPUT_TIMEOUT_MS = Math.max(60_000, Number(process.env.TRAINING_NO_OUTPUT_TIMEOUT_MS) || 240_000);
 const PREPARATION_NO_OUTPUT_TIMEOUT_MS = Math.max(120_000, Number(process.env.PREPARATION_NO_OUTPUT_TIMEOUT_MS) || 1_800_000);
 const CHECKPOINT_NO_OUTPUT_TIMEOUT_MS = Math.max(120_000, Number(process.env.CHECKPOINT_NO_OUTPUT_TIMEOUT_MS) || 3_600_000);
@@ -59,7 +60,7 @@ process.on('exit', () => {
 });
 
 function resolveNoOutputTimeoutMs(lastPayloadType) {
-  if (lastPayloadType === 'checkpointing') {
+  if (lastPayloadType === 'checkpointing' || lastPayloadType === 'recovery_checkpoint') {
     return CHECKPOINT_NO_OUTPUT_TIMEOUT_MS;
   }
   if (lastPayloadType === 'preparing' || lastPayloadType === 'prepared') {
@@ -104,6 +105,7 @@ async function main() {
 
   let finished = false;
   let stderrOutput = '';
+  let stdoutOutput = '';
   let forwardedError = false;
   let lastPayloadAtMs = Date.now();
   let lastPayloadType = 'startup';
@@ -159,12 +161,27 @@ async function main() {
       if (!trimmed || finished) {
         return;
       }
+      stdoutOutput += `${trimmed}\n`;
+      if (stdoutOutput.length > STDOUT_RING_LIMIT_CHARS) {
+        stdoutOutput = stdoutOutput.slice(-STDOUT_RING_LIMIT_CHARS);
+      }
 
       let payload = null;
       try {
         payload = JSON.parse(trimmed);
       } catch (_error) {
-        return;
+        const sanitizedLine = trimmed
+          .replace(/-Infinity/g, 'null')
+          .replace(/\bInfinity\b/g, 'null')
+          .replace(/\bNaN\b/g, 'null');
+        if (sanitizedLine === trimmed) {
+          return;
+        }
+        try {
+          payload = JSON.parse(sanitizedLine);
+        } catch (_error2) {
+          return;
+        }
       }
 
       if (!payload || typeof payload !== 'object') {
@@ -204,8 +221,27 @@ async function main() {
       activeChild.on('exit', (code) => resolve(Number(code ?? 0)));
     });
 
-    if (!finished && !forwardedError && exitCode !== 0) {
-      const message = String(stderrOutput || '').trim() || `Python training backend exited with code ${exitCode}.`;
+    if (!finished && !forwardedError) {
+      const stderrText = String(stderrOutput || '').trim();
+      const stdoutText = String(stdoutOutput || '').trim();
+      const stdoutTail = stdoutText
+        ? stdoutText
+          .split(/\r?\n/u)
+          .filter(Boolean)
+          .slice(-8)
+          .join('\n')
+        : '';
+      const message = exitCode === 0
+        ? (
+          stderrText ||
+          (stdoutTail ? `Python stdout before exit:\n${stdoutTail}` : '') ||
+          'Python training backend exited before sending final training result.'
+        )
+        : (
+          stderrText ||
+          (stdoutTail ? `Python stdout before exit:\n${stdoutTail}` : '') ||
+          `Python training backend exited with code ${exitCode}.`
+        );
       postMessage('error', {
         error: {
           message,

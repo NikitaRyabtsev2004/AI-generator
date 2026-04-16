@@ -227,6 +227,9 @@ export function subscribeToServerEvents(handlers = {}) {
   eventSource.addEventListener('snapshot', (event) => {
     parseEvent(event, handlers.onSnapshot);
   });
+  eventSource.addEventListener('training_progress', (event) => {
+    parseEvent(event, handlers.onTrainingProgress);
+  });
   eventSource.addEventListener('log', (event) => {
     parseEvent(event, handlers.onLog);
   });
@@ -293,6 +296,13 @@ export async function addUrlSource(url) {
 
 export async function removeSource(sourceId) {
   const payload = await requestJson(`/api/sources/${sourceId}`, {
+    method: 'DELETE',
+  });
+  return payload.snapshot;
+}
+
+export async function clearSources() {
+  const payload = await requestJson('/api/sources', {
     method: 'DELETE',
   });
   return payload.snapshot;

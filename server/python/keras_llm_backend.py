@@ -9,6 +9,7 @@ import platform
 import re
 import shutil
 import tempfile
+import threading
 import time
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -17,13 +18,27 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from llm_tokenizer import SPECIAL_TOKENS, SimpleSubwordTokenizer, TokenizerConfig
 
+EMIT_LOCK = threading.Lock()
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def sanitize_json_payload(value: Any) -> Any:
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: sanitize_json_payload(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [sanitize_json_payload(item) for item in value]
+    return value
+
+
 def emit(payload: Dict[str, Any]) -> None:
-    print(json.dumps(payload, ensure_ascii=False), flush=True)
+    sanitized_payload = sanitize_json_payload(payload)
+    with EMIT_LOCK:
+        print(json.dumps(sanitized_payload, ensure_ascii=False, allow_nan=False), flush=True)
 
 
 def clean_message(value: Any, fallback: str = "") -> str:
@@ -39,7 +54,11 @@ def read_json(path: str | Path) -> Dict[str, Any]:
 def write_json(path: str | Path, payload: Dict[str, Any]) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    sanitized_payload = sanitize_json_payload(payload)
+    target.write_text(
+        json.dumps(sanitized_payload, ensure_ascii=False, indent=2, allow_nan=False),
+        encoding="utf-8",
+    )
 
 
 def safe_float(value: Any, fallback: float) -> float:
@@ -144,6 +163,17 @@ def resolve_training_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
         "datasetPrefetchBatches": min(8, max(0, safe_non_negative_int(training.get("datasetPrefetchBatches"), 1))),
         # Optional private threadpool for tf.data (0 = TensorFlow default behavior).
         "datasetPrivateThreadpoolSize": min(32, max(0, safe_non_negative_int(training.get("datasetPrivateThreadpoolSize"), 0))),
+        # Background heartbeat keeps orchestration alive even if TensorFlow stalls inside one long step.
+        "heartbeatIntervalSeconds": min(60, max(5, safe_int(training.get("heartbeatIntervalSeconds"), 10))),
+        # Periodic recovery checkpoints reduce progress loss after crashes or forced restarts.
+        "recoveryCheckpointIntervalBatches": min(
+            50_000,
+            max(0, safe_non_negative_int(training.get("recoveryCheckpointIntervalBatches"), 1000)),
+        ),
+        "recoveryCheckpointIntervalMinutes": min(
+            240.0,
+            max(0.0, safe_float(training.get("recoveryCheckpointIntervalMinutes"), 20.0)),
+        ),
         "vocabularyLimit": max(512, safe_int(training.get("vocabularyLimit"), 12000)),
         "validationSplit": min(0.4, max(0.0, safe_float(training.get("validationSplit"), 0.1))),
     }
@@ -297,11 +327,65 @@ def load_keras_model_from_bytes(weights_path: str):
     return model
 
 
-def save_keras_model_to_bytes(model, weights_path: str) -> None:
+def load_keras_model_from_weights(weights_path: str, spec_payload: Dict[str, Any], tokenizer: SimpleSubwordTokenizer):
+    tf = import_tensorflow()
+    from llm_model import GPTConfig, build_gpt_model  # pylint: disable=import-outside-toplevel
+
+    model_config_payload = spec_payload.get("modelConfig") if isinstance(spec_payload.get("modelConfig"), dict) else {}
+    if not model_config_payload:
+        raise ValueError("Checkpoint modelConfig is missing.")
+
+    config_payload = dict(model_config_payload)
+    config_payload["vocabulary_size"] = max(
+        safe_int(config_payload.get("vocabulary_size"), 0),
+        safe_int(spec_payload.get("manifest", {}).get("vocabularySize"), tokenizer.vocabulary_size),
+        tokenizer.vocabulary_size,
+    )
+    config_payload["pad_token_id"] = safe_int(config_payload.get("pad_token_id"), tokenizer.pad_id)
+    model_config = GPTConfig(**config_payload)
+    model = build_gpt_model(model_config)
+    model(tf.zeros((1, model_config.context_length), dtype=tf.int32), training=False)
+
+    with tempfile.TemporaryDirectory(prefix="ai_generator_load_weights_") as temp_dir:
+        temp_path = Path(temp_dir) / "runtime_model.weights.h5"
+        try:
+            os.link(str(weights_path), str(temp_path))
+        except Exception:
+            shutil.copyfile(str(weights_path), str(temp_path))
+        model.load_weights(str(temp_path))
+    return model
+
+
+def save_keras_model_weights(model, weights_path: str) -> None:
     target = Path(weights_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(
-        prefix="ai_generator_save_",
+        prefix="ai_generator_save_weights_",
+        suffix=".weights.h5",
+        dir=str(target.parent),
+    )
+    os.close(fd)
+    temp_path = Path(temp_name)
+    try:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        model.save_weights(str(temp_path))
+        os.replace(str(temp_path), str(target))
+    finally:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except Exception:
+            pass
+
+
+def save_keras_model_archive(model, weights_path: str) -> None:
+    target = Path(weights_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix="ai_generator_save_archive_",
         suffix=".keras",
         dir=str(target.parent),
     )
@@ -325,7 +409,11 @@ def save_keras_model_to_bytes(model, weights_path: str) -> None:
 def load_checkpoint_runtime(storage: Dict[str, Any]) -> Tuple[Any, SimpleSubwordTokenizer, Dict[str, Any]]:
     paths = get_storage_paths(storage)
     tokenizer, spec_payload = load_tokenizer_and_spec(storage)
-    model = load_keras_model_from_bytes(paths["weightsPath"])
+    weights_format = str(spec_payload.get("weightsFormat") or "").strip().lower()
+    if weights_format == "hdf5_weights_v1":
+        model = load_keras_model_from_weights(paths["weightsPath"], spec_payload, tokenizer)
+    else:
+        model = load_keras_model_from_bytes(paths["weightsPath"])
     return model, tokenizer, spec_payload
 
 
@@ -344,10 +432,87 @@ def save_checkpoint_runtime(
     report("tokenizer", "Сохранение токенизатора чекпоинта.")
     tokenizer.save(paths["tokenizerPath"])
     report("weights", "Сохранение весов нейросети (может занять время на больших моделях).")
-    save_keras_model_to_bytes(model, paths["weightsPath"])
+    requested_weights_format = str(spec_payload.get("weightsFormat") or "hdf5_weights_v1").strip().lower()
+    actual_weights_format = requested_weights_format
+    if requested_weights_format == "hdf5_weights_v1":
+        try:
+            save_keras_model_weights(model, paths["weightsPath"])
+        except Exception:
+            report("weights_fallback", "Быстрое сохранение весов недоступно, используется совместимый архивный формат чекпоинта.")
+            save_keras_model_archive(model, paths["weightsPath"])
+            actual_weights_format = "legacy_keras_archive_v1"
+    else:
+        save_keras_model_archive(model, paths["weightsPath"])
+        actual_weights_format = "legacy_keras_archive_v1"
     report("spec", "Сохранение спецификации чекпоинта.")
+    spec_payload["weightsFormat"] = actual_weights_format
     write_json(paths["specPath"], spec_payload)
     report("done", "Чекпоинт успешно сохранен.")
+
+
+def build_spec_payload(
+    *,
+    manifest: Dict[str, Any],
+    parameter_count: int,
+    completed_epochs: int,
+    saved_at: str,
+    tokenizer: SimpleSubwordTokenizer,
+    tokenized_corpus,
+    training_settings: Dict[str, Any],
+    model_config,
+    checkpoint_kind: str = "final",
+    next_resume_epoch_offset: int = 0,
+    next_resume_batch_offset: int = 0,
+    processed_batches: int = 0,
+) -> Dict[str, Any]:
+    model_settings_manifest = {
+        "sequenceLength": training_settings["sequenceLength"],
+        "embeddingSize": training_settings["embeddingSize"],
+        "attentionHeads": training_settings["attentionHeads"],
+        "transformerLayers": training_settings["transformerLayers"],
+        "feedForwardSize": training_settings["feedForwardSize"],
+        "dropout": training_settings["dropout"],
+        "learningRate": training_settings["learningRate"],
+    }
+    return {
+        "version": 2,
+        "format": "keras_llm_checkpoint_v1",
+        "weightsFormat": "hdf5_weights_v1",
+        "savedAt": saved_at,
+        "modelConfig": asdict(model_config),
+        "specs": [],
+        "manifest": {
+            **manifest,
+            "parameterCount": parameter_count,
+            "trainedEpochs": completed_epochs,
+            "trainingSequenceCount": tokenized_corpus.sample_count,
+            "corpusTokenCount": tokenized_corpus.token_count,
+            "savedAt": saved_at,
+            "vocabularySize": tokenizer.vocabulary_size,
+            "modelSettings": model_settings_manifest,
+            "checkpointKind": checkpoint_kind,
+            "nextResumeEpochOffset": max(0, int(next_resume_epoch_offset)),
+            "nextResumeBatchOffset": max(0, int(next_resume_batch_offset)),
+            "processedBatches": max(0, int(processed_batches)),
+        },
+    }
+
+
+def start_training_heartbeat(
+    state: Dict[str, Any],
+    interval_seconds: int,
+    stop_event: threading.Event,
+) -> threading.Thread:
+    def worker() -> None:
+        while not stop_event.wait(max(1, int(interval_seconds))):
+            snapshot = dict(state)
+            snapshot["startedAt"] = snapshot.get("startedAt") or now_iso()
+            snapshot["sentAt"] = now_iso()
+            emit({"type": "heartbeat", **snapshot})
+
+    thread = threading.Thread(target=worker, name="training-heartbeat", daemon=True)
+    thread.start()
+    return thread
 
 
 def choose_next_token(probabilities, top_k: int, repetition_penalty: float, generated: List[int], pad_id: int, unk_id: int) -> int:
@@ -909,22 +1074,84 @@ def command_train(config: Dict[str, Any]) -> int:
     last_validation_loss: Optional[float] = None
     best_validation_loss: Optional[float] = None
     best_weights = None
-    heartbeat_interval_s = 15
-    last_heartbeat_at = time.time()
+    heartbeat_interval_s = max(5, safe_int(training_settings.get("heartbeatIntervalSeconds"), 10))
     metrics_interval = max(1, safe_int(training_settings.get("metricsReportInterval"), 16))
     history_interval = max(1, safe_int(training_settings.get("historyReportInterval"), metrics_interval))
     batch_report_interval = max(1, safe_int(training_settings.get("batchReportInterval"), 1))
+    recovery_checkpoint_interval_batches = max(
+        0,
+        safe_non_negative_int(training_settings.get("recoveryCheckpointIntervalBatches"), 1000),
+    )
+    recovery_checkpoint_interval_seconds = max(
+        0.0,
+        safe_float(training_settings.get("recoveryCheckpointIntervalMinutes"), 20.0) * 60.0,
+    )
     total_planned_batches = max(1, batches_per_epoch * effective_epochs)
+    run_total_planned_batches = max(
+        1,
+        (batches_per_epoch * max(requested_epochs, 1)) - (resume_batch_offset if requested_epochs > 0 else 0),
+    )
     smoothed_batch_seconds: Optional[float] = None
     smoothed_eta_seconds: Optional[float] = None
     last_emitted_eta_seconds: Optional[int] = None
     was_stopped = False
     stopped_at_epoch = effective_resume_epoch_offset
     stopped_at_batch = 0
+    last_recovery_checkpoint_batch = max(
+        0,
+        (max(effective_resume_epoch_offset, 0) * max(batches_per_epoch, 1)) +
+        (resume_batch_offset if effective_resume_epoch_offset > 0 else 0),
+    )
+    last_recovery_checkpoint_at = time.time()
+    last_recovery_resume_epoch_offset = effective_resume_epoch_offset
+    last_recovery_resume_batch_offset = resume_batch_offset if effective_resume_epoch_offset > 0 else 0
+    heartbeat_state = {
+        "phase": "training_batches",
+        "message": "Обучение идет в реальном времени.",
+        "epoch": max(effective_resume_epoch_offset + 1, 1),
+        "batch": max(resume_batch_offset, 0),
+        "batchesThisEpoch": batches_per_epoch,
+        "effectiveEpochs": effective_epochs,
+        "completedBatches": 0,
+        "totalPlannedBatches": total_planned_batches,
+        "etaSeconds": None,
+        "etaAt": None,
+        "avgBatchDurationMs": None,
+        "throughputBatchesPerSec": None,
+        "startedAt": now_iso(),
+    }
+    heartbeat_stop_event = threading.Event()
+    heartbeat_thread = start_training_heartbeat(heartbeat_state, heartbeat_interval_s, heartbeat_stop_event)
+
+    def update_heartbeat(**updates: Any) -> None:
+        heartbeat_state.update(updates)
+
+    def emit_recovery_checkpoint(
+        *,
+        stage: str,
+        message: str,
+        epoch_offset: int,
+        batch_offset: int,
+        processed_batches_for_checkpoint: int,
+    ) -> None:
+        emit(
+            {
+                "type": "recovery_checkpoint",
+                "stage": stage,
+                "message": message,
+                "epochOffset": max(0, int(epoch_offset)),
+                "batchOffset": max(0, int(batch_offset)),
+                "processedBatches": max(0, int(processed_batches_for_checkpoint)),
+                "effectiveEpochs": effective_epochs,
+                "batchesThisEpoch": batches_per_epoch,
+                "savedAt": now_iso(),
+            }
+        )
 
     for epoch in range(1, requested_epochs + 1):
-        batch_index = 0
-        for x_batch, y_batch in dataset_bundle.train_dataset:
+        batch_index = resume_batch_offset if epoch == 1 else 0
+        epoch_dataset = dataset_bundle.train_dataset.skip(resume_batch_offset) if epoch == 1 and resume_batch_offset > 0 else dataset_bundle.train_dataset
+        for x_batch, y_batch in epoch_dataset:
             if stop_requested(stop_signal_path):
                 was_stopped = True
                 stopped_at_epoch = effective_resume_epoch_offset + epoch
@@ -932,10 +1159,15 @@ def command_train(config: Dict[str, Any]) -> int:
                 break
 
             batch_index += 1
-            if epoch == 1 and batch_index <= resume_batch_offset:
-                stopped_at_epoch = effective_resume_epoch_offset + epoch
-                stopped_at_batch = batch_index
-                continue
+            current_epoch = effective_resume_epoch_offset + epoch
+            update_heartbeat(
+                phase="training_batches",
+                message="Обучение идет в реальном времени.",
+                epoch=current_epoch,
+                batch=batch_index,
+                batchesThisEpoch=batches_per_epoch,
+                effectiveEpochs=effective_epochs,
+            )
             batch_started_at = time.time()
             should_collect_metrics = (
                 batch_index == 1
@@ -1002,12 +1234,12 @@ def command_train(config: Dict[str, Any]) -> int:
             else:
                 smoothed_batch_seconds = (smoothed_batch_seconds * 0.9) + (batch_duration_s * 0.1)
 
-            current_epoch = effective_resume_epoch_offset + epoch
             completed_batches_global = min(
                 max(((max(current_epoch, 1) - 1) * max(batches_per_epoch, 1)) + max(batch_index, 1), 1),
                 total_planned_batches,
             )
-            remaining_batches = max(0, total_planned_batches - completed_batches_global)
+            run_completed_batches = min(run_total_planned_batches, max(0, processed_batches))
+            remaining_batches = max(0, run_total_planned_batches - run_completed_batches)
             eta_seconds = None
             eta_at = None
             if smoothed_batch_seconds is not None:
@@ -1028,6 +1260,18 @@ def command_train(config: Dict[str, Any]) -> int:
                 else:
                     eta_seconds = last_emitted_eta_seconds
                 eta_at = datetime.fromtimestamp(now + eta_seconds, tz=timezone.utc).isoformat()
+            update_heartbeat(
+                phase="training_batches",
+                message="Обучение идет в реальном времени.",
+                epoch=current_epoch,
+                batch=batch_index,
+                completedBatches=run_completed_batches,
+                totalPlannedBatches=run_total_planned_batches,
+                etaSeconds=eta_seconds,
+                etaAt=eta_at,
+                avgBatchDurationMs=round((smoothed_batch_seconds or 0.0) * 1000.0, 2),
+                throughputBatchesPerSec=round(1.0 / max(smoothed_batch_seconds or 1e-9, 1e-9), 4),
+            )
 
             history_entry = None
             should_store_history = (
@@ -1061,11 +1305,15 @@ def command_train(config: Dict[str, Any]) -> int:
                         "processedBatches": processed_batches,
                         "completedBatches": completed_batches_global,
                         "totalPlannedBatches": total_planned_batches,
+                        "runCompletedBatches": run_completed_batches,
+                        "runTotalPlannedBatches": run_total_planned_batches,
+                        "runCurrentEpoch": epoch,
+                        "runTotalEpochs": requested_epochs,
                         "epoch": current_epoch,
                         "batch": batch_index,
                         "batchesThisEpoch": batches_per_epoch,
                         "effectiveEpochs": effective_epochs,
-                        "requestedEpochs": effective_epochs,
+                        "requestedEpochs": requested_epochs,
                         "minimumTrainingSteps": minimum_steps,
                         "enforcedStepBudget": False,
                         "metricsCollected": should_collect_metrics,
@@ -1077,27 +1325,85 @@ def command_train(config: Dict[str, Any]) -> int:
                         "historyEntry": history_entry,
                     }
                 )
-
-            if now - last_heartbeat_at >= heartbeat_interval_s:
-                emit(
-                    {
-                        "type": "heartbeat",
-                        "epoch": current_epoch,
-                        "batch": batch_index,
-                        "batchesThisEpoch": batches_per_epoch,
-                        "effectiveEpochs": effective_epochs,
-                        "etaSeconds": eta_seconds,
-                        "etaAt": eta_at,
-                        "startedAt": now_iso(),
-                    }
+            should_save_recovery_checkpoint = False
+            if recovery_checkpoint_interval_batches > 0:
+                should_save_recovery_checkpoint = (
+                    completed_batches_global - last_recovery_checkpoint_batch
+                ) >= recovery_checkpoint_interval_batches
+            if not should_save_recovery_checkpoint and recovery_checkpoint_interval_seconds > 0:
+                should_save_recovery_checkpoint = (
+                    now - last_recovery_checkpoint_at
+                ) >= recovery_checkpoint_interval_seconds
+            if should_save_recovery_checkpoint and completed_batches_global < total_planned_batches:
+                checkpoint_saved_at = now_iso()
+                update_heartbeat(
+                    phase="saving_recovery_checkpoint",
+                    message="Сохраняется промежуточный recovery-чекпоинт обучения.",
                 )
-                last_heartbeat_at = now
+
+                def emit_recovery_checkpoint_stage(stage: str, message: str) -> None:
+                    emit_recovery_checkpoint(
+                        stage=stage,
+                        message=message,
+                        epoch_offset=max(current_epoch - 1, 0),
+                        batch_offset=batch_index,
+                        processed_batches_for_checkpoint=processed_batches,
+                    )
+
+                emit_recovery_checkpoint_stage(
+                    stage="started",
+                    message="Сохраняется промежуточный recovery-чекпоинт, чтобы обучение можно было продолжить после сбоя.",
+                )
+                recovery_spec_payload = build_spec_payload(
+                    manifest=manifest,
+                    parameter_count=parameter_count,
+                    completed_epochs=max(current_epoch - 1, 0),
+                    saved_at=checkpoint_saved_at,
+                    tokenizer=tokenizer,
+                    tokenized_corpus=tokenized_corpus,
+                    training_settings=training_settings,
+                    model_config=model_config,
+                    checkpoint_kind="recovery",
+                    next_resume_epoch_offset=max(current_epoch - 1, 0),
+                    next_resume_batch_offset=batch_index,
+                    processed_batches=processed_batches,
+                )
+                save_checkpoint_runtime(
+                    storage=storage,
+                    model=model,
+                    tokenizer=tokenizer,
+                    spec_payload=recovery_spec_payload,
+                    on_progress=emit_recovery_checkpoint_stage,
+                )
+                last_recovery_checkpoint_batch = completed_batches_global
+                last_recovery_checkpoint_at = time.time()
+                last_recovery_resume_epoch_offset = max(current_epoch - 1, 0)
+                last_recovery_resume_batch_offset = batch_index
+                emit_recovery_checkpoint(
+                    stage="ready",
+                    message="Промежуточный recovery-чекпоинт сохранен.",
+                    epoch_offset=last_recovery_resume_epoch_offset,
+                    batch_offset=last_recovery_resume_batch_offset,
+                    processed_batches_for_checkpoint=processed_batches,
+                )
+                update_heartbeat(
+                    phase="training_batches",
+                    message="Обучение идет в реальном времени.",
+                    epoch=current_epoch,
+                    batch=batch_index,
+                )
             stopped_at_epoch = current_epoch
             stopped_at_batch = batch_index
 
         if was_stopped:
             break
 
+        update_heartbeat(
+            phase="validation_epoch",
+            message=f"Валидация эпохи {effective_resume_epoch_offset + epoch}/{effective_epochs}.",
+            epoch=effective_resume_epoch_offset + epoch,
+            batch=batches_per_epoch,
+        )
         emit(
             {
                 "type": "validation",
@@ -1118,12 +1424,25 @@ def command_train(config: Dict[str, Any]) -> int:
                 "message": f"Валидация эпохи {effective_resume_epoch_offset + epoch}/{effective_epochs} завершена.",
             }
         )
+        update_heartbeat(
+            phase="training_batches",
+            message="Обучение идет в реальном времени.",
+            epoch=effective_resume_epoch_offset + epoch,
+            batch=batches_per_epoch,
+        )
         if last_validation_loss is not None and (
             best_validation_loss is None or last_validation_loss < best_validation_loss
         ):
             best_validation_loss = last_validation_loss
             best_weights = model.get_weights()
 
+        last_recovery_checkpoint_batch = max(
+            last_recovery_checkpoint_batch,
+            (max(effective_resume_epoch_offset + epoch, 0) * max(batches_per_epoch, 1)),
+        )
+        last_recovery_checkpoint_at = time.time()
+        last_recovery_resume_epoch_offset = effective_resume_epoch_offset + epoch
+        last_recovery_resume_batch_offset = 0
         completed_epochs = effective_resume_epoch_offset + epoch
 
     if best_weights is not None:
@@ -1133,6 +1452,12 @@ def command_train(config: Dict[str, Any]) -> int:
     perplexity = math.exp(average_loss) if average_loss is not None else None
 
     def emit_checkpoint_stage(stage: str, message: str) -> None:
+        update_heartbeat(
+            phase="saving_checkpoint",
+            message=message,
+            epoch=completed_epochs,
+            batch=stopped_at_batch,
+        )
         emit(
             {
                 "type": "checkpointing",
@@ -1160,32 +1485,20 @@ def command_train(config: Dict[str, Any]) -> int:
         "validationSampleCount": dataset_bundle.validation_sample_count,
     }
 
-    model_settings_manifest = {
-        "sequenceLength": training_settings["sequenceLength"],
-        "embeddingSize": training_settings["embeddingSize"],
-        "attentionHeads": training_settings["attentionHeads"],
-        "transformerLayers": training_settings["transformerLayers"],
-        "feedForwardSize": training_settings["feedForwardSize"],
-        "dropout": training_settings["dropout"],
-        "learningRate": training_settings["learningRate"],
-    }
-    spec_payload = {
-        "version": 2,
-        "format": "keras_llm_checkpoint_v1",
-        "savedAt": saved_at,
-        "modelConfig": asdict(model_config),
-        "specs": [],
-        "manifest": {
-            **manifest,
-            "parameterCount": parameter_count,
-            "trainedEpochs": completed_epochs,
-            "trainingSequenceCount": tokenized_corpus.sample_count,
-            "corpusTokenCount": tokenized_corpus.token_count,
-            "savedAt": saved_at,
-            "vocabularySize": tokenizer.vocabulary_size,
-            "modelSettings": model_settings_manifest,
-        },
-    }
+    spec_payload = build_spec_payload(
+        manifest=manifest,
+        parameter_count=parameter_count,
+        completed_epochs=completed_epochs,
+        saved_at=saved_at,
+        tokenizer=tokenizer,
+        tokenized_corpus=tokenized_corpus,
+        training_settings=training_settings,
+        model_config=model_config,
+        checkpoint_kind="final",
+        next_resume_epoch_offset=completed_epochs,
+        next_resume_batch_offset=min(stopped_at_batch, max(0, batches_per_epoch - 1)) if was_stopped else 0,
+        processed_batches=processed_batches,
+    )
     save_checkpoint_runtime(
         storage=storage,
         model=model,
@@ -1204,7 +1517,7 @@ def command_train(config: Dict[str, Any]) -> int:
         "processedBatches": processed_batches,
         "completedEpochs": completed_epochs,
         "effectiveEpochs": effective_epochs,
-        "requestedEpochs": effective_epochs,
+        "requestedEpochs": requested_epochs,
         "minimumTrainingSteps": minimum_steps,
         "enforcedStepBudget": False,
         "trainingSampleCount": dataset_bundle.training_sample_count,
@@ -1217,6 +1530,8 @@ def command_train(config: Dict[str, Any]) -> int:
         "history": history[-360:],
     }
 
+    heartbeat_stop_event.set()
+    heartbeat_thread.join(timeout=1.0)
     emit(
         {
             "type": "done",

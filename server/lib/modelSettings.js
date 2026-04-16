@@ -14,6 +14,10 @@ function resolveTrainingSettings(settingsLike = {}) {
   const requestedHeads = Math.max(1, Number(training.attentionHeads) || 4);
   const datasetPrefetchRaw = Number(training.datasetPrefetchBatches);
   const datasetThreadpoolRaw = Number(training.datasetPrivateThreadpoolSize);
+  const heartbeatIntervalRaw = Number(training.heartbeatIntervalSeconds);
+  const recoveryCheckpointBatchesRaw = Number(training.recoveryCheckpointIntervalBatches);
+  const recoveryCheckpointMinutesRaw = Number(training.recoveryCheckpointIntervalMinutes);
+  const maxAutoRecoveryRestartsRaw = Number(training.maxAutoRecoveryRestarts);
   let attentionHeads = requestedHeads;
 
   while (attentionHeads > 1 && embeddingSize % attentionHeads !== 0) {
@@ -45,6 +49,18 @@ function resolveTrainingSettings(settingsLike = {}) {
     datasetPrivateThreadpoolSize: Number.isFinite(datasetThreadpoolRaw)
       ? Math.min(32, Math.max(0, Math.round(datasetThreadpoolRaw)))
       : 0,
+    heartbeatIntervalSeconds: Number.isFinite(heartbeatIntervalRaw)
+      ? Math.min(60, Math.max(5, Math.round(heartbeatIntervalRaw)))
+      : 10,
+    recoveryCheckpointIntervalBatches: Number.isFinite(recoveryCheckpointBatchesRaw)
+      ? Math.min(50000, Math.max(0, Math.round(recoveryCheckpointBatchesRaw)))
+      : 1000,
+    recoveryCheckpointIntervalMinutes: Number.isFinite(recoveryCheckpointMinutesRaw)
+      ? Math.min(240, Math.max(0, recoveryCheckpointMinutesRaw))
+      : 20,
+    maxAutoRecoveryRestarts: Number.isFinite(maxAutoRecoveryRestartsRaw)
+      ? Math.min(32, Math.max(0, Math.round(maxAutoRecoveryRestartsRaw)))
+      : 12,
     vocabularyLimit: Math.max(256, Number(training.vocabularyLimit) || 8000),
   };
 }
