@@ -36,7 +36,7 @@ function resolveTrainingSettings(settingsLike = {}) {
     ),
     dropout: Math.min(0.6, Math.max(0, Number(training.dropout) || 0.1)),
     learningRate: Math.max(0.00001, Number(training.learningRate) || 0.001),
-    optimizer: String(training.optimizer || 'adam_legacy').toLowerCase() === 'adam' ? 'adam' : 'adam_legacy',
+    optimizer: 'adam',
     gradientClipNorm: Math.min(10, Math.max(0, Number(training.gradientClipNorm) || 0)),
     batchSize: Math.max(1, Number(training.batchSize) || 8),
     epochs: Math.max(1, Number(training.epochs) || 1),

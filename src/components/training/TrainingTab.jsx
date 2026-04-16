@@ -534,6 +534,7 @@ export default function TrainingTab({
     () => snapshotConstrainedSettings
   );
   const [runtimeDraft, setRuntimeDraft] = useState(() => structuredClone(runtimeConfig));
+  const [clockNowMs, setClockNowMs] = useState(() => Date.now());
   const [urlInput, setUrlInput] = useState('');
   const [queueNameInput, setQueueNameInput] = useState('');
   const [modelNameInput, setModelNameInput] = useState('');
@@ -589,6 +590,18 @@ export default function TrainingTab({
     Number.isFinite(Number(trainingProgress.throughputBatchesPerSec))
     ? Math.max(0, Number(trainingProgress.throughputBatchesPerSec))
     : null;
+  const trainingProgressUpdatedMs = Number.isFinite(Date.parse(snapshot.training?.updatedAt || ''))
+    ? Date.parse(snapshot.training.updatedAt)
+    : clockNowMs;
+  const backendEtaAtMs = Number.isFinite(Date.parse(trainingProgress.etaAt || ''))
+    ? Date.parse(trainingProgress.etaAt)
+    : null;
+  const trainingEtaTargetMs = trainingEtaSeconds !== null
+    ? trainingProgressUpdatedMs + (trainingEtaSeconds * 1000)
+    : backendEtaAtMs;
+  const effectiveEtaSeconds = trainingEtaTargetMs !== null
+    ? Math.max(0, Math.round((trainingEtaTargetMs - clockNowMs) / 1000))
+    : null;
   const trainingPercentLabel = formatPercent(trainingProgress.percent);
   const trainingEpochNow = Math.max(0, Number(trainingProgress.currentEpoch) || 0);
   const trainingEpochTotal = Math.max(0, Number(trainingProgress.totalEpochs) || 0);
@@ -596,8 +609,8 @@ export default function TrainingTab({
   const trainingBatchTotal = Math.max(0, Number(trainingProgress.totalBatches) || 0);
   const trainingEpochLabel = trainingEpochTotal > 0 ? `${trainingEpochNow}/${trainingEpochTotal}` : '—/—';
   const trainingBatchLabel = trainingBatchTotal > 0 ? `${trainingBatchNow}/${trainingBatchTotal}` : '—/—';
-  const trainingEtaLabel = trainingEtaSeconds !== null ? formatDurationClock(trainingEtaSeconds) : '—';
-  const trainingEtaAtLabel = trainingProgress.etaAt ? formatDateTime(trainingProgress.etaAt) : '—';
+  const trainingEtaLabel = effectiveEtaSeconds !== null ? formatDurationClock(effectiveEtaSeconds) : '—';
+  const trainingEtaAtLabel = trainingEtaTargetMs !== null ? formatDateTime(trainingEtaTargetMs) : '—';
   const modelConstraintReport = useMemo(
     () => applyModelConstraints(settingsDraft),
     [settingsDraft]
@@ -632,6 +645,17 @@ export default function TrainingTab({
   const isPaused = snapshot.training.status === 'paused';
   const isUploadingFiles = pendingAction === 'uploadFiles';
   const isUploadingQueueFiles = pendingAction === 'uploadQueueFiles';
+  useEffect(() => {
+    if (!isTraining) {
+      return undefined;
+    }
+
+    const intervalId = setInterval(() => {
+      setClockNowMs(Date.now());
+    }, 1000);
+
+    return () => clearInterval(intervalId);
+  }, [isTraining]);
   const normalizedUploadProgress = typeof uploadProgress === 'number'
     ? Math.min(100, Math.max(0, uploadProgress))
     : 0;

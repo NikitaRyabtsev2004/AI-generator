@@ -15,7 +15,7 @@ const DEFAULT_SETTINGS = {
     tokenizerMode: 'simple_subword',
     dropout: 0.12,
     learningRate: 0.001,
-    optimizer: 'adam_legacy',
+    optimizer: 'adam',
     gradientClipNorm: 0,
     batchReportInterval: 1,
     metricsReportInterval: 16,

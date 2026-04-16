@@ -134,9 +134,11 @@ def resolve_training_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
         embedding_size,
         min(feed_forward_requested, feed_forward_ratio_cap, feed_forward_activation_cap),
     )
-    optimizer_name = str(training.get("optimizer") or "adam_legacy").strip().lower()
+    optimizer_name = str(training.get("optimizer") or "adam").strip().lower()
     if optimizer_name not in ("adam", "adam_legacy"):
-        optimizer_name = "adam_legacy"
+        optimizer_name = "adam"
+    if optimizer_name == "adam_legacy":
+        optimizer_name = "adam"
 
     return {
         "executionMode": str(training.get("executionMode") or "native_preferred"),
@@ -1019,12 +1021,10 @@ def command_train(config: Dict[str, Any]) -> int:
         }
     )
 
-    optimizer_name = str(training_settings.get("optimizer") or "adam_legacy").lower()
+    optimizer_name = str(training_settings.get("optimizer") or "adam").lower()
     if optimizer_name == "adam_legacy":
-        legacy_module = getattr(tf.keras.optimizers, "legacy", None)
-        AdamClass = getattr(legacy_module, "Adam", tf.keras.optimizers.Adam)
-    else:
-        AdamClass = tf.keras.optimizers.Adam
+        optimizer_name = "adam"
+    AdamClass = tf.keras.optimizers.Adam
     base_optimizer = AdamClass(learning_rate=training_settings["learningRate"])
     optimizer = base_optimizer
     use_loss_scale = False
