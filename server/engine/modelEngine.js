@@ -117,6 +117,29 @@ const STRUCTURED_LANGUAGE_FIELDS = new Set([
 ]);
 const LOOSE_STRUCTURED_FIELD_PATTERN =
   /["']?(text|comment|description|explanation|summary|content|code|snippet|example|new_contents|old_contents|language|lang|syntax)["']?\s*:\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/giu;
+const ARTIFACT_PROMPT_FIELDS = new Set([
+  'instruction',
+  'query',
+  'prompt',
+  'input',
+  'question',
+  'task',
+]);
+const ARTIFACT_ANSWER_FIELDS = new Set([
+  'output',
+  'answer',
+  'response',
+  'chosen',
+  'alternative_output',
+  'final_answer',
+  'solution',
+  'result',
+  'code',
+  'snippet',
+  'example',
+]);
+const ARTIFACT_FIELD_PATTERN =
+  /\b(instruction|query|prompt|input|question|task|output|answer|response|chosen|rejected|alternative_output|final_answer|solution|result|code|snippet|example)\s*:\s*/giu;
 const COMMON_QUERY_STOPWORDS = new Set([
   'и', 'а', 'но', 'или', 'если', 'то', 'же', 'ли', 'бы', 'в', 'во', 'на', 'по', 'к', 'ко',
   'с', 'со', 'у', 'о', 'об', 'от', 'до', 'за', 'из', 'под', 'над', 'при', 'для', 'про',
@@ -754,7 +777,220 @@ function sanitizeReplyText(text) {
     .replace(/^\s*[-\u2013\u2014]\s*/u, '')
     .replace(/^\s*(пользователь|user|assistant|ассистент|бот|bot|client|клиент|human|ai|a|b|а|б)\s*:\s*/iu, '')
     .replace(/\b(пользователь|user|assistant|ассистент|бот|bot|client|клиент|human|ai|a|b|а|б)\s*:\s*/giu, '')
+    .replace(/\b(instruction|query|prompt|input|question|task|output|answer|response|chosen|rejected|alternative_output|final_answer|solution|result)\s*:\s*/giu, ' ')
     .trim();
+}
+
+function detectRequestedCodeLanguage(userMessage = '') {
+  const normalized = cleanText(userMessage || '').toLowerCase();
+  if (!normalized) {
+    return '';
+  }
+
+  if (/\b(javascript|js)\b/u.test(normalized)) {
+    return 'javascript';
+  }
+  if (/\b(typescript|ts)\b/u.test(normalized)) {
+    return 'typescript';
+  }
+  if (/\bpython|py\b/u.test(normalized)) {
+    return 'python';
+  }
+  if (/\bhtml\b/u.test(normalized)) {
+    return 'html';
+  }
+  if (/\bcss\b/u.test(normalized)) {
+    return 'css';
+  }
+  if (/\bsql\b/u.test(normalized)) {
+    return 'sql';
+  }
+  if (/\b(json)\b/u.test(normalized)) {
+    return 'json';
+  }
+  if (/\b(yaml|yml)\b/u.test(normalized)) {
+    return 'yaml';
+  }
+  if (/\b(xml)\b/u.test(normalized)) {
+    return 'xml';
+  }
+  if (/\b(bash|shell|sh|terminal|console)\b/u.test(normalized)) {
+    return 'bash';
+  }
+
+  return '';
+}
+
+function analyzeReplyPreferences(userMessage = '') {
+  const normalized = cleanText(userMessage || '');
+  const lower = normalized.toLowerCase();
+  const requestedFormat =
+    /\b(json)\b/iu.test(normalized) ? 'json'
+      : /\b(yaml|yml)\b/iu.test(normalized) ? 'yaml'
+        : /\b(xml)\b/iu.test(normalized) ? 'xml'
+          : /\b(toml)\b/iu.test(normalized) ? 'toml'
+            : /\b(markdown|md)\b/iu.test(normalized) ? 'markdown'
+              : '';
+  const wantsCode = !/\b(no code|without code|без кода)\b/iu.test(normalized) && (
+    /\b(code|snippet|function|script|component|example|implement|fix code|javascript|js|typescript|ts|python|html|css|sql|bash|regex|код|функц|скрипт|сайт|страниц)\b/iu.test(normalized) ||
+    Boolean(detectRequestedCodeLanguage(normalized))
+  );
+
+  return {
+    requestedFormat,
+    requestedCodeLanguage: detectRequestedCodeLanguage(normalized),
+    wantsCode,
+    onlyRequestedFormat: /\b(only|just|только|strict|строго)\b/iu.test(normalized) && Boolean(requestedFormat),
+    noExtraExplanation: /\b(without explanation|без объяснений|без пояснений|only data|только данные)\b/iu.test(lower),
+  };
+}
+
+function parseArtifactSections(text = '') {
+  const raw = String(text || '').replace(/\r\n/g, '\n');
+  if (!raw) {
+    return [];
+  }
+
+  const sections = [];
+  let match = ARTIFACT_FIELD_PATTERN.exec(raw);
+  while (match) {
+    sections.push({
+      field: String(match[1] || '').trim().toLowerCase(),
+      index: match.index,
+      contentStart: match.index + match[0].length,
+    });
+    match = ARTIFACT_FIELD_PATTERN.exec(raw);
+  }
+  ARTIFACT_FIELD_PATTERN.lastIndex = 0;
+
+  return sections.map((section, index) => ({
+    field: section.field,
+    content: raw.slice(
+      section.contentStart,
+      index + 1 < sections.length ? sections[index + 1].index : raw.length
+    ).trim(),
+  })).filter((section) => section.content);
+}
+
+function buildArtifactRecords(text = '') {
+  const sections = parseArtifactSections(text);
+  if (sections.length < 2) {
+    return [];
+  }
+
+  const records = [];
+  let current = {
+    prompts: [],
+    answers: [],
+    misc: [],
+  };
+
+  const flushCurrent = () => {
+    if (current.prompts.length || current.answers.length || current.misc.length) {
+      records.push(current);
+    }
+    current = {
+      prompts: [],
+      answers: [],
+      misc: [],
+    };
+  };
+
+  sections.forEach((section) => {
+    const content = cleanText(section.content || '');
+    if (!content) {
+      return;
+    }
+
+    if (ARTIFACT_PROMPT_FIELDS.has(section.field)) {
+      if (current.prompts.length || current.answers.length || current.misc.length) {
+        flushCurrent();
+      }
+      current.prompts.push(content);
+      return;
+    }
+
+    if (ARTIFACT_ANSWER_FIELDS.has(section.field)) {
+      current.answers.push(content);
+      return;
+    }
+
+    current.misc.push(content);
+  });
+
+  flushCurrent();
+  return records;
+}
+
+function extractBestArtifactReplyContent(text = '', userMessage = '', options = {}) {
+  const records = buildArtifactRecords(text);
+  if (!records.length) {
+    return '';
+  }
+
+  const wantsCode = Boolean(options.replyPreferences?.wantsCode);
+  const ranked = records
+    .map((record) => {
+      const promptText = cleanText(record.prompts.join(' '));
+      const answerText = cleanText(
+        [...record.answers, ...record.misc].join('\n\n')
+      );
+      if (!answerText) {
+        return null;
+      }
+
+      const promptRelevance = computePromptReplyRelevance(userMessage, promptText || answerText);
+      const answerRelevance = computePromptReplyRelevance(userMessage, answerText);
+      const codeBonus = wantsCode && (/```/u.test(answerText) || looksLikeUnfencedCodeBlock(answerText))
+        ? 0.18
+        : 0;
+
+      return {
+        content: answerText,
+        score: answerRelevance * 0.72 + promptRelevance * 0.28 + codeBonus,
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => right.score - left.score);
+
+  return ranked[0]?.content || '';
+}
+
+function normalizeCandidateReplyContent(userMessage, text, replyPreferences = {}) {
+  const raw = String(text || '').trim();
+  if (!raw) {
+    return '';
+  }
+
+  const structured = convertStructuredReplyToMarkdown(raw);
+  const artifactExtracted =
+    extractBestArtifactReplyContent(structured, userMessage, { replyPreferences }) ||
+    extractBestArtifactReplyContent(raw, userMessage, { replyPreferences });
+
+  return sanitizeReplyText(artifactExtracted || structured || raw);
+}
+
+function computeFormatPreferenceBonus(replyText, replyPreferences = {}) {
+  const text = String(replyText || '').trim();
+  if (!text) {
+    return 0;
+  }
+
+  let score = 0;
+  const hasCode = /```/u.test(text) || looksLikeUnfencedCodeBlock(text);
+  if (replyPreferences.wantsCode) {
+    score += hasCode ? 0.2 : -0.16;
+  } else if (hasCode) {
+    score -= 0.08;
+  }
+
+  if (replyPreferences.requestedFormat === 'json') {
+    score += /^\s*(```json|[{[])/u.test(text) ? 0.18 : -0.12;
+  } else if (replyPreferences.requestedFormat === 'markdown') {
+    score += /```|^\s*[-*]\s|^\s*#{1,3}\s/mu.test(text) ? 0.08 : 0;
+  }
+
+  return score;
 }
 
 function isSimpleGreetingMessage(userMessage) {
@@ -784,16 +1020,23 @@ function shouldForceWebSearchForMessage(userMessage) {
   if (!normalized) {
     return false;
   }
-  if (normalized.includes('?')) {
+  return (
+    /https?:\/\//u.test(normalized) ||
+    /\b(search|look up|browse|web|google|official docs|documentation|latest|current|today|release|version|news|найди|поищи|посмотри в интернете|в сети|веб|в интернете|документац|последн|актуальн|верси|релиз|новост)\b/iu.test(normalized)
+  );
+}
+
+function shouldPreferWebSearchForMessage(userMessage) {
+  const normalized = cleanText(userMessage || '').toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  if (shouldForceWebSearchForMessage(normalized)) {
     return true;
   }
 
-  const intentPattern =
-    /\b(как|что|кто|почему|зачем|где|когда|какой|какая|какие|how|what|why|when|where|which|guide|tutorial)\b/iu;
-  const techPattern =
-    /\b(javascript|js|typescript|react|node|python|sql|api|framework|library|алгоритм|программирован|код)\b/iu;
-
-  return intentPattern.test(normalized) || techPattern.test(normalized);
+  return /\b(error|exception|stacktrace|traceback|api|sdk|documentation|docs|reference|install|compatibility|breaking change|migration|npm|pip|react|node|python|typescript|javascript|версия|ошибка|документация|справка|установка|совместимост)\b/iu.test(normalized);
 }
 
 function isTechnicalOrMathQuery(userMessage) {
@@ -1525,7 +1768,13 @@ function convertStructuredReplyToMarkdown(text) {
 
 function finalizeReplyForOutput(text, options = {}) {
   const maxSentences = Math.max(Number(options.maxSentences) || 0, 0);
-  const normalizedMarkup = convertStructuredReplyToMarkdown(text);
+  const replyPreferences = analyzeReplyPreferences(options.userMessage || '');
+  const normalizedCandidate = normalizeCandidateReplyContent(
+    options.userMessage || '',
+    text,
+    replyPreferences
+  );
+  const normalizedMarkup = convertStructuredReplyToMarkdown(normalizedCandidate || text);
   const codeEnforcedMarkup = enforceCodeBlocksForCodeLikeReply(
     normalizedMarkup,
     options.userMessage || ''
@@ -1717,15 +1966,44 @@ function createChunksForDocument(documentEntry, chunkSize, chunkOverlap, allowed
 }
 
 function buildSourceDocuments(source) {
-  return [
-    {
-      sourceId: source.id,
-      sourceType: source.type,
-      sourceKind: 'knowledge',
-      label: source.label,
-      text: source.content,
-    },
-  ];
+  const rawText = cleanText(source?.content || '');
+  if (!rawText) {
+    return [];
+  }
+
+  const records = buildArtifactRecords(rawText);
+  if (!records.length) {
+    return [
+      {
+        sourceId: source.id,
+        sourceType: source.type,
+        sourceKind: 'knowledge',
+        label: source.label,
+        text: rawText,
+      },
+    ];
+  }
+
+  return records
+    .map((record, index) => {
+      const promptText = cleanText(record.prompts.join(' '));
+      const answerText = cleanText([...record.answers, ...record.misc].join('\n\n'));
+      const text = promptText && answerText
+        ? cleanText(`Задача: ${promptText}\nРешение: ${answerText}`)
+        : (answerText || promptText);
+      if (!text) {
+        return null;
+      }
+
+      return {
+        sourceId: source.id,
+        sourceType: source.type,
+        sourceKind: 'knowledge',
+        label: records.length > 1 ? `${source.label} #${index + 1}` : source.label,
+        text,
+      };
+    })
+    .filter(Boolean);
 }
 
 function normalizeStoredChunks(chunks = []) {
@@ -1899,16 +2177,21 @@ function isAllowedKnowledgeSentence(sentence) {
   if (/^(ответить|reply|главная|меню|голосовать|результаты|сезон\s+\d+)/iu.test(cleanSentence)) {
     return false;
   }
+  if (ARTIFACT_NOISE_PATTERN.test(cleanSentence)) {
+    return false;
+  }
 
   return true;
 }
 
-function selectKnowledgeSentences(chunks, queryMap, maxSentences) {
+function selectKnowledgeSentences(chunks, queryMap, maxSentences, userMessage = '') {
   const candidates = [];
   const used = new Set();
 
   chunks.forEach((chunk) => {
-    chunk.sentences.forEach((sentence) => {
+    const normalizedChunkText = normalizeCandidateReplyContent(userMessage, chunk.text);
+    const candidateSentences = splitIntoSentences(normalizedChunkText || chunk.text);
+    candidateSentences.forEach((sentence) => {
       const cleanSentence = sanitizeReplyText(sentence);
       if (!isAllowedKnowledgeSentence(cleanSentence)) {
         return;
@@ -1981,13 +2264,15 @@ function buildHybridReply({
   return cleanText(selected.join(' '));
 }
 
-function buildGroundedFallback(chunkCandidates, maxSentences) {
+function buildGroundedFallback(chunkCandidates, maxSentences, userMessage = '') {
   const selected = [];
 
   chunkCandidates.forEach((chunk) => {
+    const normalizedChunkText = normalizeCandidateReplyContent(userMessage, chunk.text);
     appendUniqueSentences(
       selected,
-      chunk.sentences.filter((sentence) => isAllowedKnowledgeSentence(sentence)),
+      splitIntoSentences(normalizedChunkText || chunk.text)
+        .filter((sentence) => isAllowedKnowledgeSentence(sentence)),
       maxSentences
     );
   });
@@ -1995,7 +2280,7 @@ function buildGroundedFallback(chunkCandidates, maxSentences) {
   if (!selected.length && chunkCandidates[0]?.text) {
     appendUniqueSentences(
       selected,
-      splitIntoSentences(chunkCandidates[0].text),
+      splitIntoSentences(normalizeCandidateReplyContent(userMessage, chunkCandidates[0].text) || chunkCandidates[0].text),
       maxSentences
     );
   }
@@ -2974,11 +3259,16 @@ function buildPromptForGeneration(userMessage, contextMessages, chunkCandidates,
   const promptParts = ['__bos__', '__ctx__'];
   const runtimeConfig = getRuntimeConfig();
   const normalizedSystemPrompt = cleanText(runtimeConfig.generation?.systemPrompt || '');
+  const replyPreferences = analyzeReplyPreferences(userMessage);
 
   if (normalizedSystemPrompt) {
     promptParts.push(`Системная инструкция: ${normalizedSystemPrompt.slice(0, 900)}`);
     promptParts.push('__sep__');
   }
+  promptParts.push(
+    'Правила синтеза ответа: не копируй служебные поля instruction/query/prompt/input/output/answer/chosen/alternative_output. Сформируй новый ответ по смыслу на основе источников и контекста.'
+  );
+  promptParts.push('__sep__');
   if (userLanguage === 'ru') {
     promptParts.push('Язык ответа: русский. Термины в коде можно оставлять на английском.');
     promptParts.push('__sep__');
@@ -2987,8 +3277,36 @@ function buildPromptForGeneration(userMessage, contextMessages, chunkCandidates,
     promptParts.push('__sep__');
   }
 
-  chunkCandidates.slice(0, 4).forEach((chunk) => {
-    promptParts.push(chunk.text);
+  if (replyPreferences.requestedFormat === 'json') {
+    promptParts.push('Формат ответа: верни только корректный JSON без пояснений вне JSON.');
+    promptParts.push('__sep__');
+  } else if (replyPreferences.requestedFormat === 'yaml') {
+    promptParts.push('Формат ответа: верни только корректный YAML без пояснений вне YAML.');
+    promptParts.push('__sep__');
+  } else if (replyPreferences.requestedFormat === 'xml') {
+    promptParts.push('Формат ответа: верни только корректный XML без пояснений вне XML.');
+    promptParts.push('__sep__');
+  } else if (replyPreferences.requestedFormat === 'toml') {
+    promptParts.push('Формат ответа: верни только корректный TOML без пояснений вне TOML.');
+    promptParts.push('__sep__');
+  } else if (replyPreferences.wantsCode) {
+    const languageHint = cleanText(replyPreferences.requestedCodeLanguage || '');
+    promptParts.push(
+      `Формат ответа: сначала 1-2 коротких предложения по делу, затем один Markdown-блок кода${languageHint ? ` с языком ${languageHint}` : ''}. Не смешивай несколько разных решений в один ответ.`
+    );
+    promptParts.push('__sep__');
+  } else {
+    promptParts.push('Формат ответа: обычный текст без псевдо-JSON, без служебных меток и без кода, если код не запрошен.');
+    promptParts.push('__sep__');
+  }
+
+  chunkCandidates.slice(0, 4).forEach((chunk, index) => {
+    const preparedChunkText = clampReplyCharacters(
+      normalizeCandidateReplyContent(userMessage, chunk.text, replyPreferences) || cleanText(chunk.text),
+      1200
+    ).content;
+    promptParts.push(`[Источник ${index + 1} | ${chunk.sourceType === 'web' ? 'web' : 'knowledge'} | ${cleanText(chunk.label || '') || 'context'}]`);
+    promptParts.push(preparedChunkText);
     promptParts.push('__sep__');
   });
 
@@ -3148,11 +3466,12 @@ function chooseBestReplyCandidate({
   contextMessages,
   recentAssistantReplies = [],
   preferGroundedKnowledge = false,
+  replyPreferences = {},
 }) {
   const candidates = [];
 
   if (bestReply) {
-    const content = sanitizeReplyText(bestReply.responseText);
+    const content = normalizeCandidateReplyContent(userMessage, bestReply.responseText, replyPreferences);
     const promptSideRelevance = computePromptReplyRelevance(userMessage, bestReply.promptText);
     const responseSideRelevance = computePromptReplyRelevance(userMessage, content);
     const topicalRelevance = responseSideRelevance * 0.78 + promptSideRelevance * 0.22;
@@ -3169,25 +3488,28 @@ function chooseBestReplyCandidate({
           contextMessages,
           recentAssistantReplies,
         }) + bestReply.score * 0.03 + topicalRelevance * 0.46 - memoryPenalty - (preferGroundedKnowledge ? 0.2 : 0)
+          + computeFormatPreferenceBonus(content, replyPreferences)
           - languageMismatchPenalty(userLanguage, content),
       });
     }
   }
 
   if (knowledgeText) {
-    const topicalRelevance = computePromptReplyRelevance(userMessage, knowledgeText);
+    const content = normalizeCandidateReplyContent(userMessage, knowledgeText, replyPreferences);
+    const topicalRelevance = computePromptReplyRelevance(userMessage, content);
     candidates.push({
       mode: 'knowledge',
-      content: cleanText(knowledgeText),
+      content,
       score: computeSelfScore({
         userMessage,
-        replyText: knowledgeText,
+        replyText: content,
         chunkCandidates,
         replyCandidates,
         contextMessages,
         recentAssistantReplies,
       }) + topicalRelevance * 0.34 - computeLowTopicalPenalty(topicalRelevance) + (preferGroundedKnowledge ? 0.1 : 0)
-        - languageMismatchPenalty(userLanguage, knowledgeText),
+        + computeFormatPreferenceBonus(content, replyPreferences)
+        - languageMismatchPenalty(userLanguage, content),
     });
   }
 
@@ -3199,55 +3521,61 @@ function chooseBestReplyCandidate({
   });
 
   if (hybridReply) {
-    const topicalRelevance = computePromptReplyRelevance(userMessage, hybridReply);
+    const content = normalizeCandidateReplyContent(userMessage, hybridReply, replyPreferences);
+    const topicalRelevance = computePromptReplyRelevance(userMessage, content);
     candidates.push({
       mode: 'hybrid',
-      content: hybridReply,
+      content,
       score: computeSelfScore({
         userMessage,
-        replyText: hybridReply,
+        replyText: content,
         chunkCandidates,
         replyCandidates,
         contextMessages,
         recentAssistantReplies,
       }) + (bestReply ? 0.02 : 0) + topicalRelevance * 0.34 - computeLowTopicalPenalty(topicalRelevance) - (preferGroundedKnowledge ? 0.14 : 0)
-        - languageMismatchPenalty(userLanguage, hybridReply),
+        + computeFormatPreferenceBonus(content, replyPreferences)
+        - languageMismatchPenalty(userLanguage, content),
     });
   }
 
   if (neuralReply) {
-    const topicalRelevance = computePromptReplyRelevance(userMessage, neuralReply);
+    const content = normalizeCandidateReplyContent(userMessage, neuralReply, replyPreferences);
+    const topicalRelevance = computePromptReplyRelevance(userMessage, content);
     candidates.push({
       mode: 'neural',
-      content: neuralReply,
+      content,
       score: computeSelfScore({
         userMessage,
-        replyText: neuralReply,
+        replyText: content,
         chunkCandidates,
         replyCandidates,
         contextMessages,
         recentAssistantReplies,
-      }) + 0.02 + topicalRelevance * 0.28 - computeLowTopicalPenalty(topicalRelevance) - (preferGroundedKnowledge ? 0.24 : 0)
-        - languageMismatchPenalty(userLanguage, neuralReply),
+      }) + 0.02 + topicalRelevance * 0.28 - computeLowTopicalPenalty(topicalRelevance) - (preferGroundedKnowledge ? 0.08 : 0)
+        + computeFormatPreferenceBonus(content, replyPreferences)
+        - languageMismatchPenalty(userLanguage, content),
     });
   }
 
   if (webChunkCandidates.length) {
-    const webGrounded = buildGroundedFallback(webChunkCandidates, maxSentences);
+    const webGrounded = buildGroundedFallback(webChunkCandidates, maxSentences, userMessage);
     if (webGrounded) {
-      const topicalRelevance = computePromptReplyRelevance(userMessage, webGrounded);
+      const content = normalizeCandidateReplyContent(userMessage, webGrounded, replyPreferences);
+      const topicalRelevance = computePromptReplyRelevance(userMessage, content);
       candidates.push({
         mode: 'web_grounded',
-        content: webGrounded,
+        content,
         score: computeSelfScore({
           userMessage,
-          replyText: webGrounded,
+          replyText: content,
           chunkCandidates,
           replyCandidates,
           contextMessages,
           recentAssistantReplies,
         }) + 0.14 + topicalRelevance * 0.52 - (topicalRelevance < 0.12 ? 0.08 : 0) + (preferGroundedKnowledge ? 0.22 : 0)
-          - languageMismatchPenalty(userLanguage, webGrounded),
+          + computeFormatPreferenceBonus(content, replyPreferences)
+          - languageMismatchPenalty(userLanguage, content),
       });
     }
   }
@@ -3255,6 +3583,7 @@ function chooseBestReplyCandidate({
   const minimumRelevance = preferGroundedKnowledge ? 0.16 : 0.1;
   const filtered = candidates
     .filter((candidate) => candidate.content)
+    .filter((candidate) => !isNoisyKnowledgeArtifactText(candidate.content))
     .filter((candidate) => computePromptReplyRelevance(userMessage, candidate.content) >= minimumRelevance)
     .filter((candidate) => !isEchoReply(userMessage, candidate.content))
     .filter((candidate) => computeRecentReplyPenalty(candidate.content, recentAssistantReplies) < 0.42)
@@ -5771,6 +6100,7 @@ function markQueueAsRunning(state, queueId) {
       Number(dialogueMemoryConfig.softMatchThreshold) || 0.62
     );
     const preferGroundedKnowledge = isTechnicalOrMathQuery(userMessage);
+    const replyPreferences = analyzeReplyPreferences(userMessage);
     const topicalGate = Math.max(0.08, minSimilarity * 0.75, preferGroundedKnowledge ? 0.14 : 0);
 
     const replyCandidates = (state.knowledge.replyMemories || [])
@@ -5837,8 +6167,10 @@ function markQueueAsRunning(state, queueId) {
 
     if (runtimeConfig.generation?.webSearchEnabled && !shouldSkipWebSearchForMessage(userMessage)) {
       const forceWebSearch = shouldForceWebSearchForMessage(userMessage);
+      const preferWebSearch = shouldPreferWebSearchForMessage(userMessage);
       const shouldUseWebSearch =
-        forceWebSearch || preferGroundedKnowledge || weakLocalEvidence || !bestReply || localChunkCandidates.length < 2;
+        forceWebSearch || weakLocalEvidence || !bestReply || localChunkCandidates.length < 2 ||
+        (preferGroundedKnowledge && preferWebSearch);
       if (!shouldUseWebSearch) {
         webChunkCandidates = [];
       } else {
@@ -5881,14 +6213,13 @@ function markQueueAsRunning(state, queueId) {
     const knowledgeSentences = selectKnowledgeSentences(
       chunkCandidates,
       queryMap,
-      state.settings.generation.maxReplySentences
+      state.settings.generation.maxReplySentences,
+      userMessage
     );
     const knowledgeText = knowledgeSentences.join(' ');
 
     let neuralReply = '';
-    const allowNeuralGeneration =
-      shouldUseNeuralGeneration({ bestReply, knowledgeSentences, state }) &&
-      !(preferGroundedKnowledge && chunkCandidates.length > 0);
+    const allowNeuralGeneration = shouldUseNeuralGeneration({ bestReply, knowledgeSentences, state });
 
     if (allowNeuralGeneration) {
       try {
@@ -5936,6 +6267,7 @@ function markQueueAsRunning(state, queueId) {
       contextMessages,
       recentAssistantReplies,
       preferGroundedKnowledge,
+      replyPreferences,
     });
 
     if (
@@ -5945,7 +6277,8 @@ function markQueueAsRunning(state, queueId) {
     ) {
       const groundedCandidateText = buildGroundedFallback(
         chunkCandidates,
-        state.settings.generation.maxReplySentences
+        state.settings.generation.maxReplySentences,
+        userMessage
       );
       if (groundedCandidateText) {
         const groundedRelevance = computePromptReplyRelevance(userMessage, groundedCandidateText);
@@ -5962,7 +6295,8 @@ function markQueueAsRunning(state, queueId) {
     if (!candidate) {
       const groundedFallback = buildGroundedFallback(
         chunkCandidates,
-        state.settings.generation.maxReplySentences
+        state.settings.generation.maxReplySentences,
+        userMessage
       );
 
       if (groundedFallback) {

@@ -137,13 +137,28 @@ function getNextTypingIndex(text, currentIndex) {
 }
 
 function renderInlineContent(text) {
-  const segments = String(text || '').split(/(`[^`\n]+`)/gu);
+  const segments = String(text || '').split(/(`[^`\n]+`|\[[^\]]{1,160}\]\(https?:\/\/[^\s)]+\))/gu);
   return segments.map((segment, index) => {
     if (/^`[^`\n]+`$/u.test(segment)) {
       return (
         <code key={`inline-${index}`} className="message-inline-code">
           {segment.slice(1, -1)}
         </code>
+      );
+    }
+
+    const markdownLinkMatch = segment.match(/^\[([^\]]{1,160})\]\((https?:\/\/[^\s)]+)\)$/u);
+    if (markdownLinkMatch) {
+      return (
+        <a
+          key={`link-${index}`}
+          href={markdownLinkMatch[2]}
+          target="_blank"
+          rel="noreferrer"
+          className="message-inline-link"
+        >
+          {markdownLinkMatch[1]}
+        </a>
       );
     }
 
@@ -161,16 +176,97 @@ function renderInlineContent(text) {
   });
 }
 
+function parseMarkdownTextBlocks(content = '') {
+  return splitTextParagraphs(content).map((paragraph) => {
+    const lines = String(paragraph || '')
+      .split('\n')
+      .map((line) => line.replace(/\s+$/u, ''))
+      .filter(Boolean);
+
+    if (!lines.length) {
+      return null;
+    }
+
+    if (lines.length === 1 && /^#{1,3}\s+/u.test(lines[0])) {
+      const match = lines[0].match(/^(#{1,3})\s+([\s\S]+)$/u);
+      return {
+        type: 'heading',
+        level: Math.min(match?.[1]?.length || 1, 3),
+        content: match?.[2] || lines[0],
+      };
+    }
+
+    if (lines.every((line) => /^\s*[-*]\s+/u.test(line))) {
+      return {
+        type: 'ul',
+        items: lines.map((line) => line.replace(/^\s*[-*]\s+/u, '')),
+      };
+    }
+
+    if (lines.every((line) => /^\s*\d+\.\s+/u.test(line))) {
+      return {
+        type: 'ol',
+        items: lines.map((line) => line.replace(/^\s*\d+\.\s+/u, '')),
+      };
+    }
+
+    if (lines.every((line) => /^\s*>\s?/u.test(line))) {
+      return {
+        type: 'quote',
+        content: lines.map((line) => line.replace(/^\s*>\s?/u, '')).join('\n'),
+      };
+    }
+
+    return {
+      type: 'paragraph',
+      content: paragraph,
+    };
+  }).filter(Boolean);
+}
+
 function MessageTextBlock({ content }) {
-  const paragraphs = useMemo(() => splitTextParagraphs(content), [content]);
+  const blocks = useMemo(() => parseMarkdownTextBlocks(content), [content]);
 
   return (
     <>
-      {paragraphs.map((paragraph, index) => (
-        <p key={`${paragraph.slice(0, 24)}-${index}`} className="message-text-block">
-          {renderInlineContent(paragraph)}
-        </p>
-      ))}
+      {blocks.map((block, index) => {
+        if (block.type === 'heading') {
+          const HeadingTag = block.level === 1 ? 'h3' : block.level === 2 ? 'h4' : 'h5';
+          return (
+            <HeadingTag
+              key={`${block.content.slice(0, 24)}-${index}`}
+              className={`message-heading-block message-heading-block--${block.level}`}
+            >
+              {renderInlineContent(block.content)}
+            </HeadingTag>
+          );
+        }
+
+        if (block.type === 'ul' || block.type === 'ol') {
+          const ListTag = block.type === 'ul' ? 'ul' : 'ol';
+          return (
+            <ListTag key={`list-${index}`} className="message-list-block">
+              {block.items.map((item, itemIndex) => (
+                <li key={`item-${itemIndex}`}>{renderInlineContent(item)}</li>
+              ))}
+            </ListTag>
+          );
+        }
+
+        if (block.type === 'quote') {
+          return (
+            <blockquote key={`quote-${index}`} className="message-quote-block">
+              {renderInlineContent(block.content)}
+            </blockquote>
+          );
+        }
+
+        return (
+          <p key={`${block.content.slice(0, 24)}-${index}`} className="message-text-block">
+            {renderInlineContent(block.content)}
+          </p>
+        );
+      })}
     </>
   );
 }
