@@ -1,70 +1,88 @@
-# Getting Started with Create React App
+# AI Generator Studio
 
-This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
+Локальная студия для обучения и тестирования LLM-подобной модели: клиент на React, backend на Node.js и вычислительный контур на Python (TensorFlow/Keras).
 
-## Available Scripts
+## Что умеет проект
 
-In the project directory, you can run:
+- Создание и переключение локальных и API-моделей.
+- Загрузка источников данных (`txt`, `csv`, `json`, `jsonl`, `parquet`, URL).
+- Подготовка корпуса, запуск и контроль обучения.
+- Чат с моделью, оценка ответов, редактирование сообщений, остановка генерации.
+- Шаринг чатов по ссылке в read-only режиме.
+- Регистрация/авторизация пользователей и изоляция рабочих данных.
 
-### `npm start`
+## Структура репозитория
 
-Runs the app in the development mode.\
-Open [http://localhost:3000](http://localhost:3000) to view it in your browser.
+- `src` — клиентская часть (интерфейс студии).
+- `server` — Node.js API, оркестрация и хранение состояния.
+- `server/python` — Python backend для обучения/генерации.
 
-The page will reload when you make changes.\
-You may also see any lint errors in the console.
+Подробные README:
 
-### `npm test`
+- [Клиент](/C:/Users/nekit/OneDrive/Desktop/W/че-то/GitHub/react.js/AI-generator/src/README.md)
+- [Server](/C:/Users/nekit/OneDrive/Desktop/W/че-то/GitHub/react.js/AI-generator/server/README.md)
+- [Python](/C:/Users/nekit/OneDrive/Desktop/W/че-то/GitHub/react.js/AI-generator/server/python/README.md)
 
-Launches the test runner in the interactive watch mode.\
-See the section about [running tests](https://facebook.github.io/create-react-app/docs/running-tests) for more information.
+## Быстрый старт
 
-### `npm run build`
+## Требования
 
-Builds the app for production to the `build` folder.\
-It correctly bundles React in production mode and optimizes the build for the best performance.
+- Node.js 18+ (рекомендуется LTS)
+- npm 9+
+- Python 3.10–3.11 для backend обучения
 
-The build is minified and the filenames include the hashes.\
-Your app is ready to be deployed!
+## Установка
 
-See the section about [deployment](https://facebook.github.io/create-react-app/docs/deployment) for more information.
+```bash
+npm install
+```
 
-### `npm run eject`
+Для Python-части (Windows):
 
-**Note: this is a one-way operation. Once you `eject`, you can't go back!**
+```powershell
+cd server/python
+./setup-venv.ps1
+```
 
-If you aren't satisfied with the build tool and configuration choices, you can `eject` at any time. This command will remove the single build dependency from your project.
+## Запуск в dev-режиме
 
-Instead, it will copy all the configuration files and the transitive dependencies (webpack, Babel, ESLint, etc) right into your project so you have full control over them. All of the commands except `eject` will still work, but they will point to the copied scripts so you can tweak them. At this point you're on your own.
+Сервер:
 
-You don't have to ever use `eject`. The curated feature set is suitable for small and middle deployments, and you shouldn't feel obligated to use this feature. However we understand that this tool wouldn't be useful if you couldn't customize it when you are ready for it.
+```bash
+npm run server:dev
+```
 
-## Learn More
+Клиент:
 
-You can learn more in the [Create React App documentation](https://facebook.github.io/create-react-app/docs/getting-started).
+```bash
+npm run client:start
+```
 
-To learn React, check out the [React documentation](https://reactjs.org/).
+По умолчанию:
 
-### Code Splitting
+- API: `http://localhost:4000`
+- Клиент (CRA dev): `http://localhost:3000` (или следующий свободный порт)
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/code-splitting](https://facebook.github.io/create-react-app/docs/code-splitting)
+## Сборка
 
-### Analyzing the Bundle Size
+```bash
+npm run build
+```
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size](https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size)
+## Проверка качества
 
-### Making a Progressive Web App
+```bash
+npm run lint
+```
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app](https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app)
+Если линтер не настроен в текущей ветке, используйте проверку сборки:
 
-### Advanced Configuration
+```bash
+npm run build
+```
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/advanced-configuration](https://facebook.github.io/create-react-app/docs/advanced-configuration)
+## Важные заметки
 
-### Deployment
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/deployment](https://facebook.github.io/create-react-app/docs/deployment)
-
-### `npm run build` fails to minify
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify](https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify)
+- Не редактируйте вручную артефакты в `server/artifacts` и runtime-данные в `server/data`, если нет задачи на восстановление/миграцию.
+- Для API-моделей экспорт локальной модели недоступен по логике приложения.
+- Если shared-ссылка чата устарела или чат удален, откроется корректное read-only сообщение об ошибке.

@@ -3,6 +3,8 @@ import {
   addUrlSource,
   clearSources,
   createChat,
+  createChatShareLink,
+  createApiModel,
   createModel,
   createNamedModel,
   createTrainingQueue,
@@ -23,9 +25,12 @@ import {
   saveRuntimeConfig,
   saveSettings,
   sendChatMessage,
+  stopChatReply,
   selectModel,
   subscribeToServerEvents,
   trainModel,
+  updateChatMessage,
+  updateApiModel,
   uploadFiles,
   uploadQueueFiles,
 } from '../api/studioApi';
@@ -69,11 +74,12 @@ function mergeLogEntries(currentLogs, incomingLogs) {
   return nextLogs.slice(0, MAX_SERVER_LOGS);
 }
 
-export function useStudioApp() {
+export function useStudioApp(options = {}) {
+  const enabled = options.enabled !== false;
   const [snapshot, setSnapshot] = useState(null);
   const [selectedChatId, setSelectedChatId] = useState(null);
   const [requestState, setRequestState] = useState({
-    loading: true,
+    loading: enabled,
     busy: false,
     error: '',
     action: '',
@@ -171,6 +177,10 @@ export function useStudioApp() {
   }, []);
 
   const loadDashboard = useCallback(async (chatId = selectedChatIdRef.current) => {
+    if (!enabled) {
+      return null;
+    }
+
     const controller = new AbortController();
     const requestId = dashboardRequestIdRef.current + 1;
 
@@ -214,7 +224,7 @@ export function useStudioApp() {
         dashboardAbortRef.current = null;
       }
     }
-  }, []);
+  }, [enabled]);
 
   const scheduleDashboardRefresh = useCallback((delays, chatId = selectedChatIdRef.current) => {
     followUpRefreshRef.current.forEach((timeoutId) => clearTimeout(timeoutId));
@@ -224,15 +234,32 @@ export function useStudioApp() {
   }, [loadDashboard]);
 
   useEffect(() => {
+    if (!enabled) {
+      setSnapshot(null);
+      setSelectedChatId(null);
+      setRequestState((current) => ({
+        ...current,
+        loading: false,
+        busy: false,
+        error: '',
+        action: '',
+      }));
+      return () => {};
+    }
+
     loadDashboard(null);
 
     return () => {
       dashboardAbortRef.current?.abort();
       followUpRefreshRef.current.forEach((timeoutId) => clearTimeout(timeoutId));
     };
-  }, [loadDashboard]);
+  }, [enabled, loadDashboard]);
 
   useEffect(() => {
+    if (!enabled) {
+      return;
+    }
+
     if (!selectedChatId || !snapshotRef.current) {
       return;
     }
@@ -242,9 +269,13 @@ export function useStudioApp() {
     }
 
     loadDashboard(selectedChatId);
-  }, [loadDashboard, selectedChatId]);
+  }, [enabled, loadDashboard, selectedChatId]);
 
   useEffect(() => {
+    if (!enabled) {
+      return () => {};
+    }
+
     let isDisposed = false;
 
     fetchRecentLogs()
@@ -317,9 +348,13 @@ export function useStudioApp() {
       isDisposed = true;
       unsubscribe();
     };
-  }, [mergeRealtimeSnapshot, mergeTrainingProgressSnapshot]);
+  }, [enabled, mergeRealtimeSnapshot, mergeTrainingProgressSnapshot]);
 
   useEffect(() => {
+    if (!enabled) {
+      return () => {};
+    }
+
     const interval = setInterval(() => {
       fetchServerStatus()
         .then((status) => {
@@ -331,9 +366,13 @@ export function useStudioApp() {
     }, realtimeConnected ? 14000 : 7000);
 
     return () => clearInterval(interval);
-  }, [realtimeConnected]);
+  }, [enabled, realtimeConnected]);
 
   useEffect(() => {
+    if (!enabled) {
+      return () => {};
+    }
+
     if (!snapshotRef.current) {
       return undefined;
     }
@@ -351,9 +390,13 @@ export function useStudioApp() {
     }, intervalMs);
 
     return () => clearInterval(interval);
-  }, [loadDashboard, realtimeConnected, requestState.action, snapshot?.model?.lifecycle, snapshot?.training?.status]);
+  }, [enabled, loadDashboard, realtimeConnected, requestState.action, snapshot?.model?.lifecycle, snapshot?.training?.status]);
 
   const runAction = useCallback(async (action, options = {}) => {
+    if (!enabled) {
+      return null;
+    }
+
     const {
       actionName = '',
       onStart,
@@ -391,7 +434,7 @@ export function useStudioApp() {
         action: '',
       }));
     }
-  }, []);
+  }, [enabled]);
 
   const actions = useMemo(() => ({
     refresh: () => loadDashboard(selectedChatIdRef.current),
@@ -451,6 +494,8 @@ export function useStudioApp() {
     removeSource: (sourceId) => runAction(() => removeSource(sourceId), { actionName: 'removeSource' }),
     createModel: () => runAction(() => createModel(), { actionName: 'createModel' }),
     createNamedModel: (name) => runAction(() => createNamedModel(name), { actionName: 'createNamedModel' }),
+    createApiModel: (apiModel) => runAction(() => createApiModel(apiModel), { actionName: 'createApiModel' }),
+    updateApiModel: (modelId, apiModel) => runAction(() => updateApiModel(modelId, apiModel), { actionName: 'updateApiModel' }),
     selectModel: (modelId) => runAction(() => selectModel(modelId), { actionName: 'selectModel' }),
     deleteLibraryModel: (modelId) => runAction(() => deleteLibraryModel(modelId), { actionName: 'deleteLibraryModel' }),
     trainModel: () => runAction(() => trainModel(), {
@@ -484,6 +529,10 @@ export function useStudioApp() {
       },
     }),
     exportModel: async () => {
+      if (!enabled) {
+        return;
+      }
+
       setRequestState((current) => ({
         ...current,
         busy: true,
@@ -492,6 +541,9 @@ export function useStudioApp() {
       }));
 
       try {
+        if (snapshotRef.current?.model?.kind === 'api') {
+          throw new Error('Экспорт доступен только для локальной модели. Выберите локальную модель в библиотеке.');
+        }
         const { blob, fileName } = await exportModelPackage();
         const objectUrl = window.URL.createObjectURL(blob);
         const link = document.createElement('a');
@@ -522,6 +574,23 @@ export function useStudioApp() {
       },
     }),
     createChat: () => runAction(() => createChat(), { actionName: 'createChat' }),
+    stopChatReply: async (chatId) => {
+      if (!enabled) {
+        return null;
+      }
+
+      const nextSnapshot = await stopChatReply(chatId);
+      if (nextSnapshot) {
+        setSnapshot(nextSnapshot);
+        setSelectedChatId(nextSnapshot.activeChat?.id || nextSnapshot.chats?.[0]?.id || null);
+      }
+      return nextSnapshot;
+    },
+    createChatShareLink: async (chatId) => createChatShareLink(chatId),
+    updateChatMessage: (messageId, content) => runAction(
+      () => updateChatMessage(messageId, content),
+      { actionName: 'updateChatMessage' }
+    ),
     deleteChat: (chatId) => runAction(() => deleteChat(chatId), { actionName: 'deleteChat' }),
     sendMessage: (chatId, content) => runAction(
       () => sendChatMessage(chatId, content),
@@ -558,7 +627,7 @@ export function useStudioApp() {
         },
       }
     ),
-  }), [loadDashboard, runAction, scheduleDashboardRefresh]);
+  }), [enabled, loadDashboard, runAction, scheduleDashboardRefresh]);
 
   return {
     snapshot,

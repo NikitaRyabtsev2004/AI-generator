@@ -767,15 +767,46 @@ async function runPythonBackendJson(commandName, payload, options = {}) {
       let stdout = '';
       let stderr = '';
       let settled = false;
+      let abortHandler = null;
+
+      const finishWithAbort = (message) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timeoutId);
+        if (typeof abortHandler === 'function') {
+          options.signal?.removeEventListener?.('abort', abortHandler);
+        }
+        child.kill('SIGTERM');
+        const abortError = new Error(message || 'Generation aborted.');
+        abortError.name = 'AbortError';
+        reject(abortError);
+      };
 
       const timeoutId = setTimeout(() => {
         if (settled) {
           return;
         }
         settled = true;
+        if (typeof abortHandler === 'function') {
+          options.signal?.removeEventListener?.('abort', abortHandler);
+        }
         child.kill('SIGTERM');
         reject(new Error(`Python backend timed out after ${timeoutMs} ms.`));
       }, timeoutMs);
+
+      if (options.signal) {
+        if (options.signal.aborted) {
+          finishWithAbort('Generation aborted.');
+          return;
+        }
+
+        abortHandler = () => {
+          finishWithAbort('Generation aborted.');
+        };
+        options.signal.addEventListener('abort', abortHandler, { once: true });
+      }
 
       child.stdout.on('data', (chunk) => {
         stdout += chunk.toString();
@@ -789,6 +820,9 @@ async function runPythonBackendJson(commandName, payload, options = {}) {
         }
         settled = true;
         clearTimeout(timeoutId);
+        if (typeof abortHandler === 'function') {
+          options.signal?.removeEventListener?.('abort', abortHandler);
+        }
         reject(error);
       });
       child.on('exit', (code) => {
@@ -797,6 +831,9 @@ async function runPythonBackendJson(commandName, payload, options = {}) {
         }
         settled = true;
         clearTimeout(timeoutId);
+        if (typeof abortHandler === 'function') {
+          options.signal?.removeEventListener?.('abort', abortHandler);
+        }
         resolve({ code, stdout, stderr });
       });
     });

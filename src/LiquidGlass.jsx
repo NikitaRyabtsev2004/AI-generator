@@ -33,9 +33,9 @@ const LiquidGlass = forwardRef(({
                 width: typeof width === 'number' ? `${width}px` : width,
                 height: typeof height === 'number' ? `${height}px` : height,
                 borderRadius: '2px',
-                overflow: 'hidden',
                 isolation: 'isolate',
                 background: 'rgba(255, 255, 255, 0.4)',
+                transition: 'all 0.2s ease-in-out',
                 boxShadow: '0 25px 50px rgba(0, 0, 0, 0.63), 0 0 0 1px rgba(255, 255, 255, 0.38), inset 0 1px 0 rgba(255, 255, 255, 0)',
                 ...style
             }}
@@ -44,18 +44,20 @@ const LiquidGlass = forwardRef(({
 
             <div
                 style={{
-                    position: 'absolute', inset: 0, zIndex: 0
+                    position: 'absolute', inset: 0, zIndex: 0, transition: 'all 0.2s ease-in-out'
                 }}
             />
             <div
                 style={{
                     position: 'absolute',
-                    width: '100%', height: '100%',
+                    width: '100%',
+                    height: '100%',
                     backdropFilter: 'blur(4px)',
                     filter: `url(#${uniqueId}-distortion)`,
                     opacity: 1,
                     background: 'radial-gradient(circle at 50% 50%, rgba(255, 255, 255, 0.098) 0%, transparent 5%)',
                     zIndex: 5,
+                    transition: 'all 0.2s ease-in-out',
                     pointerEvents: 'none',
                     ...filterStyle
                 }}
@@ -67,6 +69,7 @@ const LiquidGlass = forwardRef(({
                     width: '100%',
                     height: '100%',
                     display: 'flex',
+                    transition: 'all 0.2s ease-in-out',
                     justifyContent: 'center'
                 }}
             >
@@ -77,6 +80,7 @@ const LiquidGlass = forwardRef(({
                     position: 'absolute',
                     width: 0,
                     height: 0,
+                    transition: 'all 0.2s ease-in-out',
                     overflow: 'hidden',
                 }}
             >

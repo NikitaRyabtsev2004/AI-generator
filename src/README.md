@@ -1,86 +1,59 @@
-# Клиент (`src`) — структура и назначение файлов
+# Клиентская часть (`src`)
 
-Это React-клиент студии обучения/чата. Ниже кратко по основным файлам и где что менять.
+React-интерфейс студии, где пользователь настраивает модель, обучает ее, работает с источниками и ведет чаты.
 
-## Точка входа и каркас приложения
+## Главные файлы
 
-### `src/index.js`
-- Старт React-приложения и монтирование в DOM.
+## Точка входа
 
-### `src/App.js`
-- Главная компоновка интерфейса.
-- Связывает UI-вкладки с состоянием из `useStudioApp`.
-- Прокидывает глобальные статусы, действия и события.
+- `src/index.js` — монтирование приложения в DOM.
+- `src/App.js` — корневой контейнер, вкладки, маршрутизация, модальные окна, связка с `useStudioApp`.
 
-### `src/LiquidGlass.jsx`
-- Визуальный контейнер под glass-оформление интерфейса.
+## API и состояние
 
-### `src/theme.js`
-- Глобальная тема MUI (цвета, типографика, базовые настройки компонентов).
+- `src/api/studioApi.js` — HTTP/SSE слой для общения с backend.
+- `src/hooks/useStudioApp.js` — центральный orchestration-hook: snapshot, события, экшены, busy/error-состояния.
 
-## API-слой
+## Вкладки интерфейса
 
-### `src/api/studioApi.js`
-- HTTP и SSE-клиент для backend API.
-- Методы dashboard/settings/model/chat/source/training.
-- Подписка на realtime-события (`snapshot`, `logs`, `status`).
-
-## Оркестрация состояния
-
-### `src/hooks/useStudioApp.js`
-- Основной orchestration hook приложения.
-- Хранит snapshot, loading/error-флаги, логи и server status.
-- Содержит действия: train/pause/reset/rollback, create/select model, upload sources, chat actions.
-
-## Экран обучения
-
-### `src/components/training/TrainingTab.jsx`
-- Управление моделью, настройками и источниками.
-- Запуск/пауза/откат/сброс обучения.
-- Отображение статусов сервера и обучения.
-
-### `src/components/training/TrainingChart.jsx`
-- График динамики обучения (loss/history).
-
-## Экран чата
-
-### `src/components/chat/ChatTab.jsx`
-- UI чатов и сообщений.
-- Отправка сообщений и отображение ответов модели.
-- Оценка ответов (feedback).
+- `src/components/training/TrainingTab.jsx` — обучение, модели, источники, импорт/экспорт.
+- `src/components/chat/ChatTab.jsx` — список чатов, сообщения, шаринг, копирование, редактирование, стоп генерации.
+- `src/components/chat/SharedChatView.jsx` — публичный read-only просмотр чата по ссылке.
 
 ## Общие компоненты
 
-### `src/components/shared/GlassPanel.jsx`
-- Базовая glass-панель для карточек/блоков.
-
-### `src/components/shared/MetricCard.jsx`
-- Карточка метрики (label/value/subtext).
-
-### `src/components/shared/StatusPill.jsx`
-- Компонент статусного бейджа.
-
-## Константы и утилиты
-
-### `src/constants/modelConfig.js`
-- Описания полей и диапазонов для UI-настроек модели/обучения.
-
-### `src/utils/text.js`
-- Форматирование текста, дат, чисел и вспомогательные преобразования.
+- `src/components/shared/GlassPanel.jsx` — базовая liquid-glass панель.
+- `src/components/shared/StatusPill.jsx` — компактный статусный бейдж.
+- `src/components/shared/AppAlerts.jsx` — центр уведомлений (включая автораскрытие при новых уведомлениях).
 
 ## Стили
 
-### `src/styles/global.css`
-- Базовые глобальные стили.
+- `src/styles/app-shell.css` — каркас страницы, шапка, фоновые слои, модальные окна, уведомления.
+- `src/styles/training-tab.css` — стили вкладки обучения.
+- `src/styles/chat-tab.css` — стили чатов и сообщений.
+- `src/styles/global.css` — базовые глобальные правила.
 
-### `src/styles/app-shell.css`
-- Стили каркаса приложения.
+## Утилиты
 
-### `src/styles/training-tab.css`
-- Стили вкладки обучения.
+- `src/utils/appRoutes.js` — роутинг вкладок и shared-чата.
+- `src/utils/text.js` — форматирование дат/чисел/превью.
+- `src/utils/chatContent.js` — разбор и рендер контента ответов (код-блоки, текст, ссылки).
 
-### `src/styles/chat-tab.css`
-- Стили вкладки чата.
+## Как запускать клиент
 
-### `src/styles/glass-panel.css`
-- Общие стили glass-компонентов.
+```bash
+npm run client:start
+```
+
+Сборка production:
+
+```bash
+npm run build
+```
+
+## Что править в первую очередь при изменениях UI
+
+1. `src/App.js` — если меняется общий layout, вкладки, шапка, модалки.
+2. `src/components/training/TrainingTab.jsx` — если меняется управление обучением и моделью.
+3. `src/components/chat/ChatTab.jsx` — если меняется поведение чата.
+4. `src/styles/*.css` — визуальные правки и адаптив.

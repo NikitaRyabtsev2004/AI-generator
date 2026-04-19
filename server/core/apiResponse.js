@@ -21,7 +21,7 @@ function resolveErrorMessage(error, limits = {}) {
 }
 
 function sendError(response, error, options = {}) {
-  const statusCode = Math.max(400, Number(options.statusCode) || 400);
+  const statusCode = Math.max(400, Number(options.statusCode) || Number(error?.statusCode) || 400);
   const message = resolveErrorMessage(error, options.limits || {});
 
   logError(options.logMessage || 'API request failed.', error, {

@@ -1,9 +1,20 @@
+import { useMemo } from 'react';
 import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { Typography } from '@mui/material';
 import { formatDecimal } from '../../utils/text';
 
 export default function TrainingChart({ history }) {
-  if (!history?.length) {
+  const chartData = useMemo(() => {
+    if (!Array.isArray(history)) {
+      return [];
+    }
+
+    return history
+      .filter((entry) => Number.isFinite(Number(entry?.loss)) && Number.isFinite(Number(entry?.step)))
+      .slice(-1000);
+  }, [history]);
+
+  if (!chartData.length) {
     return (
       <div className="chart-empty">
         <Typography variant="body2">
@@ -18,7 +29,7 @@ export default function TrainingChart({ history }) {
       <div className="training-chart__canvas">
         <ResponsiveContainer width="100%" height="100%">
         <AreaChart
-          data={history}
+          data={chartData}
           margin={{ top: 8, right: 10, left: 0, bottom: 2 }}
         >
           <defs>

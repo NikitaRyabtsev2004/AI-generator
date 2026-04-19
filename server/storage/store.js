@@ -12,8 +12,9 @@ const {
   createDefaultTrainingQueuesState,
 } = require('../lib/config');
 const {
-  MODEL_LIBRARY_DIR,
   ensureModelLibraryLayout,
+  getModelLibraryDir,
+  setActiveModelLibraryUser,
 } = require('./modelLibraryStorage');
 const { RUNTIME_CONFIG_PATH } = require('./runtimeConfig');
 const { cleanText, computeStats, inferChatTitle } = require('../lib/text');
@@ -27,6 +28,7 @@ const {
 
 const DATA_DIR = path.join(__dirname, '..', 'data');
 const ARTIFACT_DIR = path.join(__dirname, '..', 'artifacts');
+const USER_WORKSPACES_DIR = path.join(DATA_DIR, 'user-workspaces');
 const DB_FILE = path.join(DATA_DIR, 'studio.db');
 const LEGACY_STORE_FILE = path.join(DATA_DIR, 'studio-store.json');
 const KNOWLEDGE_INDEX_FILE = path.join(ARTIFACT_DIR, 'knowledge-index.json');
@@ -44,6 +46,21 @@ let updateQueue = Promise.resolve();
 let lastTrainingQueueMetaSignature = '';
 let lastTrainingQueueSourcesSignature = '';
 let lastTrainingQueueRunnerSignature = '';
+let activeWorkspaceUserId = 'legacy-local';
+
+function normalizeWorkspaceUserId(userId) {
+  const raw = cleanText(String(userId || '')).toLowerCase();
+  if (!raw) {
+    return 'legacy-local';
+  }
+  const sanitized = raw.replace(/[^a-z0-9_-]/gu, '-').replace(/-+/gu, '-').slice(0, 80);
+  return sanitized || 'legacy-local';
+}
+
+function getWorkspaceArtifactsRoot(userId = activeWorkspaceUserId) {
+  const normalizedUserId = normalizeWorkspaceUserId(userId);
+  return path.join(ARTIFACT_DIR, 'users', normalizedUserId);
+}
 
 function safeStateSignature(value) {
   try {
@@ -60,21 +77,23 @@ function safeStateSignature(value) {
   }
 }
 
-function getArtifactPaths() {
+function getArtifactPaths(userId = activeWorkspaceUserId) {
+  const workspaceArtifactsRoot = getWorkspaceArtifactsRoot(userId);
+  const neuralModelDir = path.join(workspaceArtifactsRoot, 'neural-model');
   return {
     databasePath: DB_FILE,
-    artifactDir: ARTIFACT_DIR,
-    manifestPath: MODEL_MANIFEST_FILE,
-    knowledgeIndexPath: KNOWLEDGE_INDEX_FILE,
-    languageModelPath: LANGUAGE_MODEL_FILE,
-    neuralModelDir: NEURAL_MODEL_DIR,
-    tokenizerPath: TOKENIZER_FILE,
-    neuralWeightsPath: NEURAL_WEIGHTS_FILE,
-    neuralSpecPath: NEURAL_SPEC_FILE,
+    artifactDir: workspaceArtifactsRoot,
+    manifestPath: path.join(workspaceArtifactsRoot, 'model-manifest.json'),
+    knowledgeIndexPath: path.join(workspaceArtifactsRoot, 'knowledge-index.json'),
+    languageModelPath: path.join(workspaceArtifactsRoot, 'language-model.json'),
+    neuralModelDir,
+    tokenizerPath: path.join(neuralModelDir, 'tokenizer.json'),
+    neuralWeightsPath: path.join(neuralModelDir, 'weights.bin'),
+    neuralSpecPath: path.join(neuralModelDir, 'weights-spec.json'),
     runtimeConfigPath: RUNTIME_CONFIG_PATH,
     trainingQueueStorageDir: TRAINING_QUEUE_STORAGE_DIR,
     trainingJobStorageDir: TRAINING_JOB_STORAGE_DIR,
-    modelLibraryDir: MODEL_LIBRARY_DIR,
+    modelLibraryDir: getModelLibraryDir(userId),
   };
 }
 
@@ -275,6 +294,12 @@ function normalizeModelRegistry(modelRegistry) {
         id: cleanText(item?.id || ''),
         name: cleanText(item?.name || '') || 'Модель',
         kind: cleanText(item?.kind || '') || 'local',
+        api: {
+          provider: cleanText(item?.api?.provider || ''),
+          endpoint: cleanText(item?.api?.endpoint || ''),
+          model: cleanText(item?.api?.model || ''),
+          hasKey: Boolean(item?.api?.hasKey),
+        },
         packagePath: cleanText(item?.packagePath || ''),
         hasCheckpoint: Boolean(item?.hasCheckpoint),
         summary: {
@@ -423,9 +448,13 @@ function migrateLegacyState(rawLegacy) {
 }
 
 async function ensureStorageLayout() {
+  const artifactPaths = getArtifactPaths();
+  setActiveModelLibraryUser(activeWorkspaceUserId);
   await fs.mkdir(DATA_DIR, { recursive: true });
   await fs.mkdir(ARTIFACT_DIR, { recursive: true });
-  await fs.mkdir(NEURAL_MODEL_DIR, { recursive: true });
+  await fs.mkdir(USER_WORKSPACES_DIR, { recursive: true });
+  await fs.mkdir(artifactPaths.artifactDir, { recursive: true });
+  await fs.mkdir(artifactPaths.neuralModelDir, { recursive: true });
   await ensureTrainingQueueStorageLayout();
   await ensureModelLibraryLayout();
 
@@ -440,6 +469,12 @@ async function ensureStorageLayout() {
       CREATE TABLE IF NOT EXISTS app_snapshot (
         name TEXT PRIMARY KEY,
         json_value TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS user_workspaces (
+        user_id TEXT PRIMARY KEY,
+        state_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS sources (
@@ -591,15 +626,16 @@ async function readJsonIfExists(filePath, fallbackValue) {
 }
 
 async function loadArtifacts() {
+  const artifactPaths = getArtifactPaths();
   const defaultKnowledge = createDefaultKnowledgeState();
-  const knowledgeIndex = await readJsonIfExists(KNOWLEDGE_INDEX_FILE, {
+  const knowledgeIndex = await readJsonIfExists(artifactPaths.knowledgeIndexPath, {
     chunks: defaultKnowledge.chunks,
     replyMemories: defaultKnowledge.replyMemories,
     vocabulary: defaultKnowledge.vocabulary,
     bm25: defaultKnowledge.bm25,
   });
   const languageModel = await readJsonIfExists(
-    LANGUAGE_MODEL_FILE,
+    artifactPaths.languageModelPath,
     defaultKnowledge.languageModel
   );
 
@@ -675,13 +711,73 @@ async function saveArtifacts(currentState) {
     files: artifactPaths,
   };
 
-  await fs.writeFile(KNOWLEDGE_INDEX_FILE, JSON.stringify(knowledgeIndex), 'utf8');
+  await fs.mkdir(artifactPaths.artifactDir, { recursive: true });
+  await fs.mkdir(artifactPaths.neuralModelDir, { recursive: true });
+  await fs.writeFile(artifactPaths.knowledgeIndexPath, JSON.stringify(knowledgeIndex), 'utf8');
   await fs.writeFile(
-    LANGUAGE_MODEL_FILE,
+    artifactPaths.languageModelPath,
     JSON.stringify(currentState.knowledge.languageModel),
     'utf8'
   );
-  await fs.writeFile(MODEL_MANIFEST_FILE, JSON.stringify(manifest), 'utf8');
+  await fs.writeFile(artifactPaths.manifestPath, JSON.stringify(manifest), 'utf8');
+}
+
+function serializeWorkspaceState(currentState) {
+  const snapshot = structuredClone(currentState || createDefaultState());
+  if (snapshot?.model && typeof snapshot.model === 'object') {
+    delete snapshot.model.storage;
+    delete snapshot.model.artifactFiles;
+  }
+  return snapshot;
+}
+
+function readWorkspaceSnapshot(userId = activeWorkspaceUserId) {
+  const normalizedUserId = normalizeWorkspaceUserId(userId);
+  const row = db.prepare(`
+    SELECT state_json
+    FROM user_workspaces
+    WHERE user_id = ?
+    LIMIT 1
+  `).get(normalizedUserId);
+
+  if (!row) {
+    return null;
+  }
+
+  return safeParseJson(
+    row.state_json,
+    null,
+    `user_workspaces:${normalizedUserId}`
+  );
+}
+
+function readWorkspaceStateForUser(userId = activeWorkspaceUserId) {
+  if (!db) {
+    throw new Error('Store is not initialized.');
+  }
+
+  const workspaceSnapshot = readWorkspaceSnapshot(userId);
+  if (!workspaceSnapshot) {
+    return null;
+  }
+
+  return attachStorageInfo(hydrateState(workspaceSnapshot));
+}
+
+function writeWorkspaceSnapshot(currentState, userId = activeWorkspaceUserId) {
+  const normalizedUserId = normalizeWorkspaceUserId(userId);
+  const snapshot = serializeWorkspaceState(currentState);
+  db.prepare(`
+    INSERT INTO user_workspaces(user_id, state_json, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET
+      state_json = excluded.state_json,
+      updated_at = excluded.updated_at
+  `).run(
+    normalizedUserId,
+    JSON.stringify(snapshot),
+    new Date().toISOString()
+  );
 }
 
 function normalizePersistOptions(options = {}) {
@@ -989,6 +1085,7 @@ async function repairStateFromLegacyIfNeeded() {
 }
 
 async function initializeStore() {
+  setActiveModelLibraryUser(activeWorkspaceUserId);
   await ensureStorageLayout();
   await importLegacyStateIfNeeded();
   const legacyTrainingQueuesSnapshot = getSnapshotRow('trainingQueues');
@@ -1026,6 +1123,7 @@ async function initializeStore() {
   state.knowledge = deepMerge(createDefaultKnowledgeState(), artifacts);
   state = attachStorageInfo(state);
   resetTrainingQueuePersistSignatures(state.trainingQueues);
+  writeWorkspaceSnapshot(state, activeWorkspaceUserId);
   return state;
 }
 
@@ -1052,6 +1150,7 @@ async function persistState(options = {}) {
     if (persistOptions.writeArtifacts) {
       await saveArtifacts(state);
     }
+    writeWorkspaceSnapshot(state, activeWorkspaceUserId);
   } catch (error) {
     logError('Failed to persist application state.', error, {
       writeSources: persistOptions.writeSources,
@@ -1072,6 +1171,54 @@ async function persistState(options = {}) {
   }
 }
 
+function enqueueStoreOperation(operation) {
+  const run = updateQueue
+    .catch(() => undefined)
+    .then(operation);
+  updateQueue = run.catch(() => undefined);
+  return run;
+}
+
+async function switchWorkspaceUserInternal(normalizedUserId) {
+  if (!state) {
+    throw new Error('Store is not initialized.');
+  }
+
+  if (normalizedUserId === activeWorkspaceUserId) {
+    return state;
+  }
+
+  await persistState();
+  activeWorkspaceUserId = normalizedUserId;
+  setActiveModelLibraryUser(normalizedUserId);
+  await ensureStorageLayout();
+
+  const workspaceSnapshot = readWorkspaceSnapshot(normalizedUserId);
+  if (workspaceSnapshot) {
+    state = attachStorageInfo(hydrateState(workspaceSnapshot));
+  } else {
+    state = attachStorageInfo(hydrateState(createDefaultState()));
+  }
+
+  const artifacts = await loadArtifacts();
+  state.knowledge = deepMerge(createDefaultKnowledgeState(), artifacts);
+  state = attachStorageInfo(state);
+
+  writeStateToDatabase(state);
+  resetTrainingQueuePersistSignatures(state.trainingQueues);
+  writeWorkspaceSnapshot(state, normalizedUserId);
+  return state;
+}
+
+async function switchWorkspaceUser(userId) {
+  const normalizedUserId = normalizeWorkspaceUserId(userId);
+  return enqueueStoreOperation(async () => switchWorkspaceUserInternal(normalizedUserId));
+}
+
+function getActiveWorkspaceUserId() {
+  return activeWorkspaceUserId;
+}
+
 async function replaceState(nextState, options = {}) {
   state = attachStorageInfo(hydrateState(nextState));
   if (options.persist !== false) {
@@ -1081,7 +1228,15 @@ async function replaceState(nextState, options = {}) {
 }
 
 async function updateState(mutator, options = {}) {
-  updateQueue = updateQueue.then(async () => {
+  const targetUserId = options?.userId
+    ? normalizeWorkspaceUserId(options.userId)
+    : null;
+
+  return enqueueStoreOperation(async () => {
+    if (targetUserId) {
+      await switchWorkspaceUserInternal(targetUserId);
+    }
+
     const maybeNextState = await mutator(state);
     if (maybeNextState) {
       state = attachStorageInfo(hydrateState(maybeNextState));
@@ -1095,8 +1250,6 @@ async function updateState(mutator, options = {}) {
 
     return state;
   });
-
-  return updateQueue;
 }
 
 module.exports = {
@@ -1105,9 +1258,12 @@ module.exports = {
   KNOWLEDGE_INDEX_FILE,
   LANGUAGE_MODEL_FILE,
   getArtifactPaths,
+  getActiveWorkspaceUserId,
   getState,
+  switchWorkspaceUser,
   initializeStore,
   persistState,
+  readWorkspaceStateForUser,
   replaceState,
   updateState,
 };

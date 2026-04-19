@@ -47,6 +47,13 @@ const {
 } = require('../storage/trainingQueueStorage');
 const { fetchSearchDocuments } = require('../lib/webSearch');
 const { resolveTrainingSettings } = require('../lib/modelSettings');
+const {
+  assertApiModelConfig,
+  generateTextWithApiModel,
+  normalizeApiModelConfig,
+  redactApiModelConfig,
+} = require('../services/apiModelClient');
+const { getActiveWorkspaceUserId } = require('../storage/store');
 
 const RETRAINING_KEYS = [
   'sequenceLength',
@@ -254,8 +261,89 @@ function normalizeModelForExport(modelState) {
   return persistedModel;
 }
 
-function getGeneratorBackend() {
+function isApiModelState(state) {
+  return cleanText(state?.model?.kind || '') === 'api';
+}
+
+function getGeneratorBackend(state) {
+  if (isApiModelState(state)) {
+    const provider = cleanText(state?.model?.provider || '');
+    return provider ? `api:${provider}` : 'api:openai-compatible';
+  }
+
   return 'neural';
+}
+
+function createApiModelState(apiConfig, stateSettings = {}, currentKnowledge = null) {
+  const normalizedApiConfig = normalizeApiModelConfig(apiConfig);
+  const providerLabel = normalizedApiConfig.provider || 'OpenAI-compatible API';
+  const nextModel = createDefaultModelState();
+  const languageModel = currentKnowledge?.languageModel || createDefaultKnowledgeState().languageModel;
+
+  return {
+    ...nextModel,
+    exists: true,
+    kind: 'api',
+    engine: 'openai-compatible-api',
+    provider: normalizedApiConfig.provider,
+    externalModelName: normalizedApiConfig.model,
+    externalEndpoint: normalizedApiConfig.endpoint,
+    supportsTraining: false,
+    lifecycle: 'trained',
+    status: 'ready',
+    computeBackend: 'api',
+    computeBackendLabel: `Внешний API (${providerLabel})`,
+    computeBackendWarning: '',
+    trainedEpochs: 0,
+    targetEpochs: 0,
+    parameterCount: 0,
+    vocabularySize: Number(languageModel?.vocabularySize) || 0,
+    tokenCount: Number(languageModel?.corpusTokenCount) || 0,
+    configSnapshot: structuredClone(stateSettings || {}),
+    notes: [
+      'Активна внешняя API-модель. Чат использует серверный retrieval, веб-поиск и OpenAI-compatible endpoint.',
+      'Локальное обучение и чекпоинты для этой модели отключены. Для дообучения переключитесь на локальную модель.',
+    ],
+  };
+}
+
+function buildApiRegistryInfo(apiConfig = {}) {
+  const redacted = redactApiModelConfig(apiConfig);
+  return {
+    provider: redacted.provider,
+    endpoint: redacted.endpoint,
+    model: redacted.model,
+    hasKey: redacted.hasKey,
+  };
+}
+
+function createApiModelRegistryItem(state, apiConfig, name = '') {
+  const timestamp = nowIso();
+  const base = createDefaultModelRegistryItem();
+  const redactedApi = buildApiRegistryInfo(apiConfig);
+  return {
+    ...base,
+    id: createId('model'),
+    name: cleanText(name || '') || cleanText(redactedApi.model || redactedApi.provider || '') || `API модель ${Math.max((state.modelRegistry?.items || []).length, 0) + 1}`,
+    kind: 'api',
+    api: redactedApi,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    lastUsedAt: timestamp,
+    packagePath: '',
+    hasCheckpoint: false,
+    summary: {
+      ...base.summary,
+      lifecycle: 'trained',
+      trainedEpochs: 0,
+      parameterCount: 0,
+      vocabularySize: Number(state.knowledge?.languageModel?.vocabularySize) || 0,
+      tokenCount: Number(state.knowledge?.languageModel?.corpusTokenCount) || 0,
+      sourceCount: Number(state.model?.sourceCount) || 0,
+      replyPairCount: Number(state.model?.replyPairCount) || 0,
+      backend: redactedApi.provider ? `api:${redactedApi.provider}` : 'api:openai-compatible',
+    },
+  };
 }
 
 function buildTrainingSettingsSnapshot(trainingSettings = {}) {
@@ -279,6 +367,12 @@ function summarizeModelRegistryEntry(entry) {
     id: entry.id,
     name: entry.name,
     kind: entry.kind || 'local',
+    api: {
+      provider: entry.api?.provider || '',
+      endpoint: entry.api?.endpoint || '',
+      model: entry.api?.model || '',
+      hasKey: Boolean(entry.api?.hasKey),
+    },
     createdAt: entry.createdAt || null,
     updatedAt: entry.updatedAt || null,
     lastUsedAt: entry.lastUsedAt || null,
@@ -305,7 +399,7 @@ function buildModelRegistrySummaryFromState(state) {
     tokenCount: Number(state.model.tokenCount) || 0,
     sourceCount: Number(state.model.sourceCount) || 0,
     replyPairCount: Number(state.model.replyPairCount) || 0,
-    backend: getGeneratorBackend(),
+    backend: getGeneratorBackend(state),
   };
 }
 
@@ -316,6 +410,7 @@ function createModelRegistryItemFromState(state, name = '') {
     id: createId('model'),
     name: cleanText(name || '') || `Модель ${Math.max((state.modelRegistry?.items || []).length, 0) + 1}`,
     kind: 'local',
+    api: buildApiRegistryInfo(null),
     createdAt: timestamp,
     updatedAt: timestamp,
     lastUsedAt: timestamp,
@@ -333,6 +428,7 @@ function createFreshModelRegistryItem(state, name = '') {
     id: createId('model'),
     name: cleanText(name || '') || `Модель ${Math.max((state.modelRegistry?.items || []).length, 0) + 1}`,
     kind: 'local',
+    api: buildApiRegistryInfo(null),
     createdAt: timestamp,
     updatedAt: timestamp,
     lastUsedAt: timestamp,
@@ -347,7 +443,7 @@ function createFreshModelRegistryItem(state, name = '') {
       tokenCount: 0,
       sourceCount: 0,
       replyPairCount: 0,
-      backend: getGeneratorBackend(),
+      backend: getGeneratorBackend(state),
     },
   };
 }
@@ -384,7 +480,15 @@ function updateActiveModelRegistrySummary(state) {
 
   activeItem.updatedAt = nowIso();
   activeItem.lastUsedAt = nowIso();
-  activeItem.hasCheckpoint = Boolean(state.knowledge.languageModel?.checkpointReady);
+  activeItem.hasCheckpoint = !isApiModelState(state) && Boolean(state.knowledge.languageModel?.checkpointReady);
+  if (activeItem.kind === 'api') {
+    activeItem.api = {
+      provider: cleanText(state.model?.provider || activeItem.api?.provider || ''),
+      endpoint: cleanText(state.model?.externalEndpoint || activeItem.api?.endpoint || ''),
+      model: cleanText(state.model?.externalModelName || activeItem.api?.model || ''),
+      hasKey: Boolean(activeItem.api?.hasKey),
+    };
+  }
   activeItem.summary = buildModelRegistrySummaryFromState(state);
   return activeItem;
 }
@@ -404,6 +508,11 @@ async function pruneBrokenModelRegistryItems(state) {
     }
 
     if (item.id === activeModelId) {
+      keptItems.push(item);
+      continue;
+    }
+
+    if (item.kind === 'api') {
       keptItems.push(item);
       continue;
     }
@@ -682,6 +791,57 @@ function extractQueryTokens(text, { fallbackToAll = false } = {}) {
   }
 
   return allTokens;
+}
+
+function isLikelyContextFollowUp(text) {
+  const normalized = cleanText(text).toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  const tokenCount = tokenizeWords(normalized).length;
+  const informativeTokens = extractQueryTokens(normalized, { fallbackToAll: false });
+  const startsWithFollowUpCue =
+    /^(а|и|но|тогда|теперь|дальше|ещ[её]|кстати|ладно|ок(?:ей)?|хорошо|давай|ну|also|then|next|now|okay|ok|continue|add|fix|update|edit|rewrite|refactor)\b/iu
+      .test(normalized);
+  const containsReference =
+    /\b(это|этого|этому|этот|эта|эту|эти|его|ее|её|их|такой|такого|такую|тот|та|то|that|this|those|these|it|them|one)\b/iu
+      .test(normalized);
+
+  if (startsWithFollowUpCue) {
+    return true;
+  }
+
+  return containsReference && tokenCount <= 12 && informativeTokens.length <= 5;
+}
+
+function addContextIndex(indexSet, index, totalLength) {
+  if (!Number.isInteger(index)) {
+    return;
+  }
+  if (index < 0 || index >= totalLength) {
+    return;
+  }
+  indexSet.add(index);
+}
+
+function addConversationWindowAroundIndex(messages, indexSet, anchorIndex) {
+  addContextIndex(indexSet, anchorIndex, messages.length);
+  const anchor = messages[anchorIndex];
+  if (!anchor) {
+    return;
+  }
+
+  const previous = messages[anchorIndex - 1];
+  const next = messages[anchorIndex + 1];
+
+  if (previous && previous.role !== anchor.role) {
+    addContextIndex(indexSet, anchorIndex - 1, messages.length);
+  }
+
+  if (next && next.role !== anchor.role) {
+    addContextIndex(indexSet, anchorIndex + 1, messages.length);
+  }
 }
 
 function createTermMap(tokens, allowedTerms = null) {
@@ -1373,6 +1533,69 @@ function finalizeCodeAwareReply(text, maxSentences = 0) {
   return resultBlocks.join('\n\n').trim();
 }
 
+function dedupeReplyBlocks(text = '') {
+  const blocks = splitReplyIntoCodeBlocks(text);
+  if (!blocks.length) {
+    return normalizeFinalReplyText(text);
+  }
+
+  const seenTextBlocks = new Set();
+  const seenCodeBlocks = new Set();
+  const seenSentences = new Set();
+  const resultBlocks = [];
+
+  blocks.forEach((block) => {
+    if (block.type === 'code') {
+      const normalizedCode = String(block.content || '').replace(/\r\n/g, '\n').trim();
+      if (!normalizedCode) {
+        return;
+      }
+      const codeKey = normalizedCode.toLowerCase();
+      if (seenCodeBlocks.has(codeKey)) {
+        return;
+      }
+      seenCodeBlocks.add(codeKey);
+      resultBlocks.push(renderMarkdownCodeBlock(block.language, normalizedCode));
+      return;
+    }
+
+    let normalizedText = normalizeFinalReplyText(block.content)
+      .replace(/(^|\n)([a-z][\w#+.-]{1,20})\s*\n\s*\d{1,4}\s+lines?\b/giu, '$1')
+      .replace(/\n{3,}/gu, '\n\n')
+      .trim();
+    if (!normalizedText) {
+      return;
+    }
+
+    const uniqueSentences = [];
+    splitIntoSentences(normalizedText).forEach((sentence) => {
+      const cleanSentence = cleanText(sentence);
+      const key = cleanSentence.toLowerCase();
+      if (!cleanSentence || seenSentences.has(key)) {
+        return;
+      }
+      seenSentences.add(key);
+      uniqueSentences.push(cleanSentence);
+    });
+
+    normalizedText = uniqueSentences.length
+      ? cleanText(uniqueSentences.join(' '))
+      : normalizedText;
+    if (!normalizedText) {
+      return;
+    }
+
+    const textKey = normalizedText.toLowerCase();
+    if (seenTextBlocks.has(textKey)) {
+      return;
+    }
+    seenTextBlocks.add(textKey);
+    resultBlocks.push(normalizedText);
+  });
+
+  return resultBlocks.join('\n\n').trim();
+}
+
 function looksLikeCodeLine(line = '') {
   const value = String(line || '').trim();
   if (!value) {
@@ -1418,6 +1641,151 @@ function enforceCodeBlocksForCodeLikeReply(text = '', userMessage = '') {
   }
   const language = detectCodeLanguage(value, '');
   return renderMarkdownCodeBlock(language, value);
+}
+
+function normalizeMalformedCodeFences(text = '') {
+  let value = String(text || '').replace(/\r\n/g, '\n').trim();
+  if (!value) {
+    return '';
+  }
+
+  value = value
+    .replace(
+      /```([\w#+.-]+)[ \t]+(?=(?:#include\b|import\b|export\b|const\b|let\b|var\b|function\b|class\b|if\b|for\b|while\b|return\b|<[/a-z!]|body\b|html\b|SELECT\b|def\b|from\b))/giu,
+      '```$1\n'
+    )
+    .replace(/([^\n])(```[\w#+.-]*\n)/gu, '$1\n$2');
+
+  const fenceCount = (value.match(/```/gu) || []).length;
+  if (fenceCount % 2 === 1) {
+    value = `${value}\n\`\`\``;
+  }
+
+  return value.trim();
+}
+
+function hasPositiveDelimiterBalance(text = '', openSymbol = '{', closeSymbol = '}') {
+  const value = String(text || '');
+  let balance = 0;
+  for (const symbol of value) {
+    if (symbol === openSymbol) {
+      balance += 1;
+    } else if (symbol === closeSymbol) {
+      balance = Math.max(0, balance - 1);
+    }
+  }
+  return balance > 0;
+}
+
+function endsWithContinuationCue(text = '') {
+  const trimmed = String(text || '').trimEnd();
+  if (!trimmed) {
+    return false;
+  }
+
+  const lastLine = trimmed.split('\n').pop()?.trim() || '';
+  if (!lastLine) {
+    return false;
+  }
+
+  if (/[([{\-+/*=,:.]$/u.test(lastLine)) {
+    return true;
+  }
+
+  return /(?:=>|=\s*|:\s*|\b(import|from|const|let|var|return|function|class|export|extends|implements|def|SELECT|FROM|WHERE|INSERT|UPDATE|DELETE)\b)$/iu.test(lastLine);
+}
+
+function isLikelyIncompleteReply(text = '', replyPreferences = {}) {
+  const value = normalizeMalformedCodeFences(text);
+  if (!value) {
+    return true;
+  }
+
+  const fenceCount = (value.match(/```/gu) || []).length;
+  if (fenceCount % 2 === 1) {
+    return true;
+  }
+
+  const looksCodeLike = Boolean(
+    replyPreferences?.wantsCode ||
+    /```/u.test(value) ||
+    looksLikeUnfencedCodeBlock(value)
+  );
+
+  if (looksCodeLike) {
+    if (
+      hasPositiveDelimiterBalance(value, '{', '}') ||
+      hasPositiveDelimiterBalance(value, '(', ')') ||
+      hasPositiveDelimiterBalance(value, '[', ']')
+    ) {
+      return true;
+    }
+
+    if (endsWithContinuationCue(value)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function buildContinuationPrompt(userMessage = '', partialReply = '', replyPreferences = {}, userLanguage = 'auto') {
+  const languageHint = cleanText(replyPreferences?.requestedCodeLanguage || '');
+  const responseLanguageInstruction =
+    userLanguage === 'ru'
+      ? 'Язык продолжения: русский. Термины в коде можно оставлять на английском.'
+      : userLanguage === 'en'
+        ? 'Response language: English.'
+        : '';
+
+  return [
+    'Продолжи предыдущий ответ ровно с того места, где он оборвался.',
+    'Не начинай заново и не повторяй уже написанный текст.',
+    'Заверши мысль полностью.',
+    replyPreferences?.wantsCode
+      ? `Если в ответе есть код, допиши его в том же стиле${languageHint ? ` и языке ${languageHint}` : ''}, закрой все скобки/теги и обязательно закрой markdown-блок кода тройными обратными кавычками.`
+      : 'Если ответ был в списке или в структурированном формате, закончи его корректно без обрыва.',
+    responseLanguageInstruction,
+    '',
+    'Исходный запрос пользователя:',
+    cleanText(userMessage || ''),
+    '',
+    'Уже отправленная часть ответа:',
+    String(partialReply || '').trim(),
+    '',
+    'Продолжение:',
+  ].filter(Boolean).join('\n');
+}
+
+function mergeContinuationReply(baseText = '', continuationText = '') {
+  const base = String(baseText || '').replace(/\r\n/g, '\n').trimEnd();
+  const continuation = String(continuationText || '').replace(/\r\n/g, '\n').trim();
+  if (!base) {
+    return continuation;
+  }
+  if (!continuation) {
+    return base;
+  }
+  if (base.includes(continuation)) {
+    return base;
+  }
+
+  let overlap = 0;
+  const maxOverlap = Math.min(base.length, continuation.length, 320);
+  for (let size = maxOverlap; size >= 24; size -= 1) {
+    if (base.slice(-size) === continuation.slice(0, size)) {
+      overlap = size;
+      break;
+    }
+  }
+
+  const tail = continuation.slice(overlap).trimStart();
+  if (!tail) {
+    return base;
+  }
+
+  const separator = /[\s\n([{`<]$/u.test(base) || /^[\s\n)\]}.,;:>`]/u.test(tail) ? '' : '\n';
+  return `${base}${separator}${tail}`.trim();
 }
 
 function findClampBoundary(text, limit) {
@@ -1774,23 +2142,34 @@ function finalizeReplyForOutput(text, options = {}) {
     text,
     replyPreferences
   );
-  const normalizedMarkup = convertStructuredReplyToMarkdown(normalizedCandidate || text);
+  const normalizedMarkup = normalizeMalformedCodeFences(
+    convertStructuredReplyToMarkdown(normalizedCandidate || text)
+  );
   const codeEnforcedMarkup = enforceCodeBlocksForCodeLikeReply(
     normalizedMarkup,
     options.userMessage || ''
   );
   const codeAwareReply = finalizeCodeAwareReply(codeEnforcedMarkup, maxSentences);
   if (codeAwareReply) {
-    return codeAwareReply;
+    const dedupedCodeAwareReply = dedupeReplyBlocks(codeAwareReply);
+    if (dedupedCodeAwareReply) {
+      return dedupedCodeAwareReply;
+    }
   }
 
   const normalized = normalizeFinalReplyText(codeEnforcedMarkup);
   const sentenceClamped = clampReplySentenceCount(normalized, maxSentences);
   if (sentenceClamped) {
-    return sentenceClamped;
+    const dedupedSentenceReply = dedupeReplyBlocks(sentenceClamped);
+    if (dedupedSentenceReply) {
+      return dedupedSentenceReply;
+    }
   }
   if (normalized) {
-    return normalized;
+    const dedupedNormalizedReply = dedupeReplyBlocks(normalized);
+    if (dedupedNormalizedReply) {
+      return dedupedNormalizedReply;
+    }
   }
 
   return 'Не удалось сформировать корректный ответ. Уточните запрос и попробуйте снова.';
@@ -2490,6 +2869,42 @@ function isNegativeMessageFeedback(metadata) {
   return metadata?.userRating === -1;
 }
 
+function isAssistantErrorLikeMessage(message) {
+  if (!message || message.role !== 'assistant') {
+    return false;
+  }
+
+  const metadata = message.metadata || {};
+  const messageType = cleanText(metadata.type || '').toLowerCase();
+  const messageMode = cleanText(metadata.mode || '').toLowerCase();
+
+  if (messageType === 'system' || messageType === 'pending') {
+    return true;
+  }
+
+  if (messageType === 'error' || messageType === 'error_info') {
+    return true;
+  }
+
+  if (messageMode === 'api_error' || messageMode === 'error' || messageMode === 'system_error') {
+    return true;
+  }
+
+  return Boolean(metadata.generationError || metadata.apiError);
+}
+
+function isRateableAssistantMessage(message) {
+  if (!message || message.role !== 'assistant') {
+    return false;
+  }
+
+  if (isAssistantErrorLikeMessage(message)) {
+    return false;
+  }
+
+  return Boolean(cleanText(message.content || ''));
+}
+
 function extractDialoguePairsFromChat(chat) {
   const pairs = [];
 
@@ -2500,7 +2915,7 @@ function extractDialoguePairsFromChat(chat) {
       continue;
     }
 
-    if (currentMessage.metadata?.type === 'system') {
+    if (isAssistantErrorLikeMessage(currentMessage)) {
       continue;
     }
 
@@ -2529,7 +2944,7 @@ function collectBlockedReplies(state) {
   const blocked = new Set();
   state.chats.forEach((chat) => {
     chat.messages.forEach((message) => {
-      if (message.role !== 'assistant') {
+      if (!isRateableAssistantMessage(message)) {
         return;
       }
       if (isNegativeMessageFeedback(message.metadata)) {
@@ -3157,51 +3572,103 @@ function buildKnowledgeArtifacts(state, options = {}) {
 function selectContextMessages(chat, userMessage, runtimeConfig) {
   const includeAssistantMessages = runtimeConfig.context?.includeAssistantMessages !== false;
   const messages = chat.messages
-    .filter((message) => message.metadata?.type !== 'system')
-    .filter((message) => includeAssistantMessages || message.role !== 'assistant')
+    .filter((message) => !(message.role === 'assistant' && isAssistantErrorLikeMessage(message)))
     .filter((message) => cleanText(message.content))
     .map((message, index) => ({
       ...message,
       index,
     }));
 
-  const recentMessages = messages.slice(-12);
+  const currentMessageIndex = (() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role === 'user' && message.content === userMessage) {
+        return index;
+      }
+    }
+    return -1;
+  })();
+  const followUpRequest = isLikelyContextFollowUp(userMessage);
   const queryTokens = new Set(extractQueryTokens(userMessage, { fallbackToAll: true }));
-  const scored = messages
-    .filter((message) => message.content !== userMessage)
+  const selectableMessages = messages
+    .filter((message) => message.index !== currentMessageIndex)
+    .filter((message) => includeAssistantMessages || message.role !== 'assistant');
+  const scored = selectableMessages
     .map((message) => {
       const tokens = extractQueryTokens(message.content, { fallbackToAll: false });
-      let lexicalScore = 0;
+      let sharedTokens = 0;
       tokens.forEach((token) => {
         if (queryTokens.has(token)) {
-          lexicalScore += 1;
+          sharedTokens += 1;
         }
       });
 
+      const lexicalScore = queryTokens.size
+        ? sharedTokens / queryTokens.size
+        : 0;
+      const topicalScore = computePromptReplyRelevance(userMessage, message.content);
       const recencyWeight = messages.length
         ? (message.index + 1) / messages.length
         : 0;
+      const directRelevanceScore = topicalScore * 2.8 + lexicalScore * 1.25;
+      const recencyBonus = directRelevanceScore > 0
+        ? recencyWeight * 0.3
+        : (followUpRequest ? recencyWeight * 0.08 : 0);
 
       return {
         message,
+        lexicalScore,
+        topicalScore,
         score:
-          lexicalScore * 1.15 +
-          recencyWeight * 1.6 +
-          (message.role === 'assistant' ? 0.08 : 0.28),
+          directRelevanceScore +
+          recencyBonus +
+          (message.role === 'assistant' ? 0.04 : 0.12),
       };
     })
-    .sort((left, right) => right.score - left.score)
-    .slice(0, 14)
-    .map((entry) => entry.message);
+    .sort((left, right) => right.score - left.score);
 
-  const merged = new Map();
-  [...recentMessages, ...scored].forEach((message) => {
-    merged.set(message.id, message);
-  });
+  const selectedIndexes = new Set();
 
-  const ordered = [...merged.values()]
+  if (followUpRequest && currentMessageIndex > 0) {
+    const recentStart = Math.max(0, currentMessageIndex - 4);
+    for (let index = recentStart; index < currentMessageIndex; index += 1) {
+      addConversationWindowAroundIndex(messages, selectedIndexes, index);
+    }
+  }
+
+  scored
+    .filter((entry) => {
+      const hasStrongTopicalMatch = entry.topicalScore >= (followUpRequest ? 0.08 : 0.12);
+      const hasStrongLexicalMatch = entry.lexicalScore >= (followUpRequest ? 0.12 : 0.2);
+      const hasScoreMatch = entry.score >= (followUpRequest ? 0.16 : 0.24);
+      const isNearRecentWindow = followUpRequest && currentMessageIndex > 0
+        ? entry.message.index >= Math.max(0, currentMessageIndex - 3)
+        : false;
+
+      if (!followUpRequest) {
+        return hasStrongTopicalMatch || hasStrongLexicalMatch;
+      }
+
+      return hasStrongTopicalMatch || hasStrongLexicalMatch || hasScoreMatch || isNearRecentWindow;
+    })
+    .slice(0, followUpRequest ? 12 : 8)
+    .forEach((entry) => {
+      addConversationWindowAroundIndex(messages, selectedIndexes, entry.message.index);
+    });
+
+  const ordered = messages
+    .filter((message) => message.index !== currentMessageIndex)
+    .filter((message) => includeAssistantMessages || message.role !== 'assistant' || selectedIndexes.has(message.index))
+    .filter((message) => selectedIndexes.has(message.index))
     .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
     .slice(-runtimeConfig.context.maxMessages);
+
+  if (!ordered.length && followUpRequest && currentMessageIndex > 0) {
+    const fallbackStart = Math.max(0, currentMessageIndex - 2);
+    return messages
+      .slice(fallbackStart, currentMessageIndex)
+      .filter((message) => includeAssistantMessages || message.role !== 'assistant');
+  }
 
   const bounded = [];
   let totalCharacters = 0;
@@ -3267,6 +3734,10 @@ function buildPromptForGeneration(userMessage, contextMessages, chunkCandidates,
   }
   promptParts.push(
     'Правила синтеза ответа: не копируй служебные поля instruction/query/prompt/input/output/answer/chosen/alternative_output. Сформируй новый ответ по смыслу на основе источников и контекста.'
+  );
+  promptParts.push('__sep__');
+  promptParts.push(
+    'Ответ должен быть завершенным: не обрывай предложения, списки, JSON/YAML/XML/TOML и markdown-блоки кода. Если даешь код, закрой тройные обратные кавычки и все скобки/теги.'
   );
   promptParts.push('__sep__');
   if (userLanguage === 'ru') {
@@ -3584,7 +4055,22 @@ function chooseBestReplyCandidate({
   const filtered = candidates
     .filter((candidate) => candidate.content)
     .filter((candidate) => !isNoisyKnowledgeArtifactText(candidate.content))
-    .filter((candidate) => computePromptReplyRelevance(userMessage, candidate.content) >= minimumRelevance)
+    .filter((candidate) => {
+      const relevance = computePromptReplyRelevance(userMessage, candidate.content);
+      if (relevance >= minimumRelevance) {
+        return true;
+      }
+
+      if (
+        replyPreferences.wantsCode &&
+        ['neural', 'hybrid'].includes(candidate.mode) &&
+        (/```/u.test(candidate.content) || looksLikeUnfencedCodeBlock(candidate.content))
+      ) {
+        return true;
+      }
+
+      return false;
+    })
     .filter((candidate) => !isEchoReply(userMessage, candidate.content))
     .filter((candidate) => computeRecentReplyPenalty(candidate.content, recentAssistantReplies) < 0.42)
     .sort((left, right) => right.score - left.score);
@@ -3676,6 +4162,22 @@ function assertTrainingUnlocked(state, actionLabel) {
   );
 }
 
+function isModelTrainable(state) {
+  return !isApiModelState(state);
+}
+
+function isModelReadyForChat(state) {
+  if (isApiModelState(state)) {
+    return Boolean(
+      state.model.exists &&
+      cleanText(state.model.externalEndpoint || '') &&
+      cleanText(state.model.externalModelName || '')
+    );
+  }
+
+  return Boolean(state.model.exists && Number(state.model.trainedEpochs || 0) > 0);
+}
+
 function hasRetrainingImpact(previousSettings, nextSettings) {
   return RETRAINING_KEYS.some((key) => previousSettings.training?.[key] !== nextSettings.training?.[key]);
 }
@@ -3724,7 +4226,7 @@ function buildDashboard(state, chatId = null) {
     },
     runtime: {
       contextStrategy: runtimeConfig.context.strategy,
-      generatorBackend: getGeneratorBackend(),
+      generatorBackend: getGeneratorBackend(state),
       config: runtimeConfig,
       trainingExecutionMode: state.settings.training.executionMode,
       trainingBackend: state.model.computeBackendLabel || state.model.computeBackend,
@@ -3763,6 +4265,8 @@ function createModelEngine({ getState, updateState }) {
   let activeTrainingTerminationMode = null;
   let activeTrainingRollbackSnapshot = null;
   let neuralRuntime = null;
+  let activeApiModelConfig = null;
+  const activeReplyGenerations = new Map();
 
   function hasActiveTrainingExecution() {
     const workerThreadId = Number(activeTrainingWorker?.threadId);
@@ -4032,6 +4536,31 @@ function createModelEngine({ getState, updateState }) {
     activeTrainingPromise = null;
     activeTrainingStopSignal = null;
     activeTrainingTerminationMode = null;
+  }
+
+  function getReplyTaskKey(chatId, userId = getActiveWorkspaceUserId()) {
+    return `${cleanText(userId || 'anonymous')}::${cleanText(chatId || '')}`;
+  }
+
+  function registerActiveReplyTask(task) {
+    if (!task?.chatId) {
+      return null;
+    }
+
+    const normalizedTask = {
+      ...task,
+      userId: cleanText(task.userId || getActiveWorkspaceUserId() || 'anonymous'),
+    };
+    activeReplyGenerations.set(getReplyTaskKey(normalizedTask.chatId, normalizedTask.userId), normalizedTask);
+    return normalizedTask;
+  }
+
+  function getActiveReplyTask(chatId, userId = getActiveWorkspaceUserId()) {
+    return activeReplyGenerations.get(getReplyTaskKey(chatId, userId)) || null;
+  }
+
+  function clearActiveReplyTask(chatId, userId = getActiveWorkspaceUserId()) {
+    activeReplyGenerations.delete(getReplyTaskKey(chatId, userId));
   }
 
   async function restoreLastStableCheckpointState(state, options = {}) {
@@ -4474,7 +5003,91 @@ function markQueueAsRunning(state, queueId) {
     await Promise.all(writeTasks);
   }
 
+  function buildCompactModelArtifactsPayload(state, artifactPaths = {}) {
+    const compactKnowledgeIndex = {
+      chunks: [],
+      replyMemories: [],
+      vocabulary: {},
+      bm25: createDefaultKnowledgeState().bm25,
+    };
+    const compactLanguageModel = {
+      ...createDefaultKnowledgeState().languageModel,
+      ...(state.knowledge?.languageModel || {}),
+    };
+
+    return {
+      compactKnowledgeIndex,
+      compactLanguageModel,
+      artifacts: {
+        manifest: {
+          engine: state.model.engine,
+          updatedAt: state.meta?.updatedAt || nowIso(),
+          trainedEpochs: state.model.trainedEpochs,
+          parameterCount: state.model.parameterCount,
+          vocabularySize: state.model.vocabularySize,
+          sourceCount: state.model.sourceCount,
+          replyPairCount: state.model.replyPairCount,
+          corpusSignature: state.model.corpusSignature,
+          checkpointReady: false,
+          tokenizerReady: false,
+          files: artifactPaths,
+        },
+        knowledgeIndex: compactKnowledgeIndex,
+        languageModel: compactLanguageModel,
+        tokenizer: null,
+        weightsSpec: null,
+        weightsBinBase64: '',
+      },
+    };
+  }
+
+  function buildApiModelPackagePayload(state, apiConfig, options = {}) {
+    const normalizedApiConfig = normalizeApiModelConfig(apiConfig);
+    assertApiModelConfig(normalizedApiConfig);
+    const includeKnowledgeSnapshot = options.includeKnowledgeSnapshot === true;
+    const artifactPaths = normalizeStoragePaths(state.model.storage);
+    const compact = buildCompactModelArtifactsPayload(state, artifactPaths);
+    const nextModel = createApiModelState(
+      normalizedApiConfig,
+      state.settings,
+      state.knowledge
+    );
+
+    return {
+      format: MODEL_PACKAGE_FORMAT,
+      version: MODEL_PACKAGE_VERSION,
+      modelType: 'api',
+      engine: nextModel.engine,
+      exportedAt: nowIso(),
+      snapshot: {
+        settings: structuredClone(state.settings),
+        model: normalizeModelForExport(nextModel),
+        knowledge: includeKnowledgeSnapshot
+          ? structuredClone(state.knowledge)
+          : {
+            ...createDefaultKnowledgeState(),
+            languageModel: compact.compactLanguageModel,
+          },
+      },
+      runtimeConfig: structuredClone(getRuntimeConfig()),
+      embeddedArtifacts: false,
+      artifacts: compact.artifacts,
+      apiModel: {
+        provider: normalizedApiConfig.provider,
+        endpoint: normalizedApiConfig.endpoint,
+        model: normalizedApiConfig.model,
+        apiKey: normalizedApiConfig.apiKey,
+        headers: normalizedApiConfig.headers,
+        timeoutMs: normalizedApiConfig.timeoutMs,
+      },
+    };
+  }
+
   async function buildModelPackagePayload(state, options = {}) {
+    if (isApiModelState(state)) {
+      return buildApiModelPackagePayload(state, activeApiModelConfig, options);
+    }
+
     const includeKnowledgeSnapshot = options.includeKnowledgeSnapshot !== false;
     const includeArtifactsPayload = options.includeArtifactsPayload !== false;
     const artifactsPayload = includeArtifactsPayload
@@ -4486,16 +5099,8 @@ function markQueueAsRunning(state, queueId) {
       artifactsPayload.weightsSpec &&
       artifactsPayload.weightsBinBase64
     );
-    const compactKnowledgeIndex = {
-      chunks: [],
-      replyMemories: [],
-      vocabulary: {},
-      bm25: createDefaultKnowledgeState().bm25,
-    };
-    const compactLanguageModel = {
-      ...createDefaultKnowledgeState().languageModel,
-      ...(state.knowledge?.languageModel || {}),
-    };
+    const compact = buildCompactModelArtifactsPayload(state, artifactPaths);
+    const { compactKnowledgeIndex, compactLanguageModel } = compact;
 
     if (options.strictCheckpoint && !hasCheckpointArtifacts) {
       throw new Error('Экспорт недоступен: нейросетевой чекпоинт не найден или поврежден.');
@@ -4580,6 +5185,50 @@ function markQueueAsRunning(state, queueId) {
       return null;
     }
 
+    if (activeItem.kind === 'api') {
+      const candidateApiConfig = normalizeApiModelConfig({
+        ...(activeItem.api || {}),
+        provider: cleanText(state.model?.provider || activeItem.api?.provider || ''),
+        endpoint: cleanText(state.model?.externalEndpoint || activeItem.api?.endpoint || ''),
+        model: cleanText(state.model?.externalModelName || activeItem.api?.model || ''),
+        apiKey: activeApiModelConfig?.apiKey || '',
+        headers: activeApiModelConfig?.headers || {},
+        timeoutMs: activeApiModelConfig?.timeoutMs,
+      });
+
+      try {
+        assertApiModelConfig(candidateApiConfig);
+      } catch (error) {
+        activeItem.updatedAt = nowIso();
+        activeItem.lastUsedAt = nowIso();
+        activeItem.hasCheckpoint = false;
+        activeItem.api = buildApiRegistryInfo(candidateApiConfig);
+        activeItem.summary = {
+          ...activeItem.summary,
+          lifecycle: 'error',
+        };
+        logError('Skipping API model package save because the configuration is incomplete.', error, {
+          scope: 'api_model',
+          modelId: activeItem.id,
+          endpoint: candidateApiConfig.endpoint,
+          model: candidateApiConfig.model,
+        });
+        return activeItem;
+      }
+
+      activeApiModelConfig = candidateApiConfig;
+      const payload = buildApiModelPackagePayload(state, candidateApiConfig, {
+        includeKnowledgeSnapshot: false,
+      });
+      const packagePath = await writeModelLibraryPackage(activeItem.id, payload);
+      activeItem.packagePath = packagePath;
+      activeItem.updatedAt = nowIso();
+      activeItem.lastUsedAt = nowIso();
+      activeItem.hasCheckpoint = false;
+      activeItem.api = buildApiRegistryInfo(candidateApiConfig);
+      return activeItem;
+    }
+
     let payload;
     try {
       payload = await buildModelPackagePayload(state, {
@@ -4654,12 +5303,70 @@ function markQueueAsRunning(state, queueId) {
     return activeItem;
   }
 
+  async function applyApiModelPackageToState(state, modelPackage, options = {}) {
+    if (!modelPackage || typeof modelPackage !== 'object') {
+      throw new Error('Некорректный пакет API-модели.');
+    }
+
+    const apiConfig = normalizeApiModelConfig(modelPackage.apiModel || {});
+    assertApiModelConfig(apiConfig);
+    activeApiModelConfig = apiConfig;
+
+    await disposeNeuralRuntime();
+    activeTrainingRollbackSnapshot = null;
+
+    if (modelPackage.runtimeConfig && typeof modelPackage.runtimeConfig === 'object') {
+      await updateRuntimeConfig(modelPackage.runtimeConfig);
+    }
+
+    const incomingSettings = modelPackage.snapshot?.settings || {};
+    state.settings = {
+      training: {
+        ...state.settings.training,
+        ...(incomingSettings.training || {}),
+      },
+      generation: {
+        ...state.settings.generation,
+        ...(incomingSettings.generation || {}),
+      },
+    };
+
+    const preservedStorage = structuredClone(state.model.storage);
+    const preservedArtifactFiles = [...(state.model.artifactFiles || [])];
+
+    state.model = {
+      ...createApiModelState(apiConfig, state.settings, state.knowledge),
+      storage: preservedStorage,
+      artifactFiles: preservedArtifactFiles,
+    };
+    state.training = {
+      ...createDefaultTrainingState(),
+      status: 'idle',
+      phase: options.phase || 'api_model_selected',
+      message: 'Подключена внешняя API-модель. Чат использует API, а обучение локальной сети для этого профиля отключено.',
+      updatedAt: nowIso(),
+    };
+
+    updateActiveModelRegistrySummary(state);
+    pushStatus(
+      state,
+      'idle',
+      state.training.phase,
+      state.training.message
+    );
+  }
+
   async function applyModelPackageToState(state, modelPackage, options = {}) {
     if (!modelPackage || typeof modelPackage !== 'object') {
       throw new Error('Некорректный пакет модели: ожидается JSON-объект.');
     }
     if (modelPackage.format !== MODEL_PACKAGE_FORMAT || Number(modelPackage.version) !== MODEL_PACKAGE_VERSION) {
       throw new Error('Неподдерживаемый формат пакета модели.');
+    }
+
+    if (cleanText(modelPackage.modelType || '') === 'api') {
+      await applyApiModelPackageToState(state, modelPackage, options);
+      return;
     }
 
     const strictArtifacts = options.strictArtifacts !== false;
@@ -4676,6 +5383,7 @@ function markQueueAsRunning(state, queueId) {
 
     await disposeNeuralRuntime();
     activeTrainingRollbackSnapshot = null;
+    activeApiModelConfig = null;
 
     if (hasCheckpointArtifacts) {
       await writeImportedArtifacts(state.model.storage, packageArtifacts);
@@ -4768,6 +5476,10 @@ function markQueueAsRunning(state, queueId) {
   }
 
   async function ensureRuntimeLoaded(state) {
+    if (isApiModelState(state)) {
+      return null;
+    }
+
     if (neuralRuntime?.model) {
       return neuralRuntime;
     }
@@ -6058,7 +6770,7 @@ function markQueueAsRunning(state, queueId) {
     return activeTrainingQueueRunnerPromise;
   }
 
-  async function renderReply({ state, chat, userMessage }) {
+  async function renderReply({ state, chat, userMessage, abortSignal }) {
     const runtimeConfig = getRuntimeConfig();
     const userLanguage = detectMessageLanguage(userMessage);
     if (isSimpleGreetingMessage(userMessage)) {
@@ -6084,7 +6796,7 @@ function markQueueAsRunning(state, queueId) {
     const { queryMap, contextMessages } = buildWeightedQueryMap(userMessage, chat, runtimeConfig);
     const recentAssistantReplies = (chat.messages || [])
       .filter((message) => message.role === 'assistant')
-      .filter((message) => message.metadata?.type !== 'system')
+      .filter((message) => !isAssistantErrorLikeMessage(message))
       .slice(-4)
       .map((message) => sanitizeReplyText(message.content))
       .filter(Boolean);
@@ -6219,19 +6931,54 @@ function markQueueAsRunning(state, queueId) {
     const knowledgeText = knowledgeSentences.join(' ');
 
     let neuralReply = '';
-    const allowNeuralGeneration = shouldUseNeuralGeneration({ bestReply, knowledgeSentences, state });
+    let modelGenerationError = '';
+    const forceModelGeneration = isApiModelState(state);
+    const allowModelGeneration = forceModelGeneration || shouldUseNeuralGeneration({ bestReply, knowledgeSentences, state });
 
-    if (allowNeuralGeneration) {
+    if (allowModelGeneration) {
       try {
-        await ensureRuntimeLoaded(state);
-        if (neuralRuntime?.model) {
-          const promptText = buildPromptForGeneration(
-            userMessage,
-            contextMessages,
-            chunkCandidates,
-            replyCandidates,
-            userLanguage
-          );
+        const promptText = buildPromptForGeneration(
+          userMessage,
+          contextMessages,
+          chunkCandidates,
+          replyCandidates,
+          userLanguage
+        );
+        const requestModelGeneration = async (currentPromptText) => {
+          if (isApiModelState(state)) {
+            if (!activeApiModelConfig) {
+              const activeModelId = cleanText(state.modelRegistry?.activeModelId || '');
+              if (activeModelId) {
+                try {
+                  const modelPackage = await readModelLibraryPackage(activeModelId);
+                  activeApiModelConfig = normalizeApiModelConfig(modelPackage?.apiModel || {});
+                } catch (_error) {
+                  activeApiModelConfig = null;
+                }
+              }
+            }
+
+            if (!activeApiModelConfig) {
+              throw new Error('API-конфигурация не найдена. Проверьте endpoint, model id и API key в настройках API-модели.');
+            }
+
+            return generateTextWithApiModel({
+              apiConfig: activeApiModelConfig,
+              promptText: currentPromptText,
+              settings: state.settings,
+              systemPrompt: cleanText(runtimeConfig.generation?.systemPrompt || ''),
+              signal: abortSignal,
+            });
+          }
+
+          await ensureRuntimeLoaded(state);
+          if (!neuralRuntime?.model) {
+            return {
+              text: '',
+              finishReason: '',
+            };
+          }
+
           const runtimeAlignedSettings = neuralRuntime.manifest?.modelSettings
             ? {
               ...state.settings,
@@ -6241,14 +6988,61 @@ function markQueueAsRunning(state, queueId) {
               },
             }
             : state.settings;
+
           const generated = await generateText({
             runtime: neuralRuntime,
-            promptText,
+            promptText: currentPromptText,
             settings: runtimeAlignedSettings,
+            signal: abortSignal,
           });
-          neuralReply = sanitizeReplyText(generated.text);
+
+          return {
+            text: generated.text,
+            finishReason: cleanText(generated.finishReason || ''),
+          };
+        };
+
+        let combinedGeneratedReply = '';
+        let currentPromptText = promptText;
+
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          const generated = await requestModelGeneration(currentPromptText);
+          const generatedText = normalizeMalformedCodeFences(sanitizeReplyText(generated.text));
+          if (!generatedText) {
+            break;
+          }
+
+          combinedGeneratedReply = attempt === 0
+            ? generatedText
+            : mergeContinuationReply(combinedGeneratedReply, generatedText);
+
+          const finishReason = cleanText(generated.finishReason || '');
+          const reachedTokenLimit = finishReason === 'length';
+          const incompleteReply = isLikelyIncompleteReply(combinedGeneratedReply, replyPreferences);
+          if (!reachedTokenLimit && !incompleteReply) {
+            break;
+          }
+
+          currentPromptText = buildContinuationPrompt(
+            userMessage,
+            combinedGeneratedReply,
+            replyPreferences,
+            userLanguage
+          );
         }
-      } catch (_error) {
+
+        neuralReply = combinedGeneratedReply;
+      } catch (error) {
+        modelGenerationError = cleanText(error?.message || '');
+        if (isApiModelState(state) && modelGenerationError) {
+          pushStatus(
+            state,
+            'error',
+            'api_generation_failed',
+            `Внешняя API-модель не ответила: ${modelGenerationError}`,
+            { updateTrainingState: false }
+          );
+        }
         neuralReply = '';
       }
     }
@@ -6273,6 +7067,7 @@ function markQueueAsRunning(state, queueId) {
     if (
       candidate &&
       preferGroundedKnowledge &&
+      !replyPreferences.wantsCode &&
       ['neural', 'reply_memory', 'hybrid'].includes(candidate.mode)
     ) {
       const groundedCandidateText = buildGroundedFallback(
@@ -6290,6 +7085,13 @@ function markQueueAsRunning(state, queueId) {
           };
         }
       }
+    }
+
+    if (!candidate && neuralReply && (isApiModelState(state) || replyPreferences.wantsCode)) {
+      candidate = {
+        mode: 'neural',
+        content: neuralReply,
+      };
     }
 
     if (!candidate) {
@@ -6324,6 +7126,30 @@ function markQueueAsRunning(state, queueId) {
             userRating: 0,
             usedWebSources: webChunkCandidates.map((chunk) => chunk.url).filter(Boolean).slice(0, 4),
             usedWebSourceEntries,
+          },
+        });
+      }
+
+      if (isApiModelState(state) && modelGenerationError) {
+        const apiFallbackMessage = `API-модель не смогла ответить: ${modelGenerationError}`;
+
+        return buildReplyPayload(apiFallbackMessage, {
+          maxSentences: state.settings.generation.maxReplySentences,
+          maxCharacters: state.settings.generation.maxReplyCharacters,
+          userMessage,
+          references: replyReferences,
+          metadata: {
+            mode: 'api_error',
+            type: 'error',
+            usedContextMessages: contextMessages.length,
+            matchedSourceLabels: chunkCandidates.map((chunk) => chunk.label).slice(0, 4),
+            matchedMemoryScore: bestReply?.score || 0,
+            chunkMatches: chunkCandidates.length,
+            selfScore: 0,
+            userRating: 0,
+            usedWebSources: webChunkCandidates.map((chunk) => chunk.url).filter(Boolean).slice(0, 4),
+            usedWebSourceEntries,
+            apiError: modelGenerationError,
           },
         });
       }
@@ -6398,11 +7224,85 @@ function markQueueAsRunning(state, queueId) {
         await pruneBrokenModelRegistryItems(state);
         prepareTrainingQueuesState(state);
         const artifacts = await rebuildKnowledge(state);
-        const { restoredFromCheckpoint } = await reconcileCheckpointState(state, artifacts);
-        await ensureRuntimeLoaded(state);
+        let restoredFromCheckpoint = false;
+        const selectedRegistryItem = ensureModelRegistryState(state);
+
+        if (selectedRegistryItem?.kind === 'api') {
+          try {
+            const modelPackage = await readModelLibraryPackage(selectedRegistryItem.id);
+            activeApiModelConfig = normalizeApiModelConfig(modelPackage.apiModel || {});
+            assertApiModelConfig(activeApiModelConfig);
+            state.model = {
+              ...createApiModelState(activeApiModelConfig, state.settings, state.knowledge),
+              storage: structuredClone(state.model.storage),
+              artifactFiles: [...(state.model.artifactFiles || [])],
+            };
+          } catch (error) {
+            const fallbackApiConfig = normalizeApiModelConfig({
+              ...(selectedRegistryItem.api || {}),
+              apiKey: '',
+            });
+            const hasFallbackApiConfig = Boolean(
+              cleanText(fallbackApiConfig.endpoint) &&
+              cleanText(fallbackApiConfig.model)
+            );
+
+            if (error?.code === 'ENOENT' && hasFallbackApiConfig) {
+              activeApiModelConfig = fallbackApiConfig;
+              state.model = {
+                ...createApiModelState(activeApiModelConfig, state.settings, state.knowledge),
+                storage: structuredClone(state.model.storage),
+                artifactFiles: [...(state.model.artifactFiles || [])],
+              };
+              state.model.lifecycle = 'error';
+              state.model.status = 'error';
+              state.training.message = 'Пакет API-модели не найден. Модель сохранена в библиотеке, добавьте API key заново через редактирование.';
+              pushStatus(
+                state,
+                'warning',
+                'api_model_package_missing',
+                state.training.message,
+                { updateTrainingState: false }
+              );
+              log('warn', 'API model package is missing during hydrate; registry fallback was applied.', {
+                scope: 'api_model',
+                modelId: selectedRegistryItem.id,
+              });
+            } else {
+              activeApiModelConfig = null;
+              state.model.lifecycle = 'error';
+              state.model.status = 'error';
+              state.training.message = 'API-модель выбрана, но ее конфигурацию не удалось восстановить после перезапуска.';
+              pushStatus(
+                state,
+                'error',
+                'api_model_restore_failed',
+                state.training.message,
+                { updateTrainingState: false }
+              );
+              logError('Failed to restore API model configuration during hydrate.', error, {
+                scope: 'api_model',
+                modelId: selectedRegistryItem.id,
+              });
+            }
+          }
+        } else {
+          activeApiModelConfig = null;
+          ({ restoredFromCheckpoint } = await reconcileCheckpointState(state, artifacts));
+          await ensureRuntimeLoaded(state);
+        }
+
         const activeRegistryItem = updateActiveModelRegistrySummary(state);
         if (activeRegistryItem && !(await modelLibraryPackageExists(activeRegistryItem.id))) {
-          await saveActiveModelPackage(state);
+          try {
+            await saveActiveModelPackage(state);
+          } catch (error) {
+            logError('Failed to restore missing model library package during bootstrap.', error, {
+              scope: 'model_library',
+              modelId: activeRegistryItem.id,
+              kind: activeRegistryItem.kind,
+            });
+          }
         }
 
         if (restoredFromCheckpoint) {
@@ -6914,12 +7814,14 @@ function markQueueAsRunning(state, queueId) {
 
     async createFreshModel(name = '') {
       await repairStaleExecutionStateIfNeeded();
-      await updateState(async (state) => {
+      const previousState = structuredClone(getState());
+      const snapshot = await updateState(async (state) => {
         assertTrainingUnlocked(state, 'Создание модели');
         ensureModelRegistryState(state);
         await saveActiveModelPackage(state);
         await disposeNeuralRuntime();
         activeTrainingRollbackSnapshot = null;
+        activeApiModelConfig = null;
 
         const nextModelItem = createFreshModelRegistryItem(state, name);
         nextModelItem.packagePath = getModelLibraryPackagePath(nextModelItem.id);
@@ -6929,20 +7831,213 @@ function markQueueAsRunning(state, queueId) {
         state.model = createDefaultModelState();
         state.training = createDefaultTrainingState();
         state.knowledge = createDefaultKnowledgeState();
+        state.sources = [];
+        state.chats = [createEmptyChat()];
+        state.trainingQueues = createDefaultTrainingQueuesState();
         state.model.exists = true;
         state.model.lifecycle = 'ready_for_training';
         state.model.status = 'ready';
         state.model.configSnapshot = structuredClone(state.settings);
         restoreQueuesAfterModelReset(state);
         updateActiveModelRegistrySummary(state);
-        pushStatus(state, 'idle', 'fresh_model_created', 'Создана новая модель. Предыдущая сохранена в библиотеке моделей.');
+        pushStatus(
+          state,
+          'idle',
+          'fresh_model_created',
+          'Создана новая пустая локальная модель. Предыдущая сохранена в библиотеке моделей.'
+        );
         await rebuildKnowledge(state);
+        await saveActiveModelPackage(state);
+      });
+
+      const obsoleteDatasetPaths = (previousState.sources || [])
+        .map((source) => resolveDatasetSourcePath(source))
+        .filter(Boolean);
+      await Promise.all(obsoleteDatasetPaths.map(async (datasetPath) => {
+        try {
+          await fs.rm(datasetPath, { force: true });
+        } catch (_error) {
+          // Ignore stale source cleanup failures after model recreation.
+        }
+      }));
+
+      await Promise.all((previousState.trainingQueues?.items || []).map(async (queue) => {
+        try {
+          await removeTrainingQueueDirectory(queue.id);
+        } catch (_error) {
+          // Ignore queue directory cleanup failures after model recreation.
+        }
+      }));
+      await cleanupTrainingQueueStorage(snapshot.trainingQueues);
+
+      return buildDashboard(snapshot);
+    },
+
+    async createApiModel(apiModelInput = {}) {
+      await repairStaleExecutionStateIfNeeded();
+      const apiConfig = normalizeApiModelConfig(apiModelInput);
+      assertApiModelConfig(apiConfig);
+
+      const snapshot = await updateState(async (state) => {
+        assertTrainingUnlocked(state, 'Создание API-модели');
+        ensureModelRegistryState(state);
+        await saveActiveModelPackage(state);
+        await disposeNeuralRuntime();
+        activeTrainingRollbackSnapshot = null;
+        activeApiModelConfig = apiConfig;
+
+        const nextModelItem = createApiModelRegistryItem(
+          state,
+          apiConfig,
+          cleanText(apiModelInput.name || '')
+        );
+        nextModelItem.packagePath = getModelLibraryPackagePath(nextModelItem.id);
+        state.modelRegistry.items.push(nextModelItem);
+        state.modelRegistry.activeModelId = nextModelItem.id;
+        state.model = {
+          ...createApiModelState(apiConfig, state.settings, state.knowledge),
+          storage: structuredClone(state.model.storage),
+          artifactFiles: [...(state.model.artifactFiles || [])],
+        };
+        state.training = {
+          ...createDefaultTrainingState(),
+          status: 'idle',
+          phase: 'api_model_created',
+          message: 'Создан профиль API-модели. Чат будет использовать внешний endpoint, а локальное обучение для этого профиля отключено.',
+          updatedAt: nowIso(),
+        };
+        updateActiveModelRegistrySummary(state);
+        pushStatus(
+          state,
+          'idle',
+          'api_model_created',
+          `Создана API-модель «${nextModelItem.name}». Ответы в чате будут приходить через внешний endpoint.`,
+          { updateTrainingState: false }
+        );
         await saveActiveModelPackage(state);
       }, {
         writeSources: false,
         writeChats: false,
+        writeArtifacts: false,
       });
-      return buildDashboard(getState());
+
+      return buildDashboard(snapshot);
+    },
+
+    async updateApiModel(modelId, apiModelInput = {}) {
+      await repairStaleExecutionStateIfNeeded();
+      const currentState = getState();
+      if (isTrainingLocked(currentState) || activeTrainingPromise) {
+        throw new Error('Редактирование API-модели недоступно во время обучения.');
+      }
+
+      if (!cleanText(modelId)) {
+        throw new Error('Идентификатор API-модели не передан.');
+      }
+
+      ensureModelRegistryState(currentState);
+      const existingRegistryItem = (currentState.modelRegistry?.items || []).find((item) => item.id === modelId);
+      if (!existingRegistryItem || existingRegistryItem.kind !== 'api') {
+        throw new Error('API-модель из библиотеки не найдена.');
+      }
+
+      let existingApiConfig = null;
+      if (currentState.modelRegistry?.activeModelId === modelId && isApiModelState(currentState) && activeApiModelConfig) {
+        existingApiConfig = normalizeApiModelConfig(activeApiModelConfig);
+      } else {
+        const existingPackage = await readModelLibraryPackage(modelId);
+        existingApiConfig = normalizeApiModelConfig(existingPackage.apiModel || {});
+      }
+
+      const nextApiKey = typeof apiModelInput.apiKey === 'string' && apiModelInput.apiKey.trim().length
+        ? apiModelInput.apiKey.trim()
+        : existingApiConfig.apiKey;
+      const nextApiConfig = normalizeApiModelConfig({
+        ...existingApiConfig,
+        ...apiModelInput,
+        apiKey: nextApiKey,
+        headers: existingApiConfig.headers,
+        timeoutMs: existingApiConfig.timeoutMs,
+      });
+      assertApiModelConfig(nextApiConfig);
+      const nextName =
+        cleanText(apiModelInput.name || '') ||
+        cleanText(existingRegistryItem.name || '') ||
+        cleanText(nextApiConfig.model || '') ||
+        'API модель';
+
+      const snapshot = await updateState(async (state) => {
+        assertTrainingUnlocked(state, 'Редактирование API-модели');
+        ensureModelRegistryState(state);
+        const registryItem = (state.modelRegistry?.items || []).find((item) => item.id === modelId);
+        if (!registryItem || registryItem.kind !== 'api') {
+          throw new Error('API-модель из библиотеки не найдена.');
+        }
+
+        registryItem.name = nextName;
+        registryItem.updatedAt = nowIso();
+
+        if (state.modelRegistry.activeModelId === modelId && isApiModelState(state)) {
+          activeApiModelConfig = nextApiConfig;
+          state.model = {
+            ...createApiModelState(nextApiConfig, state.settings, state.knowledge),
+            storage: structuredClone(state.model.storage),
+            artifactFiles: [...(state.model.artifactFiles || [])],
+          };
+          updateActiveModelRegistrySummary(state);
+          await saveActiveModelPackage(state);
+        } else {
+          const packagePath = getModelLibraryPackagePath(modelId);
+          const existingPackage = await readModelLibraryPackage(modelId);
+          const packageSettings = structuredClone(existingPackage.snapshot?.settings || state.settings);
+          const packageKnowledge = structuredClone(existingPackage.snapshot?.knowledge || state.knowledge);
+          const nextPackage = {
+            ...existingPackage,
+            modelType: 'api',
+            engine: 'openai-compatible-api',
+            exportedAt: nowIso(),
+            snapshot: {
+              ...(existingPackage.snapshot || {}),
+              settings: packageSettings,
+              model: {
+                ...normalizeModelForExport(createApiModelState(nextApiConfig, packageSettings, packageKnowledge)),
+                exportName: nextName,
+              },
+              knowledge: packageKnowledge,
+            },
+            apiModel: {
+              provider: nextApiConfig.provider,
+              endpoint: nextApiConfig.endpoint,
+              model: nextApiConfig.model,
+              apiKey: nextApiConfig.apiKey,
+              headers: nextApiConfig.headers,
+              timeoutMs: nextApiConfig.timeoutMs,
+            },
+          };
+          await writeModelLibraryPackage(modelId, nextPackage);
+          registryItem.packagePath = packagePath;
+          registryItem.api = buildApiRegistryInfo(nextApiConfig);
+          registryItem.summary = {
+            ...(registryItem.summary || {}),
+            lifecycle: 'trained',
+            backend: nextApiConfig.provider ? `api:${nextApiConfig.provider}` : 'api:openai-compatible',
+          };
+        }
+
+        pushStatus(
+          state,
+          'idle',
+          'api_model_updated',
+          `Параметры API-модели «${nextName}» обновлены.`,
+          { updateTrainingState: false }
+        );
+      }, {
+        writeSources: false,
+        writeChats: false,
+        writeArtifacts: false,
+      });
+
+      return buildDashboard(snapshot);
     },
 
     async pauseTraining() {
@@ -6952,7 +8047,7 @@ function markQueueAsRunning(state, queueId) {
       }
 
       if (!activeTrainingPromise && activeTrainingQueueRunnerPromise) {
-        await updateState(async (state) => {
+        const snapshot = await updateState(async (state) => {
           if (state.trainingQueues.runner?.active) {
             markQueueAsPendingAfterInterruption(
               state,
@@ -6971,7 +8066,7 @@ function markQueueAsRunning(state, queueId) {
           writeChats: false,
           writeArtifacts: false,
         });
-        return buildDashboard(getState());
+        return buildDashboard(snapshot);
       }
 
       await updateState(async (state) => {
@@ -6979,7 +8074,7 @@ function markQueueAsRunning(state, queueId) {
         pushStatus(state, 'training', 'pause_requested', 'Пауза будет выполнена после завершения текущей стадии подготовки или текущего батча и сохранения чекпоинта.');
       }, { persist: false });
       await stopActiveTraining('pause_requested');
-      await updateState(async (state) => {
+      const snapshot = await updateState(async (state) => {
         if (state.trainingQueues.runner?.active) {
           markQueueAsPendingAfterInterruption(
             state,
@@ -6999,14 +8094,14 @@ function markQueueAsRunning(state, queueId) {
         writeSources: false,
         writeChats: false,
       });
-      return buildDashboard(getState());
+      return buildDashboard(snapshot);
     },
 
     async resetModel() {
       await repairStaleExecutionStateIfNeeded();
       await stopActiveTraining('model_deleted');
 
-      await updateState(async (state) => {
+      const snapshot = await updateState(async (state) => {
         ensureModelRegistryState(state);
         await disposeNeuralRuntime();
         await removeModelArtifacts(state.model.storage);
@@ -7023,7 +8118,7 @@ function markQueueAsRunning(state, queueId) {
         writeSources: false,
         writeChats: false,
       });
-      return buildDashboard(getState());
+      return buildDashboard(snapshot);
     },
 
     async rollbackTrainingToCheckpoint() {
@@ -7033,7 +8128,7 @@ function markQueueAsRunning(state, queueId) {
       }
 
       if (!activeTrainingWorker && !activeTrainingPromise && activeTrainingQueueRunnerPromise) {
-        await updateState(async (state) => {
+        const snapshot = await updateState(async (state) => {
           if (state.trainingQueues.runner?.active) {
             markQueueAsPendingAfterInterruption(
               state,
@@ -7052,12 +8147,12 @@ function markQueueAsRunning(state, queueId) {
           writeChats: false,
           writeArtifacts: false,
         });
-        return buildDashboard(getState());
+        return buildDashboard(snapshot);
       }
 
       await stopActiveTraining('rollback_to_checkpoint');
 
-      await updateState(async (state) => {
+      const snapshot = await updateState(async (state) => {
         await disposeNeuralRuntime();
         const queueId = state.trainingQueues.runner?.currentQueueId || null;
         await restoreLastStableCheckpointState(state);
@@ -7070,7 +8165,7 @@ function markQueueAsRunning(state, queueId) {
       });
 
       activeTrainingRollbackSnapshot = null;
-      return buildDashboard(getState());
+      return buildDashboard(snapshot);
     },
 
     async exportModelPackage() {
@@ -7079,12 +8174,16 @@ function markQueueAsRunning(state, queueId) {
         throw new Error('Модель еще не создана. Экспорт недоступен.');
       }
 
+      if (isApiModelState(state)) {
+        throw new Error('Экспорт доступен только для локальной модели. Переключитесь на локальную модель в библиотеке.');
+      }
+
       if (isTrainingLocked(state) || activeTrainingPromise) {
         throw new Error('Экспорт модели недоступен во время обучения или сохранения чекпоинта.');
       }
 
       const payload = await buildModelPackagePayload(state, {
-        strictCheckpoint: true,
+        strictCheckpoint: !isApiModelState(state),
       });
 
       const fileStamp = nowIso().replace(/[:.]/g, '-');
@@ -7105,15 +8204,22 @@ function markQueueAsRunning(state, queueId) {
         assertTrainingUnlocked(state, 'Импорт модели');
         ensureModelRegistryState(state);
         await saveActiveModelPackage(state);
-        const nextRegistryItem = createModelRegistryItemFromState(
-          state,
-          modelPackage.snapshot?.model?.exportName || modelPackage.snapshot?.model?.engine || 'Импортированная модель'
-        );
+        const importedModelType = cleanText(modelPackage.modelType || '') === 'api' ? 'api' : 'local';
+        const nextRegistryItem = importedModelType === 'api'
+          ? createApiModelRegistryItem(
+            state,
+            modelPackage.apiModel || {},
+            modelPackage.snapshot?.model?.exportName || modelPackage.snapshot?.model?.externalModelName || 'Импортированная API-модель'
+          )
+          : createModelRegistryItemFromState(
+            state,
+            modelPackage.snapshot?.model?.exportName || modelPackage.snapshot?.model?.engine || 'Импортированная модель'
+          );
         nextRegistryItem.packagePath = getModelLibraryPackagePath(nextRegistryItem.id);
         state.modelRegistry.items.push(nextRegistryItem);
         state.modelRegistry.activeModelId = nextRegistryItem.id;
         await applyModelPackageToState(state, modelPackage, {
-          strictArtifacts: true,
+          strictArtifacts: importedModelType !== 'api',
           phase: 'model_imported',
         });
         updateActiveModelRegistrySummary(state);
@@ -7123,7 +8229,10 @@ function markQueueAsRunning(state, queueId) {
         writeChats: false,
       });
 
-      await updateState(async (state) => {
+      const snapshot = await updateState(async (state) => {
+        if (isApiModelState(state)) {
+          return;
+        }
         try {
           await ensureRuntimeLoaded(state);
           if (neuralRuntime?.model) {
@@ -7146,7 +8255,7 @@ function markQueueAsRunning(state, queueId) {
         writeArtifacts: false,
       });
 
-      return buildDashboard(getState());
+      return buildDashboard(snapshot);
     },
 
     async updateRuntimeSettings(partialRuntimeConfig) {
@@ -7156,7 +8265,7 @@ function markQueueAsRunning(state, queueId) {
         throw new Error('Изменение runtime-настроек недоступно во время обучения.');
       }
 
-      await updateState(async (state) => {
+      const snapshot = await updateState(async (state) => {
         assertTrainingUnlocked(state, 'Изменение runtime-настроек');
         ensureModelRegistryState(state);
         await updateRuntimeConfig(partialRuntimeConfig || {});
@@ -7174,7 +8283,7 @@ function markQueueAsRunning(state, queueId) {
         writeArtifacts: false,
       });
 
-      return buildDashboard(getState());
+      return buildDashboard(snapshot);
     },
 
     async selectModel(modelId) {
@@ -7202,6 +8311,53 @@ function markQueueAsRunning(state, queueId) {
         modelPackage = await readModelLibraryPackage(modelId);
       } catch (error) {
         if (error?.code === 'ENOENT') {
+          if ((existingModel.kind || 'local') === 'api') {
+            const fallbackApiConfig = normalizeApiModelConfig({
+              ...(existingModel.api || {}),
+              apiKey: '',
+            });
+            const hasFallbackApiConfig = Boolean(
+              cleanText(fallbackApiConfig.endpoint) &&
+              cleanText(fallbackApiConfig.model)
+            );
+
+            if (hasFallbackApiConfig) {
+              const snapshot = await updateState(async (state) => {
+                assertTrainingUnlocked(state, 'Переключение модели');
+                ensureModelRegistryState(state);
+                await saveActiveModelPackage(state);
+                state.modelRegistry.activeModelId = modelId;
+                activeApiModelConfig = fallbackApiConfig;
+                state.model = {
+                  ...createApiModelState(activeApiModelConfig, state.settings, state.knowledge),
+                  storage: structuredClone(state.model.storage),
+                  artifactFiles: [...(state.model.artifactFiles || [])],
+                };
+                state.model.lifecycle = 'error';
+                state.model.status = 'error';
+                const selectedItem = state.modelRegistry.items.find((item) => item.id === modelId) || null;
+                if (selectedItem) {
+                  selectedItem.lastUsedAt = nowIso();
+                }
+                pushStatus(
+                  state,
+                  'warning',
+                  'api_model_package_missing',
+                  'Пакет API-модели не найден. Модель оставлена в библиотеке, добавьте API key заново через редактирование.',
+                  { updateTrainingState: false }
+                );
+              }, {
+                writeSources: false,
+                writeChats: false,
+                writeArtifacts: false,
+              });
+
+              return buildDashboard(snapshot);
+            }
+
+            throw new Error('API-модель найдена в библиотеке, но ее конфигурация неполная. Откройте редактирование и заполните endpoint/model/API key.');
+          }
+
           await updateState(async (state) => {
             ensureModelRegistryState(state);
             state.modelRegistry.items = (state.modelRegistry.items || []).filter((item) => item.id !== modelId);
@@ -7252,7 +8408,10 @@ function markQueueAsRunning(state, queueId) {
         writeChats: false,
       });
 
-      await updateState(async (state) => {
+      const snapshot = await updateState(async (state) => {
+        if (isApiModelState(state)) {
+          return;
+        }
         try {
           await ensureRuntimeLoaded(state);
           if (neuralRuntime?.model) {
@@ -7267,7 +8426,7 @@ function markQueueAsRunning(state, queueId) {
         writeArtifacts: false,
       });
 
-      return buildDashboard(getState());
+      return buildDashboard(snapshot);
     },
 
     async deleteModelFromLibrary(modelId) {
@@ -7281,7 +8440,7 @@ function markQueueAsRunning(state, queueId) {
         throw new Error('Сначала переключитесь на другую модель, затем удаляйте текущую.');
       }
 
-      await updateState(async (state) => {
+      const snapshot = await updateState(async (state) => {
         ensureModelRegistryState(state);
         const nextItems = (state.modelRegistry.items || []).filter((item) => item.id !== modelId);
         if (nextItems.length === (state.modelRegistry.items || []).length) {
@@ -7302,11 +8461,14 @@ function markQueueAsRunning(state, queueId) {
       });
 
       await removeModelLibraryPackage(modelId);
-      return buildDashboard(getState());
+      return buildDashboard(snapshot);
     },
 
     async trainModel() {
       await repairStaleExecutionStateIfNeeded();
+      if (!isModelTrainable(getState())) {
+        throw new Error('Для API-модели локальное обучение отключено. Переключитесь на локальную модель.');
+      }
       await ensureModelExists();
       const state = getState();
       if (hasPendingTrainingQueues(state)) {
@@ -7346,10 +8508,17 @@ function markQueueAsRunning(state, queueId) {
         throw new Error('Сообщение пустое.');
       }
 
-      const snapshot = await updateState(async (state) => {
+      let userMessageId = '';
+      let replyMessageId = '';
+      let replyGenerationRequired = false;
+      let activeUserId = getActiveWorkspaceUserId();
+
+      const preparedSnapshot = await updateState(async (state) => {
         assertTrainingUnlocked(state, 'Отправка сообщений');
         ensureChatAvailability(state);
+
         const chat = state.chats.find((entry) => entry.id === chatId) || state.chats[0];
+        activeUserId = getActiveWorkspaceUserId();
 
         const userMessage = {
           id: createId('msg'),
@@ -7358,55 +8527,55 @@ function markQueueAsRunning(state, queueId) {
           createdAt: nowIso(),
         };
 
+        userMessageId = userMessage.id;
         chat.messages.push(userMessage);
 
-        if (!state.model.exists || !state.model.trainedEpochs) {
+        if (!isModelReadyForChat(state)) {
           chat.messages.push({
             id: createId('msg'),
             role: 'assistant',
-            content: 'Модель пока не обучена. Сначала добавьте данные и запустите обучение.',
+            content: isApiModelState(state)
+              ? 'API-модель выбрана, но пока не готова к ответу. Проверьте endpoint, model id и API key.'
+              : 'Модель пока не обучена. Сначала добавьте данные и запустите обучение.',
             createdAt: nowIso(),
             metadata: {
               mode: 'system',
+              type: 'system',
               selfScore: 0,
               userRating: 0,
             },
           });
-        } else {
-          state.model.lifecycle = 'generating_reply';
-          state.model.status = 'busy';
-          pushStatus(
-            state,
-            'syncing_knowledge',
-            'generating_reply',
-            'Сервер формирует ответ по обученной нейросети и индексу знаний.',
-            { updateTrainingState: false }
-          );
-
-          const reply = await renderReply({
-            state,
-            chat,
-            userMessage: normalizedContent,
-          });
-
-          chat.messages.push({
-            id: createId('msg'),
-            role: 'assistant',
-            content: reply.content,
-            createdAt: nowIso(),
-            metadata: reply.metadata,
-          });
-
-          const assistantMessages = chat.messages
-            .filter((message) => message.role === 'assistant' && message.metadata?.selfScore !== undefined)
-            .map((message) => Number(message.metadata.selfScore || 0));
-          state.model.averageSelfScore = assistantMessages.length
-            ? Number((assistantMessages.reduce((sum, value) => sum + value, 0) / assistantMessages.length).toFixed(3))
-            : state.model.averageSelfScore;
-          state.model.lifecycle = 'trained';
-          state.model.status = 'ready';
-          state.model.lastGenerationAt = nowIso();
+          chat.title = inferChatTitle(chat.messages);
+          chat.updatedAt = nowIso();
+          return;
         }
+
+        replyGenerationRequired = true;
+        replyMessageId = createId('msg');
+        chat.messages.push({
+          id: replyMessageId,
+          role: 'assistant',
+          content: '',
+          createdAt: nowIso(),
+          metadata: {
+            type: 'pending',
+            mode: 'pending',
+            selfScore: 0,
+            userRating: 0,
+          },
+        });
+
+        state.model.lifecycle = 'generating_reply';
+        state.model.status = 'busy';
+        pushStatus(
+          state,
+          'syncing_knowledge',
+          'generating_reply',
+          isApiModelState(state)
+            ? 'Сервер формирует ответ через подключенную API-модель и индекс знаний.'
+            : 'Сервер формирует ответ по обученной нейросети и индексу знаний.',
+          { updateTrainingState: false }
+        );
 
         chat.title = inferChatTitle(chat.messages);
         chat.updatedAt = nowIso();
@@ -7415,7 +8584,358 @@ function markQueueAsRunning(state, queueId) {
         writeArtifacts: false,
       });
 
-      return buildDashboard(snapshot, chatId);
+      if (!replyGenerationRequired) {
+        return buildDashboard(preparedSnapshot, chatId);
+      }
+
+      const controller = new AbortController();
+      const replyTask = registerActiveReplyTask({
+        userId: activeUserId,
+        chatId,
+        replyMessageId,
+        userMessageId,
+        controller,
+      });
+
+      replyTask.promise = (async () => {
+        try {
+          const currentState = getState();
+          const chat = currentState.chats.find((entry) => entry.id === chatId) || null;
+          if (!chat) {
+            throw new Error('Чат для генерации ответа не найден.');
+          }
+
+          const replyMessageIndex = chat.messages.findIndex((message) => message.id === replyMessageId);
+          const contextMessages = replyMessageIndex >= 0 ? chat.messages.slice(0, replyMessageIndex) : chat.messages;
+          const contextChat = {
+            ...chat,
+            messages: contextMessages,
+          };
+
+          const reply = await renderReply({
+            state: currentState,
+            chat: contextChat,
+            userMessage: normalizedContent,
+            abortSignal: controller.signal,
+          });
+
+          const snapshot = await updateState(async (state) => {
+            const liveChat = state.chats.find((entry) => entry.id === chatId) || null;
+            if (!liveChat) {
+              throw new Error('Чат для сохранения ответа не найден.');
+            }
+
+            const assistantMessage = liveChat.messages.find((message) => message.id === replyMessageId);
+            if (!assistantMessage) {
+              throw new Error('Сообщение-ответ для обновления не найдено.');
+            }
+
+            assistantMessage.content = reply.content;
+            assistantMessage.createdAt = nowIso();
+            assistantMessage.metadata = reply.metadata;
+
+            const assistantMessages = liveChat.messages
+              .filter((message) => isRateableAssistantMessage(message))
+              .filter((message) => message.metadata?.selfScore !== undefined)
+              .map((message) => Number(message.metadata.selfScore || 0));
+            state.model.averageSelfScore = assistantMessages.length
+              ? Number((assistantMessages.reduce((sum, value) => sum + value, 0) / assistantMessages.length).toFixed(3))
+              : state.model.averageSelfScore;
+            state.model.lifecycle = 'trained';
+            state.model.status = 'ready';
+            state.model.lastGenerationAt = nowIso();
+            liveChat.title = inferChatTitle(liveChat.messages);
+            liveChat.updatedAt = nowIso();
+          }, {
+            writeSources: false,
+            writeArtifacts: false,
+          });
+
+          return buildDashboard(snapshot, chatId);
+        } catch (error) {
+          const wasAborted = error?.name === 'AbortError' || controller.signal.aborted;
+          const snapshot = await updateState(async (state) => {
+            const liveChat = state.chats.find((entry) => entry.id === chatId) || null;
+            const assistantMessage = liveChat?.messages?.find((message) => message.id === replyMessageId) || null;
+
+            if (assistantMessage) {
+              assistantMessage.content = wasAborted
+                ? 'Генерация ответа остановлена пользователем.'
+                : 'Не удалось получить ответ модели. Попробуйте снова.';
+              assistantMessage.createdAt = nowIso();
+              assistantMessage.metadata = {
+                mode: 'system',
+                type: 'system',
+                selfScore: 0,
+                userRating: 0,
+                generationError: wasAborted ? 'stopped_by_user' : cleanText(error?.message || ''),
+              };
+            }
+
+            state.model.lifecycle = state.model.trainedEpochs ? 'trained' : 'ready_for_training';
+            state.model.status = 'ready';
+            if (wasAborted) {
+              pushStatus(
+                state,
+                'paused',
+                'reply_generation_stopped',
+                'Генерация ответа остановлена пользователем.',
+                { updateTrainingState: false }
+              );
+            } else {
+              pushStatus(
+                state,
+                'error',
+                'reply_generation_failed',
+                cleanText(error?.message || 'Не удалось получить ответ модели.'),
+                { updateTrainingState: false }
+              );
+            }
+
+            if (liveChat) {
+              liveChat.title = inferChatTitle(liveChat.messages);
+              liveChat.updatedAt = nowIso();
+            }
+          }, {
+            writeSources: false,
+            writeArtifacts: false,
+          });
+
+          return buildDashboard(snapshot, chatId);
+        } finally {
+          clearActiveReplyTask(chatId, activeUserId);
+        }
+      })();
+
+      return replyTask.promise;
+    },
+
+    async stopChatReply(chatId) {
+      const activeReplyTask = getActiveReplyTask(chatId);
+      if (!activeReplyTask) {
+        return buildDashboard(getState(), chatId);
+      }
+
+      activeReplyTask.controller.abort();
+
+      if (activeReplyTask.promise) {
+        try {
+          await Promise.race([
+            activeReplyTask.promise,
+            delay(6000),
+          ]);
+        } catch (_error) {
+          // The sendMessage/editMessage flow handles final state reconciliation itself.
+        }
+      }
+
+      return buildDashboard(getState(), chatId);
+    },
+
+    async editMessage(messageId, content) {
+      const normalizedContent = cleanText(content);
+      if (!normalizedContent) {
+        throw new Error('Сообщение пустое.');
+      }
+
+      let chatId = '';
+      let replyMessageId = '';
+      let activeUserId = getActiveWorkspaceUserId();
+      let editedMessageIndex = -1;
+
+      const preparedSnapshot = await updateState(async (state) => {
+        assertTrainingUnlocked(state, 'Редактирование сообщений');
+        ensureChatAvailability(state);
+
+        const located = findMessageById(state, messageId);
+        if (!located) {
+          throw new Error('Сообщение для редактирования не найдено.');
+        }
+
+        if (located.message.role !== 'user') {
+          throw new Error('Редактировать можно только сообщения пользователя.');
+        }
+
+        chatId = located.chat.id;
+        activeUserId = getActiveWorkspaceUserId();
+        editedMessageIndex = located.messageIndex;
+        located.message.content = normalizedContent;
+        located.message.updatedAt = nowIso();
+
+        const replyIndex = located.chat.messages.findIndex(
+          (message, index) => index > located.messageIndex && message.role === 'assistant'
+        );
+
+        if (replyIndex >= 0) {
+          replyMessageId = located.chat.messages[replyIndex].id;
+          located.chat.messages[replyIndex] = {
+            ...located.chat.messages[replyIndex],
+            content: '',
+            createdAt: nowIso(),
+            metadata: {
+              type: 'pending',
+              mode: 'pending',
+              selfScore: 0,
+              userRating: 0,
+            },
+          };
+        } else {
+          replyMessageId = createId('msg');
+          located.chat.messages.splice(located.messageIndex + 1, 0, {
+            id: replyMessageId,
+            role: 'assistant',
+            content: '',
+            createdAt: nowIso(),
+            metadata: {
+              type: 'pending',
+              mode: 'pending',
+              selfScore: 0,
+              userRating: 0,
+            },
+          });
+        }
+
+        state.model.lifecycle = 'generating_reply';
+        state.model.status = 'busy';
+        pushStatus(
+          state,
+          'syncing_knowledge',
+          'message_regeneration_started',
+          'Сообщение пользователя изменено, пересчитываем ближайший ответ модели.',
+          { updateTrainingState: false }
+        );
+
+        located.chat.title = inferChatTitle(located.chat.messages);
+        located.chat.updatedAt = nowIso();
+      }, {
+        writeSources: false,
+        writeArtifacts: false,
+      });
+
+      if (!chatId || !replyMessageId) {
+        return buildDashboard(preparedSnapshot, chatId || null);
+      }
+
+      const controller = new AbortController();
+      const replyTask = registerActiveReplyTask({
+        userId: activeUserId,
+        chatId,
+        replyMessageId,
+        userMessageId: messageId,
+        controller,
+      });
+
+      replyTask.promise = (async () => {
+        try {
+          const currentState = getState();
+          const liveChat = currentState.chats.find((entry) => entry.id === chatId) || null;
+          if (!liveChat) {
+            throw new Error('Чат для пересчета ответа не найден.');
+          }
+
+          const replyIndex = liveChat.messages.findIndex((message) => message.id === replyMessageId);
+          const userMessage = liveChat.messages[editedMessageIndex];
+          const contextChat = {
+            ...liveChat,
+            messages: replyIndex >= 0 ? liveChat.messages.slice(0, replyIndex) : liveChat.messages.slice(0, editedMessageIndex + 1),
+          };
+
+          const reply = await renderReply({
+            state: currentState,
+            chat: contextChat,
+            userMessage: cleanText(userMessage?.content || normalizedContent),
+            abortSignal: controller.signal,
+          });
+
+          const snapshot = await updateState(async (state) => {
+            const chat = state.chats.find((entry) => entry.id === chatId) || null;
+            if (!chat) {
+              throw new Error('Чат для сохранения пересчитанного ответа не найден.');
+            }
+
+            const assistantMessage = chat.messages.find((message) => message.id === replyMessageId);
+            if (!assistantMessage) {
+              throw new Error('Сообщение-ответ для пересчета не найдено.');
+            }
+
+            assistantMessage.content = reply.content;
+            assistantMessage.createdAt = nowIso();
+            assistantMessage.metadata = reply.metadata;
+
+            const assistantMessages = chat.messages
+              .filter((message) => isRateableAssistantMessage(message))
+              .filter((message) => message.metadata?.selfScore !== undefined)
+              .map((message) => Number(message.metadata.selfScore || 0));
+            state.model.averageSelfScore = assistantMessages.length
+              ? Number((assistantMessages.reduce((sum, value) => sum + value, 0) / assistantMessages.length).toFixed(3))
+              : state.model.averageSelfScore;
+            state.model.lifecycle = 'trained';
+            state.model.status = 'ready';
+            state.model.lastGenerationAt = nowIso();
+            chat.title = inferChatTitle(chat.messages);
+            chat.updatedAt = nowIso();
+          }, {
+            writeSources: false,
+            writeArtifacts: false,
+          });
+
+          return buildDashboard(snapshot, chatId);
+        } catch (error) {
+          const wasAborted = error?.name === 'AbortError' || controller.signal.aborted;
+          const snapshot = await updateState(async (state) => {
+            const chat = state.chats.find((entry) => entry.id === chatId) || null;
+            const assistantMessage = chat?.messages?.find((message) => message.id === replyMessageId) || null;
+
+            if (assistantMessage) {
+              assistantMessage.content = wasAborted
+                ? 'Перегенерация ответа остановлена пользователем.'
+                : 'Не удалось пересчитать ответ модели. Попробуйте снова.';
+              assistantMessage.createdAt = nowIso();
+              assistantMessage.metadata = {
+                mode: 'system',
+                type: 'system',
+                selfScore: 0,
+                userRating: 0,
+                generationError: wasAborted ? 'stopped_by_user' : cleanText(error?.message || ''),
+              };
+            }
+
+            state.model.lifecycle = state.model.trainedEpochs ? 'trained' : 'ready_for_training';
+            state.model.status = 'ready';
+            if (wasAborted) {
+              pushStatus(
+                state,
+                'paused',
+                'message_regeneration_stopped',
+                'Перегенерация ответа остановлена пользователем.',
+                { updateTrainingState: false }
+              );
+            } else {
+              pushStatus(
+                state,
+                'error',
+                'message_regeneration_failed',
+                cleanText(error?.message || 'Не удалось пересчитать ответ модели.'),
+                { updateTrainingState: false }
+              );
+            }
+
+            if (chat) {
+              chat.title = inferChatTitle(chat.messages);
+              chat.updatedAt = nowIso();
+            }
+          }, {
+            writeSources: false,
+            writeArtifacts: false,
+          });
+
+          return buildDashboard(snapshot, chatId);
+        } finally {
+          clearActiveReplyTask(chatId, activeUserId);
+        }
+      })();
+
+      return replyTask.promise;
     },
 
     async rateMessage(messageId, score) {
@@ -7428,7 +8948,7 @@ function markQueueAsRunning(state, queueId) {
           throw new Error('Сообщение для оценки не найдено.');
         }
 
-        if (located.message.role !== 'assistant' || located.message.metadata?.type === 'system') {
+        if (!isRateableAssistantMessage(located.message)) {
           throw new Error('Оценивать можно только ответы модели.');
         }
 

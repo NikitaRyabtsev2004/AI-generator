@@ -330,6 +330,197 @@ function isLikelyStandaloneCode(content = '') {
   return codeSignals >= Math.max(2, Math.ceil(lines.length * 0.45)) && sentenceSignals <= 1;
 }
 
+function looksLikeCodeLine(line = '') {
+  const value = String(line || '').trim();
+  if (!value) {
+    return false;
+  }
+
+  if (/^(function\s+\w+|const\s+\w+|let\s+\w+|var\s+\w+|if\s*\(|for\s*\(|while\s*\(|return\b|class\s+\w+|import\s+|export\s+|def\s+\w+|#include\b|SELECT\b|INSERT\b|UPDATE\b|DELETE\b|<[/a-z!])/iu.test(value)) {
+    return true;
+  }
+
+  if (/[{};<>]/u.test(value) && /(=|\(|\)|=>|<\/?[a-z]|:\s*$)/iu.test(value)) {
+    return true;
+  }
+
+  return false;
+}
+
+function repairMalformedCodeFences(content = '') {
+  let value = String(content || '').replace(/\r\n/g, '\n').trim();
+  if (!value) {
+    return '';
+  }
+
+  value = value
+    .replace(
+      /```([\w#+.-]+)[ \t]+(?=(?:#include\b|import\b|export\b|const\b|let\b|var\b|function\b|class\b|if\b|for\b|while\b|return\b|<[/a-z!]|body\b|html\b|SELECT\b|def\b|from\b))/giu,
+      '```$1\n'
+    )
+    .replace(/([^\n])(```[\w#+.-]*\n)/gu, '$1\n$2');
+
+  const fenceCount = (value.match(/```/gu) || []).length;
+  if (fenceCount % 2 === 1) {
+    value = `${value}\n\`\`\``;
+  }
+
+  return value.trim();
+}
+
+function stripPseudoCodeCardArtifacts(content = '') {
+  return String(content || '')
+    .replace(
+      /(^|\n)([a-z][\w#+.-]{1,20})\s*\n\s*\d{1,4}\s+lines?\s*(?=\n|$)/giu,
+      '$1'
+    )
+    .replace(/\n{3,}/gu, '\n\n')
+    .trim();
+}
+
+function dedupeMessageParts(parts = []) {
+  const seenText = new Set();
+  const seenCode = new Set();
+  const deduped = [];
+
+  parts.forEach((part) => {
+    if (!part || !part.type) {
+      return;
+    }
+
+    if (part.type === 'code') {
+      const normalizedCode = String(part.content || '').replace(/\r\n/g, '\n').trim();
+      if (!normalizedCode) {
+        return;
+      }
+
+      const language = String(part.language || 'text').toLowerCase();
+      const normalizedLines = normalizedCode.split('\n').map((line) => line.trim()).filter(Boolean);
+      const isTinyCodePart = normalizedLines.length <= 6;
+      const normalizedCodeLower = normalizedCode.toLowerCase();
+      const key = `${language}:${normalizedCodeLower}`;
+
+      if (seenCode.has(key)) {
+        return;
+      }
+
+      if (isTinyCodePart) {
+        const hasSubsetInExistingCode = deduped.some((existingPart) => (
+          existingPart?.type === 'code' &&
+          String(existingPart.language || 'text').toLowerCase() === language &&
+          String(existingPart.content || '').toLowerCase().includes(normalizedCodeLower)
+        ));
+        if (hasSubsetInExistingCode) {
+          return;
+        }
+      }
+
+      const previousPart = deduped[deduped.length - 1];
+      if (
+        previousPart?.type === 'code' &&
+        String(previousPart.language || 'text').toLowerCase() === language
+      ) {
+        previousPart.content = `${String(previousPart.content || '').replace(/\s+$/u, '')}\n${normalizedCode}`.trim();
+        seenCode.add(key);
+        return;
+      }
+
+      seenCode.add(key);
+      deduped.push({
+        ...part,
+        language,
+        content: normalizedCode,
+      });
+      return;
+    }
+
+    const normalizedText = String(part.content || '').trim();
+    if (!normalizedText) {
+      return;
+    }
+    const key = normalizedText.toLowerCase();
+    if (seenText.has(key)) {
+      return;
+    }
+    seenText.add(key);
+    deduped.push({
+      ...part,
+      content: normalizedText,
+    });
+  });
+
+  return deduped;
+}
+
+function extractTrailingCodeSection(text = '') {
+  const value = String(text || '').replace(/\r\n/g, '\n').trim();
+  if (!value || /```/u.test(value)) {
+    return null;
+  }
+
+  const lines = value.split('\n');
+  for (let startIndex = 1; startIndex < lines.length - 1; startIndex += 1) {
+    const textPart = lines.slice(0, startIndex).join('\n').trim();
+    const codePart = lines.slice(startIndex).join('\n').trim();
+    if (!textPart || !codePart) {
+      continue;
+    }
+
+    const codeLines = codePart
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (codeLines.length < 2) {
+      continue;
+    }
+
+    const codeLikeLines = codeLines.filter(looksLikeCodeLine).length;
+    if (codeLikeLines >= 2 && (codeLikeLines / codeLines.length) >= 0.5) {
+      return {
+        text: textPart,
+        code: codePart,
+      };
+    }
+  }
+
+  return null;
+}
+
+function appendTextOrCodePart(parts, rawText = '') {
+  const repaired = repairMalformedCodeFences(rawText);
+  if (!repaired) {
+    return;
+  }
+
+  if (isLikelyStandaloneCode(repaired)) {
+    parts.push({
+      type: 'code',
+      language: detectCodeLanguage(repaired),
+      content: repaired,
+    });
+    return;
+  }
+
+  const splitSection = extractTrailingCodeSection(repaired);
+  if (splitSection) {
+    parts.push({
+      type: 'text',
+      content: splitSection.text,
+    });
+    parts.push({
+      type: 'code',
+      language: detectCodeLanguage(splitSection.code),
+      content: splitSection.code,
+    });
+    return;
+  }
+
+  parts.push({
+    type: 'text',
+    content: repaired,
+  });
+}
+
 export function detectCodeLanguage(code = '', hint = '') {
   const normalizedHint = normalizeLanguage(hint);
   if (normalizedHint !== 'text') {
@@ -367,13 +558,15 @@ export function detectCodeLanguage(code = '', hint = '') {
 }
 
 export function parseMessageContent(content = '') {
-  const normalized = normalizeStructuredPayloadToMarkdown(content);
+  const normalized = stripPseudoCodeCardArtifacts(
+    repairMalformedCodeFences(normalizeStructuredPayloadToMarkdown(content))
+  );
   const value = String(normalized || '').replace(/\r\n/g, '\n').trim();
   if (!value) {
     return [];
   }
 
-  if (isLikelyStandaloneCode(value)) {
+  if (!/```/u.test(value) && isLikelyStandaloneCode(value)) {
     return [{
       type: 'code',
       language: detectCodeLanguage(value),
@@ -390,10 +583,7 @@ export function parseMessageContent(content = '') {
     if (match.index > lastIndex) {
       const textBlock = value.slice(lastIndex, match.index).trim();
       if (textBlock) {
-        parts.push({
-          type: 'text',
-          content: textBlock,
-        });
+        appendTextOrCodePart(parts, textBlock);
       }
     }
 
@@ -410,14 +600,12 @@ export function parseMessageContent(content = '') {
   if (lastIndex < value.length) {
     const textBlock = value.slice(lastIndex).trim();
     if (textBlock) {
-      parts.push({
-        type: 'text',
-        content: textBlock,
-      });
+      appendTextOrCodePart(parts, textBlock);
     }
   }
 
-  return parts.length ? parts : [{ type: 'text', content: value }];
+  const deduped = dedupeMessageParts(parts);
+  return deduped.length ? deduped : [{ type: 'text', content: value }];
 }
 
 function buildTokenPatterns(language) {

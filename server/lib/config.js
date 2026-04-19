@@ -61,6 +61,12 @@ function createDefaultModelRegistryItem() {
     id: '',
     name: '',
     kind: 'local',
+    api: {
+      provider: '',
+      endpoint: '',
+      model: '',
+      hasKey: false,
+    },
     createdAt: null,
     updatedAt: null,
     lastUsedAt: null,
@@ -89,7 +95,12 @@ function createDefaultModelRegistryState() {
 function createDefaultModelState() {
   return {
     exists: false,
+    kind: 'local',
     engine: MODEL_ENGINE,
+    provider: '',
+    externalModelName: '',
+    externalEndpoint: '',
+    supportsTraining: true,
     lifecycle: 'not_created',
     status: 'idle',
     sourceCount: 0,

@@ -86,6 +86,7 @@ async function generateText({
   runtime,
   promptText,
   settings,
+  signal,
 }) {
   if (!runtime?.storage) {
     return {
@@ -104,6 +105,7 @@ async function generateText({
       },
       {
         timeoutMs: 90000,
+        signal,
       }
     );
 
@@ -111,7 +113,10 @@ async function generateText({
       text: String(payload?.text || '').trim(),
       generatedTokenIds: Array.isArray(payload?.generatedTokenIds) ? payload.generatedTokenIds : [],
     };
-  } catch (_error) {
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      throw error;
+    }
     return {
       text: '',
       generatedTokenIds: [],

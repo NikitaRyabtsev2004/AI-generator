@@ -36,6 +36,24 @@ function createModelsRoutes({
     }
   });
 
+  router.post('/model/create-api', heavy, async (request, response) => {
+    try {
+      const snapshot = await engine.createApiModel(request.body || {});
+      sendSuccess(response, { snapshot });
+    } catch (error) {
+      sendError(response, error);
+    }
+  });
+
+  router.patch('/models/:modelId/api', heavy, async (request, response) => {
+    try {
+      const snapshot = await engine.updateApiModel(request.params.modelId, request.body || {});
+      sendSuccess(response, { snapshot });
+    } catch (error) {
+      sendError(response, error);
+    }
+  });
+
   router.post('/models/:modelId/select', heavy, async (request, response) => {
     try {
       const snapshot = await engine.selectModel(request.params.modelId);

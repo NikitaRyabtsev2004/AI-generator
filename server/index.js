@@ -1,7 +1,10 @@
+require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs/promises');
+const { AsyncLocalStorage } = require('node:async_hooks');
 const {
   LOG_FILE,
   getRecentLogs,
@@ -12,7 +15,15 @@ const {
 } = require('./lib/logger');
 const { createModelEngine } = require('./engine/modelEngine');
 const { initializeRuntimeConfig } = require('./storage/runtimeConfig');
-const { getState, initializeStore, updateState } = require('./storage/store');
+const {
+  DB_FILE,
+  getActiveWorkspaceUserId,
+  getState,
+  initializeStore,
+  readWorkspaceStateForUser,
+  switchWorkspaceUser,
+  updateState,
+} = require('./storage/store');
 const { cleanText } = require('./lib/text');
 const { sendError, writeSseEvent } = require('./core/apiResponse');
 const { createOverloadGuard, readPositiveIntegerEnv } = require('./core/overloadGuard');
@@ -23,6 +34,11 @@ const { createSourcesRoutes } = require('./routes/sourcesRoutes');
 const { createTrainingRoutes } = require('./routes/trainingRoutes');
 const { createModelsRoutes } = require('./routes/modelsRoutes');
 const { createChatsRoutes } = require('./routes/chatsRoutes');
+const { createAuthRoutes } = require('./routes/authRoutes');
+const { createPublicRoutes } = require('./routes/publicRoutes');
+const { createPublicPageRoutes } = require('./routes/publicPageRoutes');
+const { createAuthService, createHttpError } = require('./services/authService');
+const { createChatShareService } = require('./services/chatShareService');
 
 const PORT = Number(process.env.PORT || 4000);
 const SLOW_REQUEST_THRESHOLD_MS = readPositiveIntegerEnv('SLOW_REQUEST_THRESHOLD_MS', 3000);
@@ -90,6 +106,13 @@ async function bootstrap() {
   });
 
   const app = express();
+  const requestContext = new AsyncLocalStorage();
+  const authService = createAuthService({
+    dbPath: DB_FILE,
+  });
+  const chatShareService = createChatShareService({
+    dbPath: DB_FILE,
+  });
   const overloadGuard = createOverloadGuard();
   const { sourceUpload, modelPackageUpload, limits } = createUploadMiddlewares();
   const realtimeClients = new Set();
@@ -97,11 +120,18 @@ async function bootstrap() {
   let pendingTrainingProgressBroadcast = null;
   let scheduleStateBroadcast = () => {};
 
-  app.use(cors());
+  app.use(cors({
+    origin: true,
+    credentials: true,
+  }));
   app.use(express.json({ limit: '8mb' }));
 
   const instrumentedUpdateState = async (mutator, options = {}) => {
-    const nextState = await updateState(mutator, options);
+    const contextUserId = requestContext.getStore()?.userId || null;
+    const nextState = await updateState(mutator, {
+      ...options,
+      ...(contextUserId ? { userId: contextUserId } : {}),
+    });
     scheduleStateBroadcast();
     return nextState;
   };
@@ -119,12 +149,19 @@ async function bootstrap() {
     getOverloadSnapshot: overloadGuard.snapshot,
   });
 
-  const broadcastEvent = (eventName, payload) => {
-    realtimeClients.forEach((client) => {
+  const broadcastEvent = (eventName, payload, options = {}) => {
+    const targetUserId = options.targetUserId || getActiveWorkspaceUserId();
+    realtimeClients.forEach((clientEntry) => {
+      if (!clientEntry?.response) {
+        return;
+      }
+      if (targetUserId && clientEntry.userId !== targetUserId) {
+        return;
+      }
       try {
-        writeSseEvent(client, eventName, payload);
+        writeSseEvent(clientEntry.response, eventName, payload);
       } catch (_error) {
-        realtimeClients.delete(client);
+        realtimeClients.delete(clientEntry);
       }
     });
   };
@@ -138,6 +175,8 @@ async function bootstrap() {
           try {
             broadcastEvent('training_progress', {
               snapshot: createTrainingProgressPayload(getState()),
+            }, {
+              targetUserId: getActiveWorkspaceUserId(),
             });
           } catch (error) {
             logError('Failed to broadcast training progress payload.', error);
@@ -153,7 +192,9 @@ async function bootstrap() {
         pendingStateBroadcast = null;
         try {
           const snapshot = await engine.getRealtimeSnapshot();
-          broadcastEvent('snapshot', { snapshot });
+          broadcastEvent('snapshot', { snapshot }, {
+            targetUserId: getActiveWorkspaceUserId(),
+          });
         } catch (error) {
           logError('Failed to broadcast realtime snapshot.', error);
         }
@@ -169,7 +210,9 @@ async function bootstrap() {
       pendingStateBroadcast = null;
       try {
         const snapshot = await engine.getRealtimeSnapshot();
-        broadcastEvent('snapshot', { snapshot });
+        broadcastEvent('snapshot', { snapshot }, {
+          targetUserId: getActiveWorkspaceUserId(),
+        });
       } catch (error) {
         logError('Failed to broadcast realtime snapshot.', error);
       }
@@ -177,7 +220,9 @@ async function bootstrap() {
   };
 
   const unsubscribeLogs = subscribeLogs((entry) => {
-    broadcastEvent('log', { entry });
+    broadcastEvent('log', { entry }, {
+      targetUserId: getActiveWorkspaceUserId(),
+    });
   });
 
   const handleSseEvents = async (request, response) => {
@@ -189,7 +234,12 @@ async function bootstrap() {
     response.flushHeaders?.();
     response.write(': connected\n\n');
 
-    realtimeClients.add(response);
+    const userId = request.auth?.user?.id || null;
+    const clientEntry = {
+      response,
+      userId,
+    };
+    realtimeClients.add(clientEntry);
 
     try {
       const snapshot = await engine.getRealtimeSnapshot();
@@ -220,7 +270,7 @@ async function bootstrap() {
 
     request.on('close', () => {
       clearInterval(heartbeatId);
-      realtimeClients.delete(response);
+      realtimeClients.delete(clientEntry);
     });
   };
 
@@ -228,6 +278,8 @@ async function bootstrap() {
     logError('Unhandled promise rejection.', error);
     broadcastEvent('server_error', {
       message: cleanText(error?.message || 'Unhandled promise rejection.'),
+    }, {
+      targetUserId: getActiveWorkspaceUserId(),
     });
   });
 
@@ -235,6 +287,8 @@ async function bootstrap() {
     logError('Uncaught exception.', error);
     broadcastEvent('server_error', {
       message: cleanText(error?.message || 'Uncaught exception.'),
+    }, {
+      targetUserId: getActiveWorkspaceUserId(),
     });
   });
 
@@ -279,6 +333,41 @@ async function bootstrap() {
     next();
   });
 
+  app.use('/api/auth', createAuthRoutes({
+    authService,
+  }));
+
+  app.use('/api/public', createPublicRoutes({
+    chatShareService,
+    readWorkspaceStateForUser,
+  }));
+  app.use(createPublicPageRoutes());
+
+  app.use('/api', async (request, response, next) => {
+    if (request.path.startsWith('/auth/')) {
+      next();
+      return;
+    }
+
+    try {
+      const auth = authService.resolveAuthFromRequest(request);
+      if (!auth?.user) {
+        authService.clearSessionCookie(response);
+        sendError(response, createHttpError('Требуется вход в аккаунт.', 401));
+        return;
+      }
+
+      request.auth = auth;
+      requestContext.run({ userId: auth.user.id }, () => {
+        switchWorkspaceUser(auth.user.id)
+          .then(() => next())
+          .catch((error) => sendError(response, error));
+      });
+    } catch (error) {
+      sendError(response, error);
+    }
+  });
+
   app.use('/api', createSystemRoutes({
     engine,
     getState,
@@ -306,6 +395,8 @@ async function bootstrap() {
   }));
   app.use('/api', createChatsRoutes({
     engine,
+    getState,
+    chatShareService,
     overloadMiddleware: overloadGuard.middleware,
   }));
 
@@ -313,7 +404,11 @@ async function bootstrap() {
   try {
     await fs.access(buildDir);
     app.use(express.static(buildDir));
-    app.get('*', async (request, response, next) => {
+    app.use((request, response, next) => {
+      if (request.method !== 'GET') {
+        next();
+        return;
+      }
       if (request.path.startsWith('/api/')) {
         next();
         return;
@@ -322,6 +417,34 @@ async function bootstrap() {
       response.sendFile(path.join(buildDir, 'index.html'));
     });
   } catch (_error) {
+    const clientDevOrigin = cleanText(
+      process.env.CLIENT_DEV_ORIGIN ||
+      process.env.FRONTEND_DEV_ORIGIN ||
+      'http://localhost:3000'
+    ).replace(/\/+$/u, '');
+
+    app.use((request, response, next) => {
+      if (request.method !== 'GET') {
+        next();
+        return;
+      }
+      if (request.path.startsWith('/api/')) {
+        next();
+        return;
+      }
+
+      const originalUrl = request.originalUrl || request.url || '/';
+      if (clientDevOrigin) {
+        response.redirect(307, `${clientDevOrigin}${originalUrl}`);
+        return;
+      }
+
+      response.status(503).json({
+        ok: false,
+        error: 'Клиентская сборка не найдена. Запустите `npm run client:start` или выполните `npm run build`.',
+      });
+    });
+
     app.get('/', (_request, response) => {
       response.json({
         ok: true,

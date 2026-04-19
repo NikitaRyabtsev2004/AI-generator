@@ -28,6 +28,7 @@ async function requestJson(url, options = {}) {
 
   try {
     const response = await fetch(url, {
+      credentials: 'include',
       ...fetchOptions,
       signal: controller.signal,
     });
@@ -60,6 +61,7 @@ function uploadFormDataWithProgress(url, formData, handlers = {}) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', url, true);
+    xhr.withCredentials = true;
     xhr.setRequestHeader('Accept', 'application/x-ndjson');
     xhr.timeout = 180000;
 
@@ -202,7 +204,9 @@ export async function fetchServerStatus() {
 }
 
 export function subscribeToServerEvents(handlers = {}) {
-  const eventSource = new EventSource('/api/events');
+  const eventSource = new EventSource('/api/events', {
+    withCredentials: true,
+  });
 
   const parseEvent = (event, callback) => {
     if (typeof callback !== 'function') {
@@ -373,6 +377,30 @@ export async function createNamedModel(name) {
   return payload.snapshot;
 }
 
+export async function createApiModel(apiModel) {
+  const payload = await requestJson('/api/model/create-api', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(apiModel || {}),
+    timeoutMs: 20000,
+  });
+  return payload.snapshot;
+}
+
+export async function updateApiModel(modelId, apiModel) {
+  const payload = await requestJson(`/api/models/${encodeURIComponent(modelId)}/api`, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(apiModel || {}),
+    timeoutMs: 20000,
+  });
+  return payload.snapshot;
+}
+
 export async function selectModel(modelId) {
   const payload = await requestJson(`/api/models/${encodeURIComponent(modelId)}/select`, {
     method: 'POST',
@@ -424,6 +452,7 @@ export async function rollbackTrainingToCheckpoint() {
 export async function exportModelPackage() {
   const response = await fetch('/api/model/export', {
     method: 'GET',
+    credentials: 'include',
   });
 
   if (!response.ok) {
@@ -462,11 +491,53 @@ export async function createChat() {
   return payload.snapshot;
 }
 
+export async function stopChatReply(chatId) {
+  const payload = await requestJson(`/api/chats/${encodeURIComponent(chatId)}/stop`, {
+    method: 'POST',
+    timeoutMs: 15000,
+  });
+  return payload.snapshot;
+}
+
 export async function deleteChat(chatId) {
   const payload = await requestJson(`/api/chats/${chatId}`, {
     method: 'DELETE',
   });
   return payload.snapshot;
+}
+
+export async function createChatShareLink(chatId) {
+  const payload = await requestJson(`/api/chats/${encodeURIComponent(chatId)}/share`, {
+    method: 'POST',
+    timeoutMs: 15000,
+  });
+  return payload.share;
+}
+
+export async function updateChatMessage(messageId, content) {
+  const payload = await requestJson(`/api/messages/${encodeURIComponent(messageId)}`, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      content,
+    }),
+    timeoutMs: 90000,
+  });
+  return payload.snapshot;
+}
+
+export async function fetchSharedChat(token, options = {}) {
+  const payload = await requestJson(`/api/public/chat-shares/${encodeURIComponent(token)}`, {
+    timeoutMs: 15000,
+    credentials: 'omit',
+    ...options,
+  });
+  return {
+    share: payload.share || null,
+    chat: payload.chat || null,
+  };
 }
 
 export async function sendChatMessage(chatId, content) {
@@ -490,4 +561,81 @@ export async function rateMessage(messageId, score) {
     body: JSON.stringify({ score }),
   });
   return payload.snapshot;
+}
+
+export async function fetchAuthSession() {
+  const payload = await requestJson('/api/auth/session', {
+    timeoutMs: 12000,
+  });
+  return {
+    authenticated: Boolean(payload.authenticated),
+    user: payload.user || null,
+  };
+}
+
+export async function startRegistration(email, password) {
+  const payload = await requestJson('/api/auth/register/start', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ email, password }),
+    timeoutMs: 20000,
+  });
+  return payload.message || '';
+}
+
+export async function verifyRegistration(email, code) {
+  const payload = await requestJson('/api/auth/register/verify', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ email, code }),
+    timeoutMs: 20000,
+  });
+  return payload.user || null;
+}
+
+export async function loginWithPassword(email, password) {
+  const payload = await requestJson('/api/auth/login', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ email, password }),
+    timeoutMs: 20000,
+  });
+  return payload.user || null;
+}
+
+export async function logoutSession() {
+  await requestJson('/api/auth/logout', {
+    method: 'POST',
+    timeoutMs: 12000,
+  });
+}
+
+export async function startPasswordReset(email) {
+  const payload = await requestJson('/api/auth/password-reset/start', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ email }),
+    timeoutMs: 20000,
+  });
+  return payload.message || '';
+}
+
+export async function confirmPasswordReset(email, code, newPassword) {
+  const payload = await requestJson('/api/auth/password-reset/confirm', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ email, code, newPassword }),
+    timeoutMs: 20000,
+  });
+  return payload.user || null;
 }

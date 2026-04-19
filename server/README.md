@@ -1,117 +1,78 @@
-# Сервер (`server`) — структура и назначение файлов
+# Серверная часть (`server`)
 
-Этот backend разделен на уровни: точка входа, инфраструктура API, доменная логика, движок обучения и слой хранения.
+Node.js backend, который:
+
+- отдает API для клиента;
+- управляет жизненным циклом моделей;
+- запускает Python backend для обучения/генерации;
+- хранит состояние и артефакты;
+- обслуживает публичные read-only страницы shared-чатов.
+
+## Ключевые модули
 
 ## Точка входа
 
-### `server/index.js`
-- Инициализирует логгер, runtime-конфиг и хранилище.
-- Поднимает Express API и SSE-канал realtime-событий.
-- Подключает маршруты (`routes`) и защиту от перегруза (`core/overloadGuard`).
-- Отдает клиентский `build`, если он существует.
+- `server/index.js` — bootstrap приложения, middleware, роуты, SSE, статическая раздача build.
 
-## Инфраструктура API (`server/core`)
+## Роуты (`server/routes`)
 
-### `server/core/apiResponse.js`
-- Единый формат ответов API: `sendSuccess`, `sendError`.
-- Вспомогательные writers для NDJSON и SSE.
+- `systemRoutes.js` — health/status/dashboard/logs/events.
+- `sourcesRoutes.js` — загрузка и управление источниками.
+- `trainingRoutes.js` — запуск/пауза/сброс/откат обучения.
+- `modelsRoutes.js` — создание/выбор/удаление моделей, import/export.
+- `chatsRoutes.js` — сообщения чата, шаринг, stop/retry/edit-flow.
+- `publicRoutes.js` — API выдачи shared-чата по токену.
+- `publicPageRoutes.js` — HTML-страница read-only чата по `/shared/chat/:token`.
 
-### `server/core/overloadGuard.js`
-- Ограничение тяжелых запросов (active + queue).
-- Отказ с `503`, если сервер перегружен.
+## Движок и интеграции (`server/engine`)
 
-### `server/core/serverStatus.js`
-- Формирует payload для `/api/status`.
-- Метрики Node/process/event-loop + состояние обучения + статус Python bridge.
-
-## Маршруты API (`server/routes`)
-
-### `server/routes/systemRoutes.js`
-- `/api/health`, `/api/status`, `/api/logs/recent`, `/api/events`, `/api/dashboard`.
-
-### `server/routes/sourcesRoutes.js`
-- Источники знаний: загрузка файлов, URL-источники, удаление источника.
-
-### `server/routes/trainingRoutes.js`
-- Очереди обучения и команды управления: train/pause/reset/rollback.
-
-### `server/routes/modelsRoutes.js`
-- Создание/выбор/удаление модели, runtime-настройки, import/export пакета модели.
-
-### `server/routes/chatsRoutes.js`
-- Чаты, отправка сообщений, оценка ответов.
+- `modelEngine.js` — основная бизнес-логика студии.
+- `trainingWorker.js` — вынесенные тяжелые задачи обучения.
+- `pythonBridge.js` — запуск Python-команд, контроль процесса, abort-сигналы.
+- `neuralModel.js` — работа с локальной моделью через Python runtime.
 
 ## Сервисы (`server/services`)
 
-### `server/services/uploadSourceService.js`
-- Multer middlewares для загрузки файлов.
-- Парсинг TXT/CSV/JSON.
-- NDJSON-прогресс подготовки источников.
-- Ограничения и троттлинг для больших загрузок.
+- `uploadSourceService.js` — прием и первичная обработка входных файлов.
+- `apiModelClient.js` — запросы к внешним API-моделям.
+- `chatShareService.js` — создание/валидация share-токенов чатов.
 
-## Движок модели и обучения (`server/engine`)
+## Хранение (`server/storage`)
 
-### `server/engine/modelEngine.js`
-- Главная доменная логика приложения.
-- Жизненный цикл модели, сбор корпуса, запуск обучения, rollback.
-- Генерация ответов, retrieval, обратная связь пользователя.
-- Реестр моделей (создание/выбор/удаление/импорт/экспорт).
+- `store.js` — SQLite-слой, state management и миграции.
+- `runtimeConfig.js` — чтение/запись runtime-конфига.
+- `modelLibraryStorage.js` — библиотека моделей пользователя.
+- `trainingQueueStorage.js` — очередь источников на дообучение.
 
-### `server/engine/neuralModel.js`
-- Node-обертка для Python runtime (load/generate/tokenize).
+## Вспомогательные библиотеки (`server/lib`)
 
-### `server/engine/trainingWorker.js`
-- Worker thread для долгих задач обучения.
-- Общается с Python backend и стримит статусы в engine.
+- `logger.js` — структурированные логи.
+- `modelSettings.js` — валидация конфигов модели/обучения.
+- `webSearch.js` и `content.js` — режим веб-поиска и извлечение контента.
+- `text.js` — нормализация и служебные преобразования текста.
 
-### `server/engine/pythonBridge.js`
-- Поиск Python runtime.
-- Автоподготовка `server/python/.venv` (если нужно).
-- Запуск Python-команд и телеметрия состояния bridge.
+## Данные и артефакты
 
-## Библиотеки/утилиты (`server/lib`)
+- `server/data` — runtime-БД, логи, служебные файлы.
+- `server/artifacts` — веса, токенизаторы, индексы, манифесты.
 
-### `server/lib/config.js`
-- Фабрики default-state и базовые конфиги обучения/генерации.
+Эти каталоги считаются рабочими и обычно не редактируются вручную.
 
-### `server/lib/logger.js`
-- Структурный логгер в память + файл (`server/data/server.log`).
+## Запуск сервера
 
-### `server/lib/text.js`
-- Нормализация текста, токенизация, preview/title, статистика.
+```bash
+npm run server:dev
+```
 
-### `server/lib/modelSettings.js`
-- Валидация и нормализация training-настроек из UI.
+Для production (после `npm run build`):
 
-### `server/lib/content.js`
-- Извлечение и очистка текста веб-страниц по URL.
+```bash
+npm run server:start
+```
 
-### `server/lib/webSearch.js`
-- Поиск (DuckDuckGo HTML) и загрузка релевантных страниц для web-режима.
+## Отладка типичных проблем
 
-## Хранилище и артефакты (`server/storage`)
-
-### `server/storage/store.js`
-- SQLite-хранилище состояния студии и атомарные обновления `updateState`.
-- Миграции/нормализация и восстановление состояния.
-
-### `server/storage/runtimeConfig.js`
-- Чтение/запись runtime-конфига (`server/data/runtime-config.json`).
-
-### `server/storage/modelLibraryStorage.js`
-- Хранение пакетов моделей (`server/data/model-library`).
-
-### `server/storage/trainingQueueStorage.js`
-- Дисковое хранилище источников очередей обучения и job payload-файлов.
-
-## Python backend (`server/python`)
-
-Содержит TensorFlow/Keras-часть (архитектура модели, токенизатор, tf.data pipeline, train loop, setup-venv).
-Подробности смотри в [server/python/README.md](./python/README.md).
-
-## Генерируемые каталоги
-
-- `server/data/*` — БД, логи, runtime-конфиг, библиотеки моделей.
-- `server/artifacts/*` — веса, токенизатор, манифесты, индексы.
-
-Не редактируй эти каталоги вручную без необходимости восстановления.
+1. `Cannot GET /shared/chat/...` — проверь, что сервер поднят с актуальным `publicPageRoutes.js`.
+2. `No module named tensorflow` — подготовь `server/python/.venv` через `setup-venv.ps1`.
+3. API-модель не отвечает — проверь `endpoint`, `model id`, `api key`, а также доступность провайдера.
+4. Долгие операции зависают — смотри `/api/status`, очередь и серверные логи.

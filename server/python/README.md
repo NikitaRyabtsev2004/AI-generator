@@ -1,61 +1,64 @@
-# Python backend (`server/python`) — что за что отвечает
+# Python backend (`server/python`)
 
-Эта папка содержит реализацию обучения и инференса на TensorFlow + Keras.
+Python-часть отвечает за обучение и инференс локальной модели на TensorFlow/Keras.
 
-## Основная точка входа
+## Основные файлы
 
-### `server/python/keras_llm_backend.py`
-- CLI backend, который вызывает Node через `pythonBridge`.
-- Команды:
-  - `train` — обучение модели.
-  - `load_runtime` — подготовка runtime для генерации.
-  - `generate` — генерация ответа.
-- Читает JSON-конфиг, запускает пайплайн, пишет чекпоинты и отдает статусы.
+- `keras_llm_backend.py` — CLI-точка входа для Node bridge (`train`, `load_runtime`, `generate`).
+- `llm_model.py` — GPT-подобная Transformer-архитектура (attention, FFN, layer norm, positional encoding).
+- `llm_tokenizer.py` — subword-токенизация, обучение и сохранение словаря.
+- `llm_data.py` — подготовка датасета и `tf.data` pipeline.
+- `requirements.txt` — зависимости Python runtime.
+- `setup-venv.ps1` — автоматическая настройка виртуального окружения (Windows).
+- `setup-venv2.ps1` — альтернативный скрипт для отдельного GPU-окружения.
 
-## Архитектура модели
+## Что реализовано в контуре обучения
 
-### `server/python/llm_model.py`
-- GPT-подобный autoregressive Transformer:
-  - multi-head causal self-attention,
-  - positional encoding,
-  - layer norm,
-  - feed-forward блоки,
-  - конфигурируемая глубина/размеры.
+- Кастомный training loop (без `model.fit`).
+- Teacher forcing.
+- Cross-entropy loss + метрики (`loss`, `perplexity`).
+- Checkpoints и артефакты для продолжения обучения.
+- Поддержка mixed precision (по возможностям окружения).
+- Streaming-подход к данным через `tf.data`.
 
-## Токенизация
+## Поддерживаемые источники данных
 
-### `server/python/llm_tokenizer.py`
-- Кастомный subword-токенизатор.
-- Обучение словаря на пользовательских данных.
-- Сохранение/загрузка токенизатора.
-- Обработка `PAD/UNK/BOS/EOS`, паддинг и обрезка.
+Через Node-пайплайн в Python поступают нормализованные тренировочные тексты, полученные из:
 
-## Data pipeline
+- `txt`
+- `csv`
+- `json`
+- `jsonl`
+- `parquet`
 
-### `server/python/llm_data.py`
-- Подготовка данных и `tf.data.Dataset`.
-- Загрузка и нормализация текстов (TXT/CSV/JSON).
-- Токенизация, батчинг, паддинг, train/val-разделение.
+## Подготовка окружения (Windows)
 
-## Зависимости и окружение
+```powershell
+cd server/python
+./setup-venv.ps1
+```
 
-### `server/python/requirements.txt`
-- Python-зависимости backend (включая TensorFlow).
+После этого Node backend сможет автоматически использовать созданный `.venv`.
 
-### `server/python/setup-venv.ps1`
-- Windows-скрипт для быстрой подготовки окружения:
-  - создает `.venv`,
-  - устанавливает зависимости,
-  - подготавливает backend к запуску из Node.
+## Ручной запуск для диагностики
 
-### `server/python/setup-venv2.ps1`
-- Альтернативный Windows-скрипт для GPU-режима TensorFlow:
-  - создает `.venv2` на Python 3.10,
-  - ставит стек `tensorflow==2.10.1` из `requirements.windows-gpu.txt`,
-  - подсказывает команду для `AI_GENERATOR_PYTHON`.
+Пример проверки доступности backend-команды:
 
-## Локальное окружение
+```powershell
+cd server/python
+.\.venv\Scripts\python.exe .\keras_llm_backend.py --help
+```
 
-### `server/python/.venv/`
-- Генерируемая папка виртуального окружения.
-- Не является исходным кодом проекта.
+## Частые ошибки
+
+1. `No module named tensorflow`
+   причина: окружение не создано или не установлены зависимости.
+   решение: выполнить `setup-venv.ps1`.
+
+2. Ошибка legacy Keras optimizer
+   причина: смешение Keras 3 и legacy API.
+   решение: использовать совместимые оптимизаторы в коде или включить совместимый стек `tf_keras` при необходимости.
+
+3. Слишком быстрый train на большом parquet
+   причина: в корпус попал только небольшой фрагмент данных.
+   решение: проверять лог извлечения и статистику окон/токенов перед запуском обучения.
